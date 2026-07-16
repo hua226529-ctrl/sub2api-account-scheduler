@@ -141,6 +141,37 @@ func TestArbiterDeduplicatesSameIdempotentSemantics(t *testing.T) {
 	}
 }
 
+func TestArbiterTreatsEvidenceAsAnUnorderedSet(t *testing.T) {
+	metadata := metadataFor(AuthorityAutonomousAgent, "evidence-set", fixedNow)
+	metadata.EvidenceRefs = []string{" evidence:b ", "evidence:a", "evidence:a"}
+	original := append([]string(nil), metadata.EvidenceRefs...)
+	canonical, err := NewAccountSchedulableIntent(metadata, 123, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(metadata.EvidenceRefs, original) {
+		t.Fatalf("constructor modified metadata evidence: got %v want %v", metadata.EvidenceRefs, original)
+	}
+	duplicate := cloneIntent(canonical)
+	duplicate.ID = "evidence-set-duplicate"
+	duplicate.EvidenceRefs = []string{"evidence:b", "evidence:a", "evidence:b"}
+	firstSignature, err := SemanticSignature(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSignature, err := SemanticSignature(duplicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSignature != secondSignature {
+		t.Fatalf("equivalent evidence sets have different signatures: %s != %s", firstSignature, secondSignature)
+	}
+	result := onlyResult(t, Arbitrate(fixedNow.Add(time.Second), []Intent{duplicate, canonical}))
+	if result.Winner == nil || len(result.Ignored) != 1 || result.Ignored[0].ReasonCode != ReasonDuplicate {
+		t.Fatalf("equivalent evidence sets were not deduplicated: %+v", result)
+	}
+}
+
 func TestArbiterRejectsConflictingIdempotencyKeyWithoutWinner(t *testing.T) {
 	first := mustSchedulableIntent(t, AuthorityActivePolicy, "first", 123, false, fixedNow)
 	second := mustSchedulableIntent(t, AuthorityActivePolicy, "second", 123, true, fixedNow)
@@ -167,6 +198,67 @@ func TestArbiterMarksCrossResourceIdempotencyConflict(t *testing.T) {
 	for _, result := range results {
 		if result.Winner != nil || len(result.Ignored) != 1 || result.Ignored[0].ReasonCode != ReasonIdempotencyConflict {
 			t.Fatalf("cross-resource conflict = %+v", result)
+		}
+	}
+}
+
+func TestArbiterTreatsAuditAndExecutionDifferencesAsIdempotencyConflicts(t *testing.T) {
+	base := mustSchedulableIntent(t, AuthorityAutonomousAgent, "base", 123, false, fixedNow)
+	tests := []struct {
+		name   string
+		change func(*Intent)
+	}{
+		{name: "expiration", change: func(intent *Intent) {
+			expiresAt := intent.ExpiresAt.Add(time.Minute)
+			intent.ExpiresAt = &expiresAt
+		}},
+		{name: "evidence", change: func(intent *Intent) {
+			intent.EvidenceRefs = []string{"evidence:replacement"}
+		}},
+		{name: "producer", change: func(intent *Intent) {
+			intent.Producer = ProducerAdminUI
+		}},
+		{name: "actor", change: func(intent *Intent) {
+			intent.Actor = "different-actor"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := cloneIntent(base)
+			changed.ID = "changed"
+			test.change(&changed)
+			result := onlyResult(t, Arbitrate(fixedNow.Add(time.Second), []Intent{changed, base}))
+			if result.Winner != nil || len(result.Ignored) != 2 {
+				t.Fatalf("semantic difference was silently deduplicated: %+v", result)
+			}
+			for _, ignored := range result.Ignored {
+				if ignored.ReasonCode != ReasonIdempotencyConflict {
+					t.Fatalf("ignored = %+v", result.Ignored)
+				}
+			}
+		})
+	}
+}
+
+func TestArbiterOrdersConflictKeysSupersededAndIgnoredAcrossPermutations(t *testing.T) {
+	policy := mustSchedulableIntent(t, AuthorityActivePolicy, "policy", 123, true, fixedNow)
+	duplicate := cloneIntent(policy)
+	duplicate.ID = "policy-duplicate"
+	manual := mustSchedulableIntent(t, AuthorityManualHold, "manual", 123, false, fixedNow.Add(time.Second))
+	expired := mustSchedulableIntent(t, AuthorityAdministratorCommand, "expired", 123, true, fixedNow.Add(-time.Hour))
+	expiresAt := fixedNow
+	expired.ExpiresAt = &expiresAt
+	load := 25
+	loadIntent := mustLoadFactorIntent(t, AuthorityActivePolicy, "load", 456, &load, fixedNow)
+
+	permutations := permuteIntents([]Intent{policy, duplicate, manual, expired, loadIntent})
+	want := Arbitrate(fixedNow, permutations[0])
+	if len(want) != 2 || len(want[0].Superseded) == 0 || len(want[0].Ignored) == 0 {
+		t.Fatalf("test fixture does not exercise all ordered collections: %+v", want)
+	}
+	for index, permutation := range permutations[1:] {
+		if got := Arbitrate(fixedNow, permutation); !reflect.DeepEqual(got, want) {
+			t.Fatalf("permutation %d changed ordered output:\ngot  %+v\nwant %+v", index+1, got, want)
 		}
 	}
 }

@@ -55,7 +55,9 @@ Agent、救灾、优化和管理员直接动作默认建模为带 TTL 的 `Overr
 
 冲突组由 `(Resource, Operation)` 定义。不同账号、不同上游 key 或不同 Operation 彼此独立仲裁。
 
-相同幂等键且语义完全相同的 Intent 视为重复提交，只保留 ID 字典序最小的规范候选。相同幂等键却表达不同语义时，整组被标记为 `idempotency_conflict`，不选出 winner，避免将键冲突误当成合法重试。
+相同幂等键且 Semantic Signature 完全相同的 Intent 视为重复提交，只保留 ID 字典序最小的规范候选。Semantic Signature 包含 Producer、Authority、Resource、Operation、DesiredState、Actor、Reason、CreatedAt、ExpiresAt、PolicyVersion、SnapshotVersion 和 EvidenceRefs；EvidenceRefs 在比较前按集合复制、排序和去重。
+
+对规范构造的 Intent，相同 IdempotencyKey 下完整内容变化会同时产生不同 Intent ID 和不同 Semantic Signature；Arbiter 将整组标记为 `idempotency_conflict`，不选出 winner，避免将同一次业务动作的载荷变化误当成合法重试。ID 本身不替代字段级语义比较：非规范调用方仅改写 ID、但完整语义完全相同时，仍按重复提交处理。DesiredState、Authority、TTL 或审计字段不能参与 IdempotencyKey；否则调用者可以通过修改载荷生成新键，绕过同一业务动作必须一致的冲突检查。
 
 ## 确定性仲裁
 

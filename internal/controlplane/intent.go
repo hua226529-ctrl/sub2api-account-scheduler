@@ -3,6 +3,7 @@ package controlplane
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -111,12 +112,27 @@ func normalizeMetadata(metadata IntentMetadata) IntentMetadata {
 	metadata.Reason = strings.TrimSpace(metadata.Reason)
 	metadata.PolicyVersion = strings.TrimSpace(metadata.PolicyVersion)
 	metadata.SnapshotVersion = strings.TrimSpace(metadata.SnapshotVersion)
-	metadata.EvidenceRefs = append([]string(nil), metadata.EvidenceRefs...)
-	for index := range metadata.EvidenceRefs {
-		metadata.EvidenceRefs[index] = strings.TrimSpace(metadata.EvidenceRefs[index])
-	}
+	metadata.EvidenceRefs = canonicalEvidenceRefs(metadata.EvidenceRefs)
 	metadata.ExpiresAt = cloneTimePointer(metadata.ExpiresAt)
 	return metadata
+}
+
+func canonicalEvidenceRefs(references []string) []string {
+	if len(references) == 0 {
+		return nil
+	}
+	canonical := append([]string(nil), references...)
+	for index := range canonical {
+		canonical[index] = strings.TrimSpace(canonical[index])
+	}
+	sort.Strings(canonical)
+	unique := canonical[:0]
+	for _, reference := range canonical {
+		if len(unique) == 0 || reference != unique[len(unique)-1] {
+			unique = append(unique, reference)
+		}
+	}
+	return unique
 }
 
 func (i Intent) Validate() error {

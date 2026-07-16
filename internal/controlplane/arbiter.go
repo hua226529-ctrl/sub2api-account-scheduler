@@ -1,6 +1,8 @@
 package controlplane
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strconv"
 	"strings"
@@ -143,6 +145,16 @@ func sameIdempotentSemantics(intents []Intent) bool {
 	return true
 }
 
+// SemanticSignature returns a stable digest of every field that affects
+// execution, arbitration, lifecycle, permission, or audit semantics.
+func SemanticSignature(intent Intent) (string, error) {
+	if err := intent.Validate(); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(semanticSignature(intent)))
+	return "cp-sem-v1-" + hex.EncodeToString(digest[:]), nil
+}
+
 func candidateWins(left, right Intent) bool {
 	leftRank, _ := authorityRank(left.Authority)
 	rightRank, _ := authorityRank(right.Authority)
@@ -196,7 +208,7 @@ func semanticSignature(intent Intent) string {
 	} else {
 		appendCanonicalPart(&builder, strconv.FormatInt(intent.ExpiresAt.UnixNano(), 10))
 	}
-	for _, reference := range intent.EvidenceRefs {
+	for _, reference := range canonicalEvidenceRefs(intent.EvidenceRefs) {
 		appendCanonicalPart(&builder, reference)
 	}
 	return builder.String()

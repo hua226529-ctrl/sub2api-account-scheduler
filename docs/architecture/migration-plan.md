@@ -4,7 +4,7 @@
 
 | 顺序 | 阶段 | 输入 | 输出 | 兼容策略与回滚点 | 不允许破坏的行为 | 所需测试 |
 |---:|---|---|---|---|---|---|
-| 1 | Intent 与 Arbiter（1A 已完成；1B 未开始） | 当前 Policy、人工、Agent、Balance、Failover 的动作描述和安全检查 | 1A：有类型的 Intent、OverrideLease、纯判定 Arbiter；1B：shadow decision | 1A 未接入生产路径。1B 才以 feature flag 接入 shadow，旧 writer 仍执行并可完全关闭。 | 判定结果、freeze、人工优先级、精确 grant、脱敏 | 1A：领域验证、Authority、幂等、确定性测试；1B：producer characterization、shadow 等价、旧数据库重启、权限矩阵 |
+| 1 | Intent 与 Arbiter（1A、1B 已完成；1C 未开始） | 当前 Policy、人工、Agent、Balance、Failover 的动作描述和安全检查 | 1A：有类型的 Intent、OverrideLease、纯判定 Arbiter；1B：离线旧路径适配与 Semantic Gap 审计；1C：runtime shadow observer | 1A/1B 均未接入生产路径。1C 才以默认 no-op、显式开启方式接入 shadow，旧 writer 仍执行并可完全关闭。 | 判定结果、freeze、人工优先级、精确 grant、脱敏 | 1A：领域验证、Authority、幂等、确定性；1B：适配、稳定 identity、调用点覆盖；1C：shadow 等价、旧数据库重启、权限矩阵 |
 | 2 | 账号 Mutation Executor | 账号 Intent、account_controls、freeze/lock/freshness 规则 | SetSchedulable/UpdateLoadFactor 唯一 executor，幂等和 readback journal | 逐 capability/账号池切换；旧 Engine wrapper 可回退。双写只允许审计，不允许双外部写。 | 暂停/恢复阈值、人工/余额/成本/健康锁、uncertain 分类 | fake 写成功超时、提交失败回滚、同资源并发、重启协调、限频 |
 | 3 | 分组 Mutation Executor | 普通 SwitchGroup、三级 Transition、已有 transitions 表 | 普通和自动切组统一 executor | 先包裹现有 `TransitionGroupTier`，普通 SwitchGroup feature flag；保留旧 HTTP 契约。 | 已确认 policy/version、余额和新鲜度、幂等、前后回读、人工精确授权 | 三级切换矩阵、普通切组兼容、unknown group freeze、restart readback |
 | 4 | Reconcile 热路径 | 当前单体 Reconcile、账号 executor | 明确 Collect/Evaluate/Plan/Execute 边界，执行只产 Intent | shadow plan 与旧 decision 对比；先对单账号池启用，开关回退旧循环。 | 确定性策略主导、模型不可用继续、freeze 下采集不写、stale fail-closed | 10/100/500 等价、并发人工动作、故障注入、阶段 duration benchmark |
@@ -23,4 +23,4 @@
 
 ## 当前状态
 
-阶段 1A 已完成纯领域模型、确定性仲裁、单元测试和领域合同。它没有生产调用方、数据库表、外部写入或 feature flag。阶段 1B 的 Producer 兼容适配和 shadow 决策尚未开始。
+阶段 1A 已完成纯领域模型、确定性仲裁、单元测试和领域合同。阶段 1B 已完成离线类型安全适配、Semantic Gap、稳定 identity 和旧写路径审计。两者都没有生产调用方、数据库表、外部写入或 feature flag。阶段 1C 的 runtime shadow observer 尚未开始。
