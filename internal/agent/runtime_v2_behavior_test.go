@@ -51,7 +51,7 @@ func TestUnifiedRunGuardIsVisibleInOverview(t *testing.T) {
 	}
 }
 
-func TestTransitionTokenGroupTierRequiresAgentConfidenceButAllowsAdministrator(t *testing.T) {
+func TestCharacterizationTransitionTokenGroupTierRequiresAgentConfidenceButAllowsAdministrator(t *testing.T) {
 	t.Parallel()
 	manager := &Manager{}
 	arguments := json.RawMessage(`{"source_id":9,"key_id":"token-7","target_tier":"backup","confidence":0.89,"reason":"pool outage"}`)
@@ -90,7 +90,7 @@ func TestTransitionTokenGroupTierRequiresAgentConfidenceButAllowsAdministrator(t
 	}
 }
 
-func TestScheduledCommandPersistsExactAdministratorGrant(t *testing.T) {
+func TestCharacterizationScheduledCommandPersistsExactAdministratorGrant(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
@@ -223,7 +223,7 @@ func TestEnqueueAnalysisGoalDeduplicatesActiveEmergencyAcrossTriggers(t *testing
 	}
 }
 
-func TestRuntimeMessagesAdvancePastStepsCreatedAfterCheckpoint(t *testing.T) {
+func TestCharacterizationRuntimeMessagesAdvancePastStepsCreatedAfterCheckpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{

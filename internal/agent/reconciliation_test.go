@@ -99,7 +99,7 @@ func TestEvaluateUnobservableMutationStaysQuarantined(t *testing.T) {
 	}
 }
 
-func TestRestartReconciliationOnlyAcceptsObservableExternalMutations(t *testing.T) {
+func TestCharacterizationRestartReconciliationOnlyAcceptsObservableExternalMutations(t *testing.T) {
 	t.Parallel()
 	for _, capability := range []string{"pause_account", "resume_account", "set_load_factor", "pin_load_until",
 		"clear_load_pin", "clear_flap_protection", "clear_manual_override", "update_binding",

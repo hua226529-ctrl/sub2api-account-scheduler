@@ -11,7 +11,7 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
 
-func TestRedactAgentTextRemovesCommonCredentials(t *testing.T) {
+func TestCharacterizationRedactAgentTextRemovesCommonCredentials(t *testing.T) {
 	t.Parallel()
 	input := "立即恢复账号225\n密码：demo-labeled-pass\napi_key=sk-example1234567890abcdef\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz.123\nadmin-" + strings.Repeat("c", 64)
 	redacted := redactAgentText(input)

@@ -84,7 +84,7 @@ func newAdministratorTestManager(t *testing.T) (*Manager, *store.Store, *adminis
 	return manager, database, api
 }
 
-func TestAdministratorIntentScopesCapabilityAndAccount(t *testing.T) {
+func TestCharacterizationAdministratorIntentScopesCapabilityAndAccount(t *testing.T) {
 	t.Parallel()
 	manager, _, _ := newAdministratorTestManager(t)
 	intent := manager.parseAdministratorIntent(context.Background(), "立即恢复备用账号")
@@ -143,7 +143,7 @@ func TestAdministratorGrantIDIsBoundAndLegacyEnvelopeFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAdministratorGrantCannotBeConsumedByAnotherStep(t *testing.T) {
+func TestCharacterizationAdministratorGrantCannotBeConsumedByAnotherStep(t *testing.T) {
 	manager, _, api := newAdministratorTestManager(t)
 	arguments := json.RawMessage(`{"account_id":298,"reason":"administrator request"}`)
 	grant := mintAdministratorGrant(administratorCommandHash("single-use-test-scope"),

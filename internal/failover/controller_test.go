@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"testing"
@@ -11,14 +12,16 @@ import (
 )
 
 type fakeStore struct {
-	policies []model.GroupFailoverPolicy
-	windows  map[string]model.AgentWindowStats
-	settings model.AgentSettings
-	dispatch model.Settings
-	states   []model.GroupFailoverState
-	events   []model.Event
-	count30  int
-	count6h  int
+	policies         []model.GroupFailoverPolicy
+	windows          map[string]model.AgentWindowStats
+	settings         model.AgentSettings
+	dispatch         model.Settings
+	states           []model.GroupFailoverState
+	events           []model.Event
+	count30          int
+	count6h          int
+	windowErrAccount int64
+	windowCalls      []int64
 }
 
 func (f *fakeStore) ListGroupFailoverPolicies(context.Context, int64) ([]model.GroupFailoverPolicy, error) {
@@ -39,7 +42,12 @@ func (f *fakeStore) CountCompletedGroupTierTransitions(_ context.Context, _ int6
 	}
 	return f.count6h, nil
 }
+
 func (f *fakeStore) GetAgentWindowStats(_ context.Context, accountID int64, _ time.Time, _ time.Time, label string) (model.AgentWindowStats, error) {
+	f.windowCalls = append(f.windowCalls, accountID)
+	if accountID == f.windowErrAccount {
+		return model.AgentWindowStats{}, errors.New("injected window failure")
+	}
 	return f.windows[windowKey(label, accountID)], nil
 }
 func (f *fakeStore) GetAgentSettings(context.Context) (model.AgentSettings, error) {
@@ -74,7 +82,7 @@ type fakeTelemetry struct{ at time.Time }
 
 func (f fakeTelemetry) Status() (*time.Time, string) { value := f.at; return &value, "" }
 
-func TestControllerFallsBackToBackupOnlyAfterGlobalOutage(t *testing.T) {
+func TestCharacterizationControllerFallsBackToBackupOnlyAfterGlobalOutage(t *testing.T) {
 	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
 	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
@@ -110,6 +118,67 @@ func TestControllerFallsBackToBackupOnlyAfterGlobalOutage(t *testing.T) {
 	}
 	if upstreams.transitions[0].DryRun {
 		t.Fatal("control mode transition unexpectedly became a dry run")
+	}
+}
+
+func TestCharacterizationControllerRejectsStaleSnapshotBeforeAnyTransition(t *testing.T) {
+	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
+	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
+	stale := now.Add(-10 * time.Minute)
+	snapshots.snapshot.LastSyncAt = &stale
+	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
+	controller.now = func() time.Time { return now }
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("stale account snapshot unexpectedly allowed failover evaluation")
+	}
+	if len(upstreams.transitions) != 0 {
+		t.Fatalf("stale snapshot caused transitions: %+v", upstreams.transitions)
+	}
+}
+
+func TestCurrentBehaviorAgentObserveModeMakesFailoverDryRun(t *testing.T) {
+	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
+	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
+	store.settings.Mode = model.AgentModeObserve
+	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
+	controller.now = func() time.Time { return now }
+	controller.outageSince["pool-a"] = now.Add(-5 * time.Minute)
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstreams.transitions) != 1 || !upstreams.transitions[0].DryRun {
+		t.Fatalf("observe mode failover transition = %+v, want one dry run", upstreams.transitions)
+	}
+}
+
+func TestCurrentBehaviorFirstPoolAssessmentFailureStopsLaterPools(t *testing.T) {
+	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
+	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
+	secondPolicy := store.policies[0]
+	secondPolicy.SourceID, secondPolicy.KeyID, secondPolicy.Pool = 2, "22", "pool-b"
+	secondPolicy.AccountIDs = []int64{202}
+	secondPolicy.State.SourceID, secondPolicy.State.KeyID = 2, "22"
+	store.policies = append(store.policies, secondPolicy)
+	secondSource := upstreams.sources[0]
+	secondSource.ID, secondSource.NormalizedURL, secondSource.RoutingPool = 2, "https://upstream-b.example", "pool-b"
+	secondSource.KeyRates = []model.KeyRate{{ExternalID: "22", GroupID: "main", Status: "active"}}
+	upstreams.sources = append(upstreams.sources, secondSource)
+	secondBinding := snapshots.snapshot.Bindings[0]
+	secondBinding.Account.ID = 202
+	secondBinding.NormalizedEndpoint = secondSource.NormalizedURL
+	secondBinding.Monitor = &model.Monitor{ID: 8, Enabled: true, PrimaryStatus: model.StatusFailed, LastCheckedAt: &now}
+	secondBinding.MonitorState.MonitorID = 8
+	snapshots.snapshot.Bindings = append(snapshots.snapshot.Bindings, secondBinding)
+	store.windowErrAccount = 101
+	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
+	controller.now = func() time.Time { return now }
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("first pool assessment failure unexpectedly allowed the round to succeed")
+	}
+	for _, accountID := range store.windowCalls {
+		if accountID == 202 {
+			t.Fatalf("later pool was evaluated after the first pool error: calls=%v", store.windowCalls)
+		}
 	}
 }
 
@@ -209,7 +278,7 @@ func TestControllerDoesNotTreatUnknownTrafficErrorsAsHardFailures(t *testing.T) 
 	}
 }
 
-func TestControllerRequiresPersistedDistinctMonitorStreak(t *testing.T) {
+func TestCharacterizationControllerRequiresPersistedDistinctMonitorStreak(t *testing.T) {
 	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 5)
 	old := now.Add(-50 * time.Second)

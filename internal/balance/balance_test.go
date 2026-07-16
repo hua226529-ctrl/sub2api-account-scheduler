@@ -86,7 +86,7 @@ func TestNewAPIFetchBalanceAndEffectiveRate(t *testing.T) {
 	}
 }
 
-func TestNewAPIAccessKeyCanReadAndSwitchTokenGroup(t *testing.T) {
+func TestCharacterizationNewAPIAccessKeyCanReadAndSwitchTokenGroup(t *testing.T) {
 	currentGroup := "cheap"
 	applyGroupWrite := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +181,7 @@ func TestSub2FetchUsesUserRateOverride(t *testing.T) {
 	}
 }
 
-func TestSub2RefreshKeyCanReadAndSwitchTokenGroup(t *testing.T) {
+func TestCharacterizationSub2RefreshKeyCanReadAndSwitchTokenGroup(t *testing.T) {
 	currentGroup := int64(1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -303,7 +303,7 @@ func TestDisableSourceDoesNotRequireUpstreamConnection(t *testing.T) {
 	}
 }
 
-func TestBalanceLockNeedsTwoLowAndTwoRecoveryResults(t *testing.T) {
+func TestCharacterizationBalanceLockNeedsTwoLowAndTwoRecoveryResults(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{FailureThreshold: 3, RecoveryThreshold: 3, ManualHoldMinutes: 10, FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10})
 	if err != nil {
@@ -343,7 +343,7 @@ func TestBalanceLockNeedsTwoLowAndTwoRecoveryResults(t *testing.T) {
 	}
 }
 
-func TestCostRoutingPrefersLowRateAndUsesTwoPhaseFailover(t *testing.T) {
+func TestCharacterizationCostRoutingPrefersLowRateAndUsesTwoPhaseFailover(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{FailureThreshold: 3, RecoveryThreshold: 3, ManualHoldMinutes: 10, FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10})
 	if err != nil {

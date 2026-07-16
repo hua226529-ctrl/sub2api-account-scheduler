@@ -178,7 +178,7 @@ func applyV3Checks(t *testing.T, engine *Engine, database *store.Store, api *fak
 	}
 }
 
-func TestAgentCannotTakeOwnershipOfManualPause(t *testing.T) {
+func TestCharacterizationAgentCannotTakeOwnershipOfManualPause(t *testing.T) {
 	engine, database, api := newEngineTest(t, false)
 	ctx := context.Background()
 	if err := engine.ManualPause(ctx, 225, "web"); err != nil {
@@ -199,7 +199,7 @@ func TestAgentCannotTakeOwnershipOfManualPause(t *testing.T) {
 	}
 }
 
-func TestAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.T) {
+func TestCharacterizationAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.T) {
 	engine, database, api := newEngineTest(t, false)
 	ctx := context.Background()
 	if err := engine.AgentPause(ctx, 225, "agent:2", "风险证据充分"); err != nil {
@@ -231,7 +231,7 @@ func TestAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.T) {
 	}
 }
 
-func TestReconcileCountsOnlyDistinctChecksAndPausesAfterThreeFailures(t *testing.T) {
+func TestCharacterizationReconcileCountsOnlyDistinctChecksAndPausesAfterThreeFailures(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	base := time.Now().UTC()
@@ -261,7 +261,7 @@ func TestReconcileCountsOnlyDistinctChecksAndPausesAfterThreeFailures(t *testing
 	}
 }
 
-func TestReconcileRecoversOnlyOwnedPauseAfterThreeHealthyChecks(t *testing.T) {
+func TestCharacterizationReconcileRecoversOnlyOwnedPauseAfterThreeHealthyChecks(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	base := time.Now().UTC()
@@ -286,7 +286,7 @@ func TestReconcileRecoversOnlyOwnedPauseAfterThreeHealthyChecks(t *testing.T) {
 	}
 }
 
-func TestDegradedAndStaleMonitorNeverPause(t *testing.T) {
+func TestCharacterizationDegradedAndStaleMonitorNeverPause(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	api.setMonitorResult(model.StatusDegraded, time.Now().UTC())
@@ -306,7 +306,7 @@ func TestDegradedAndStaleMonitorNeverPause(t *testing.T) {
 	}
 }
 
-func TestBalanceAndHealthLocksMustBothClearBeforeResume(t *testing.T) {
+func TestCharacterizationBalanceAndHealthLocksMustBothClearBeforeResume(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	source, err := database.CreateUpstreamSource(ctx, model.UpstreamSource{Name: "balance", Provider: "newapi", BaseURL: "https://upstream.example", NormalizedURL: "https://upstream.example", CredentialNonce: []byte{1}, CredentialCiphertext: []byte{1}, PauseBelow: 5, ResumeAt: 10, Enabled: true})
@@ -526,7 +526,7 @@ func TestEffectiveFlapPolicyUsesAccountOverridesAndStrongerRecovery(t *testing.T
 	}
 }
 
-func TestAdaptiveHealthReducesLoadAndRespectsManualLoadOverride(t *testing.T) {
+func TestCharacterizationAdaptiveHealthReducesLoadAndRespectsManualLoadOverride(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	settings, err := database.GetSettings(ctx)

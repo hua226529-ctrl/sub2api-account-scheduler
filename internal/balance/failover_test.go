@@ -18,7 +18,7 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/store"
 )
 
-func TestGroupFailoverPolicyVersionConfirmationAndIdempotentTransition(t *testing.T) {
+func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTransition(t *testing.T) {
 	ctx := context.Background()
 	var currentGroup atomic.Value
 	currentGroup.Store("main")

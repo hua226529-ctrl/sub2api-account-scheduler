@@ -26,6 +26,19 @@ func Open(path string, defaults model.Settings) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openDatabase(db, defaults)
+}
+
+// OpenDatabaseForTesting initializes an injected database with the production
+// schema. Production callers must use Open.
+func OpenDatabaseForTesting(db *sql.DB, defaults model.Settings) (*Store, error) {
+	if db == nil {
+		return nil, errors.New("database is required")
+	}
+	return openDatabase(db, defaults)
+}
+
+func openDatabase(db *sql.DB, defaults model.Settings) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	store := &Store{db: db}
 	if err := store.migrate(context.Background()); err != nil {
