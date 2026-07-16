@@ -74,7 +74,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -buildvcs=false -trimpath -ldflags="-s -w" \
             -o release/scheduler-linux-amd64 ./cmd/scheduler
-          sha256sum release/scheduler-linux-amd64 > release/SHA256SUMS
+          (cd release && sha256sum scheduler-linux-amd64 > SHA256SUMS)
 
       - name: Upload Linux build
         uses: actions/upload-artifact@v7
