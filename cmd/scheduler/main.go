@@ -13,6 +13,7 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/agent"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/balance"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/config"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplaneshadow"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/failover"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/httpserver"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
@@ -28,6 +29,9 @@ func main() {
 	if err != nil {
 		logger.Error("config_invalid", "error", err)
 		os.Exit(1)
+	}
+	if cfg.ControlplaneShadowModeInvalid {
+		logger.Warn("controlplane_shadow_mode_invalid", "fallback", "off")
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
 		logger.Error("data_directory_failed", "error", err)
@@ -46,7 +50,11 @@ func main() {
 	defer database.Close()
 
 	client := sub2api.New(cfg.Sub2APIBaseURL, cfg.AdminAPIKey, cfg.RequestTimeout)
-	engine := reconcile.NewEngine(client, database, cfg.PollInterval, logger)
+	engineOptions := make([]reconcile.EngineOption, 0, 1)
+	if cfg.ControlplaneShadowMode == "log" {
+		engineOptions = append(engineOptions, reconcile.WithControlplaneShadow(controlplaneshadow.NewLoggingObserver(logger)))
+	}
+	engine := reconcile.NewEngine(client, database, cfg.PollInterval, logger, engineOptions...)
 	var secretBox *balance.SecretBox
 	if len(cfg.CredentialKey) > 0 {
 		secretBox, err = balance.NewSecretBox(cfg.CredentialKey)

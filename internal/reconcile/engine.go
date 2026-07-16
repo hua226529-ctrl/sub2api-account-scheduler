@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/automation"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplaneshadow"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/health"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
@@ -62,6 +63,7 @@ type Engine struct {
 	pollInterval time.Duration
 	logger       *slog.Logger
 	startedAt    time.Time
+	shadow       controlplaneshadow.Runtime
 
 	runMu      sync.Mutex
 	barrier    *automation.Barrier
@@ -71,12 +73,19 @@ type Engine struct {
 	conflicts  map[string]bool
 }
 
-func NewEngine(api Sub2API, store Repository, pollInterval time.Duration, logger *slog.Logger) *Engine {
+func NewEngine(api Sub2API, store Repository, pollInterval time.Duration, logger *slog.Logger, options ...EngineOption) *Engine {
 	started := time.Now().UTC()
-	return &Engine{
+	engine := &Engine{
 		api: api, store: store, pollInterval: pollInterval, logger: logger, startedAt: started,
+		shadow:  controlplaneshadow.NewRuntime(controlplaneshadow.NoopObserver{}),
 		barrier: automation.NewBarrier(), snapshot: model.Snapshot{ServiceStarted: started}, trigger: make(chan struct{}, 1), conflicts: make(map[string]bool),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(engine)
+		}
+	}
+	return engine
 }
 
 // AutomationBarrier is shared with out-of-engine automation such as upstream
@@ -293,6 +302,7 @@ func effectiveFreezeState(state model.AgentFreezeState, now time.Time) model.Fre
 }
 
 func (e *Engine) ManualPause(ctx context.Context, accountID int64, actor string) error {
+	e.observeManualPause(ctx, accountID, actor)
 	updated, err := e.api.SetSchedulable(ctx, accountID, false)
 	if err != nil {
 		return uncertainExternalMutation("管理员暂停账号", err)
@@ -357,6 +367,7 @@ func (e *Engine) AgentPause(ctx context.Context, accountID int64, actor, reason 
 	if !account.Schedulable {
 		return errors.New("账号已经暂停，智能体不会覆盖现有归属")
 	}
+	e.observeAutonomousSchedulable(ctx, controlplaneshadow.PathAgentPause, accountID, false, actor, reason, now)
 	updated, err := e.api.SetSchedulable(ctx, accountID, false)
 	if err != nil {
 		return uncertainExternalMutation("智能体暂停账号", err)
@@ -423,6 +434,7 @@ func (e *Engine) AgentResume(ctx context.Context, accountID int64, actor, reason
 	if account.Schedulable {
 		return errors.New("账号已经开启，拒绝改写暂停归属")
 	}
+	e.observeAutonomousSchedulable(ctx, controlplaneshadow.PathAgentResume, accountID, true, actor, reason, now)
 	updated, err := e.api.SetSchedulable(ctx, accountID, true)
 	if err != nil {
 		return uncertainExternalMutation("恢复账号", err)
@@ -482,6 +494,7 @@ func (e *Engine) AgentSetLoadFactor(ctx context.Context, accountID int64, value 
 	}
 	beforeValue := cloneIntPointer(binding.Account.LoadFactor)
 	before := formatLoadFactor(beforeValue)
+	e.observeAutonomousLoadFactor(ctx, controlplaneshadow.PathAgentSetLoad, accountID, value, actor, reason, now)
 	updated, err := e.api.UpdateLoadFactor(ctx, accountID, value)
 	if err != nil {
 		return uncertainExternalMutation("调整账号负载", err)
@@ -537,6 +550,7 @@ func (e *Engine) ForceSetLoadFactor(ctx context.Context, accountID int64, value 
 		return err
 	}
 	before := cloneIntPointer(account.LoadFactor)
+	e.observeAdministratorLoadFactor(ctx, controlplaneshadow.PathForceSetLoad, accountID, value, actor, reason, time.Time{}, nil)
 	updated, err := e.api.UpdateLoadFactor(ctx, accountID, value)
 	if err != nil {
 		return uncertainExternalMutation("管理员强制调整账号负载", err)
@@ -616,6 +630,7 @@ func (e *Engine) PinLoad(ctx context.Context, accountID int64, value int, until 
 	}
 	desired := value
 	wroteExternal := !sameIntPointer(account.LoadFactor, &desired)
+	e.observePinnedLoadFactor(ctx, accountID, &desired, actor, reason, now, until)
 	if wroteExternal {
 		updated, updateErr := e.api.UpdateLoadFactor(ctx, accountID, &desired)
 		if updateErr != nil {
@@ -718,6 +733,7 @@ func (e *Engine) ManualResume(ctx context.Context, accountID int64, actor string
 	if !accountCanBeManaged(account, time.Now().UTC()) {
 		return errors.New("账号状态异常、凭据错误或已过期，禁止恢复")
 	}
+	e.observeManualResume(ctx, accountID, actor)
 	updated, err := e.api.SetSchedulable(ctx, accountID, true)
 	if err != nil {
 		return err
@@ -835,6 +851,7 @@ func (e *Engine) ForceResume(ctx context.Context, accountID int64, actor, reason
 		return err
 	}
 	wasSchedulable := account.Schedulable
+	e.observeAdministratorSchedulable(ctx, controlplaneshadow.PathForceResume, accountID, true, actor, reason, time.Time{})
 	if !wasSchedulable {
 		updated, updateErr := e.api.SetSchedulable(ctx, accountID, true)
 		if updateErr != nil {
@@ -1891,6 +1908,9 @@ func (e *Engine) reconcileAdaptiveLoadWithFreeze(ctx context.Context, binding *m
 		control.OriginalLoadFactor = cloneIntPointer(binding.Account.LoadFactor)
 	}
 	beforeLoad := cloneIntPointer(binding.Account.LoadFactor)
+	if !control.ManualLocked && !control.BalanceLocked && !control.CostLocked {
+		e.observePolicyLoadFactor(ctx, binding, desired, reasonForAdaptiveLoad(restore), now)
+	}
 	updated, err := e.api.UpdateLoadFactor(ctx, binding.Account.ID, desired)
 	if err != nil {
 		return err
@@ -2061,6 +2081,9 @@ func (e *Engine) applyPause(ctx context.Context, binding *model.ResolvedBinding,
 		}
 		return e.store.UpsertControl(ctx, *control)
 	}
+	if control.HealthLocked && !control.ManualLocked && !control.BalanceLocked && !control.CostLocked {
+		e.observePolicySchedulable(ctx, controlplaneshadow.PathReconcilePolicyPause, binding, false, reason, now)
+	}
 	updated, err := e.api.SetSchedulable(ctx, binding.Account.ID, false)
 	if err != nil {
 		return err
@@ -2111,6 +2134,10 @@ func (e *Engine) applyResume(ctx context.Context, binding *model.ResolvedBinding
 		}
 		return e.store.UpsertControl(ctx, *control)
 	}
+	previousOwner := control.Owner
+	if previousOwner == "automatic" && !control.ManualLocked && !control.HealthLocked && !control.BalanceLocked && !control.CostLocked {
+		e.observePolicySchedulable(ctx, controlplaneshadow.PathReconcilePolicyResume, binding, true, reason, now)
+	}
 	updated, err := e.api.SetSchedulable(ctx, binding.Account.ID, true)
 	if err != nil {
 		return err
@@ -2118,7 +2145,6 @@ func (e *Engine) applyResume(ctx context.Context, binding *model.ResolvedBinding
 	if !updated.Schedulable {
 		return errors.New("Sub2API 未确认账号恢复")
 	}
-	previousOwner := control.Owner
 	control.OwnsPause = false
 	control.Owner = ""
 	control.ManualLocked = false

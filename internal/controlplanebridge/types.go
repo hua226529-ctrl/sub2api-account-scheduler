@@ -177,11 +177,11 @@ func prepareMetadata(context LegacyContext, producer controlplane.Producer, auth
 	if context.Reason == "" {
 		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingReason, "legacy action has no explicit reason")
 	}
-	if context.CreatedAt.IsZero() {
-		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingCreatedAt, "legacy action has no explicit creation time")
+	if context.ExpiresAt == nil && requirements.agentTTL {
+		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapLegacyPermanentAgentControl, "legacy autonomous control has no finite expiration")
 	}
-	if context.ExpiresAt != nil && !context.ExpiresAt.After(context.CreatedAt) {
-		return controlplane.IntentMetadata{}, failed(ConversionInvalid, GapInvalidExpiration, "expiration must be after creation")
+	if context.ExpiresAt == nil && requirements.ttl {
+		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingTTL, "conversion requires an explicit finite expiration")
 	}
 	if requirements.policy && context.PolicyVersion == "" {
 		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingPolicyVersion, "active policy conversion requires the actual policy version")
@@ -192,14 +192,14 @@ func prepareMetadata(context LegacyContext, producer controlplane.Producer, auth
 	if requirements.evidence && !hasEvidence(context.EvidenceRefs) {
 		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingEvidence, "automated conversion requires existing evidence references")
 	}
-	if context.ExpiresAt == nil && requirements.agentTTL {
-		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapLegacyPermanentAgentControl, "legacy autonomous control has no finite expiration")
-	}
-	if context.ExpiresAt == nil && requirements.ttl {
-		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingTTL, "conversion requires an explicit finite expiration")
-	}
 	if !context.StableSourceNamespace.Valid() || context.StableSourceNamespace != expectedNamespace || context.StableSourceID == "" {
 		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingIdempotencySource, "legacy action has no stable business-action identifier")
+	}
+	if context.CreatedAt.IsZero() {
+		return controlplane.IntentMetadata{}, failed(ConversionIncomplete, GapMissingCreatedAt, "legacy action has no explicit creation time")
+	}
+	if context.ExpiresAt != nil && !context.ExpiresAt.After(context.CreatedAt) {
+		return controlplane.IntentMetadata{}, failed(ConversionInvalid, GapInvalidExpiration, "expiration must be after creation")
 	}
 
 	return controlplane.IntentMetadata{

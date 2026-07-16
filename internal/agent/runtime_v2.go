@@ -478,7 +478,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			}
 			invocation := CapabilityInvocation{Name: call.Function.Name, Arguments: arguments,
 				RunID: run.ID, GoalID: goal.ID, StepID: step.ID, Actor: actor, IdempotencyKey: step.IdempotencyKey,
-				AdministratorGrant: adminGrant, DryRun: dryRun}
+				AdministratorGrant: adminGrant, DryRun: dryRun, CreatedAt: step.CreatedAt, ExpiresAt: step.ExpiresAt}
 			if spec.Mutating && !dryRun {
 				// Persist the baseline before entering any external mutation. A
 				// process crash after the write can then be resolved by readback.
@@ -931,7 +931,8 @@ func (m *Manager) executeScheduledCommand(ctx context.Context, command model.Sch
 	}
 	invocation := CapabilityInvocation{Name: command.Capability, Arguments: command.Arguments,
 		RunID: run.ID, GoalID: derefInt64(command.GoalID), StepID: derefInt64(command.StepID), Actor: command.CreatedBy,
-		IdempotencyKey: command.IdempotencyKey, AdministratorGrant: conditions.AdministratorGrant}
+		IdempotencyKey: command.IdempotencyKey, AdministratorGrant: conditions.AdministratorGrant,
+		CreatedAt: command.CreatedAt, ExpiresAt: command.ExpiresAt}
 	attemptedAt := time.Now().UTC()
 	evidence := scheduledReconciliationEvidence{AttemptedAt: attemptedAt, BeforeState: m.capabilityState(ctx, invocation)}
 	if err := m.store.RecordScheduledCommandAttemptState(ctx, command.ID, m.workerID, marshalRaw(evidence), attemptedAt); err != nil {

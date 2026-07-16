@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/balance"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplanebridge"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplaneshadow"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/reconcile"
 )
@@ -28,6 +30,10 @@ type CapabilityInvocation struct {
 	IdempotencyKey     string
 	AdministratorGrant *AdministratorGrant
 	DryRun             bool
+	CreatedAt          time.Time
+	ExpiresAt          *time.Time
+	SnapshotVersion    string
+	EvidenceRefs       []string
 }
 
 type CapabilityExecution struct {
@@ -99,6 +105,9 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 			invocation.GoalID, invocation.StepID, invocation.Name, administratorArgumentsHash(invocation.Arguments)); err != nil {
 			return CapabilityExecution{}, fmt.Errorf("管理员精确授权已失效或已被其他步骤消费: %w", err)
 		}
+	}
+	if spec.Mutating {
+		ctx = withControlplaneShadowContext(ctx, invocation)
 	}
 	before := m.capabilityState(ctx, invocation)
 	call := model.AgentToolCall{RunID: invocation.RunID, Tool: invocation.Name, Arguments: invocation.Arguments,
@@ -726,6 +735,39 @@ func normalizedArguments(payload json.RawMessage) (json.RawMessage, error) {
 func administratorGrantedInvocation(invocation CapabilityInvocation) bool {
 	return invocation.AdministratorGrant != nil &&
 		validateAdministratorGrant(invocation.AdministratorGrant, invocation.Name, invocation.Arguments) == nil
+}
+
+func withControlplaneShadowContext(ctx context.Context, invocation CapabilityInvocation) context.Context {
+	var reason struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.Unmarshal(invocation.Arguments, &reason)
+	actionContext := controlplaneshadow.ActionContext{
+		StableSourceNamespace: controlplanebridge.SourceAgentAction,
+		StableSourceID:        strings.TrimSpace(invocation.IdempotencyKey),
+		Reason:                strings.TrimSpace(reason.Reason),
+		SnapshotVersion:       strings.TrimSpace(invocation.SnapshotVersion),
+		EvidenceRefs:          append([]string(nil), invocation.EvidenceRefs...),
+		CreatedAt:             invocation.CreatedAt,
+		ExpiresAt:             cloneInvocationTime(invocation.ExpiresAt),
+	}
+	if invocation.AdministratorGrant != nil {
+		grantID := strings.TrimSpace(invocation.AdministratorGrant.GrantID)
+		actionContext.StableSourceNamespace = controlplanebridge.SourceAdministratorGrantConsumption
+		actionContext.StableSourceID = grantID
+		actionContext.AdministratorAuthorization = controlplanebridge.AdministratorAuthorization{
+			IdentityVerified: true, ExactGrant: true, GrantConsumed: !invocation.DryRun, GrantConsumptionID: grantID,
+		}
+	}
+	return controlplaneshadow.WithActionContext(ctx, actionContext)
+}
+
+func cloneInvocationTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
 }
 
 func (m *Manager) capabilityState(ctx context.Context, invocation CapabilityInvocation) json.RawMessage {
