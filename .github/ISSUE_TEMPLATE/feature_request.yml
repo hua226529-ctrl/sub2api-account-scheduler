@@ -1,0 +1,49 @@
+name: Feature request
+description: 提议新的能力或行为改进
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已搜索现有问题和讨论，确认没有相同提议。
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 描述当前工作流中的具体困难，不要包含真实账号或凭据。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 描述期望的界面、接口或调度行为。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - 确定性调度
+        - 智能体
+        - 余额与倍率
+        - 上游分组救灾
+        - 管理界面
+        - 部署与可观测性
+    validations:
+      required: true

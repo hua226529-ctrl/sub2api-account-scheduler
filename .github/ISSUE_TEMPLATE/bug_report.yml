@@ -1,0 +1,75 @@
+name: Bug report
+description: 报告可以稳定复现的错误
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已搜索现有问题，确认没有重复报告。
+          required: true
+        - label: 我已删除日志和截图中的密钥、密码、Cookie、真实账号及其他敏感信息。
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 请填写 Git 标签、提交哈希或镜像标签。
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 部署方式
+      options:
+        - Docker Compose
+        - Docker
+        - Linux 二进制
+        - 源码运行
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 请说明实际行为、发生频率及影响范围。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开……
+        2. 配置……
+        3. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏日志
+      description: 不要提交管理员密钥、上游密码、模型密钥、Cookie 或数据库文件。
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、浏览器、Docker/Go/Node 版本及相关非敏感配置。

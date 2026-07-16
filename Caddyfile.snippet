@@ -1,0 +1,5 @@
+redir /scheduler /scheduler/ 308
+
+handle_path /scheduler/* {
+    reverse_proxy 127.0.0.1:8323
+}

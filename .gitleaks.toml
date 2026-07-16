@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic credentials used by redaction and adapter tests"
+regexTarget = "secret"
+regexes = [
+  '''^admin-local-test$''',
+  '''^sk-1234567890$''',
+  '''^sk-0987654321$''',
+  '''^sk-legacy1234$''',
+  '''^AbCDef0123456789_AbCDef0123456789_AbCd$''',
+  '''^AbCDef0123456789/AbCDef0123456789\+AbCd==$''',
+  '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJhZG1pbmlzdHJhdG9yIn0\.signature0123456789$''',
+]

@@ -1,0 +1,48 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state
+/data/
+/data-*/
+/.tmp*/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.wal
+*.shm
+cookies.txt
+*.log
+
+# Dependencies and generated assets
+/frontend/node_modules/
+/frontend/dist/
+/internal/webui/dist/*
+!/internal/webui/dist/.keep
+/dist/
+/release/
+
+# Build and test output
+/scheduler
+/scheduler-*
+*.exe
+*.test
+coverage.out
+coverage-*.out
+*.prof
+*.pprof
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Frontend and Go verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test -- --run
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(find cmd internal -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
+          if [[ -n "$unformatted" ]]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test Go packages
+        run: go test -buildvcs=false -count=1 ./...
+
+      - name: Vet Go packages
+        run: go vet ./...
+
+      - name: Build Linux AMD64 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -buildvcs=false -trimpath -ldflags="-s -w" \
+            -o release/scheduler-linux-amd64 ./cmd/scheduler
+          sha256sum release/scheduler-linux-amd64 > release/SHA256SUMS
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-linux-amd64
+          path: |
+            release/scheduler-linux-amd64
+            release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  race:
+    name: Go race detector
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build embedded frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run Go tests with race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -buildvcs=false -count=1 ./...
+
+  docker-smoke:
+    name: Docker smoke test
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build mock Sub2API
+        run: go build -buildvcs=false -o "$RUNNER_TEMP/mocksub2api" ./cmd/mocksub2api
+
+      - name: Build image and verify health
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mock_log="$RUNNER_TEMP/mocksub2api.log"
+          "$RUNNER_TEMP/mocksub2api" >"$mock_log" 2>&1 &
+          mock_pid=$!
+
+          cleanup() {
+            docker rm -f scheduler-smoke >/dev/null 2>&1 || true
+            kill "$mock_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 20); do
+            if curl -fsS -H 'x-api-key: admin-local-test' \
+              http://127.0.0.1:18080/api/v1/admin/accounts >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "20" ]]; then
+              cat "$mock_log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker build --pull --tag "sub2api-account-scheduler:${GITHUB_SHA}" .
+          docker run --detach --name scheduler-smoke \
+            --network host \
+            --read-only \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,noexec,size=16m,mode=1777 \
+            --tmpfs /data:rw,nosuid,noexec,size=64m,uid=10001,gid=10001,mode=0700 \
+            --env SUB2API_ADMIN_API_KEY=admin-local-test \
+            --env SUB2API_BASE_URL=http://127.0.0.1:18080 \
+            --env LISTEN_ADDRESS=:8323 \
+            --env DATABASE_PATH=/data/scheduler.db \
+            --env BASE_PATH=/scheduler/ \
+            --env COOKIE_SECURE=false \
+            --env DRY_RUN=true \
+            --env POLL_INTERVAL=10s \
+            --env REQUEST_TIMEOUT=3s \
+            --env BALANCE_POLL_INTERVAL=1m \
+            --env TELEMETRY_POLL_INTERVAL=1m \
+            "sub2api-account-scheduler:${GITHUB_SHA}"
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8323/healthz >/dev/null && \
+              curl -fsS http://127.0.0.1:8323/readyz >/dev/null; then
+              docker logs scheduler-smoke
+              exit 0
+            fi
+            if ! docker inspect -f '{{.State.Running}}' scheduler-smoke | grep -qx true; then
+              docker logs scheduler-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker logs scheduler-smoke
+          exit 1
