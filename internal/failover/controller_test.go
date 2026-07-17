@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,9 +13,9 @@ import (
 )
 
 type fakeStore struct {
+	mu               sync.Mutex
 	policies         []model.GroupFailoverPolicy
 	windows          map[string]model.AgentWindowStats
-	settings         model.AgentSettings
 	dispatch         model.Settings
 	states           []model.GroupFailoverState
 	events           []model.Event
@@ -22,19 +23,44 @@ type fakeStore struct {
 	count6h          int
 	windowErrAccount int64
 	windowCalls      []int64
+	evidence         []model.GroupValidationEvidence
 }
 
 func (f *fakeStore) ListGroupFailoverPolicies(context.Context, int64) ([]model.GroupFailoverPolicy, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return append([]model.GroupFailoverPolicy(nil), f.policies...), nil
 }
 func (f *fakeStore) SaveGroupFailoverState(_ context.Context, state model.GroupFailoverState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveGroupFailoverState(state)
+	return nil
+}
+func (f *fakeStore) CompareAndSaveGroupFailoverState(_ context.Context, expected, state model.GroupFailoverState) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := range f.policies {
+		current := f.policies[index].State
+		if current.SourceID != expected.SourceID || current.KeyID != expected.KeyID {
+			continue
+		}
+		if current.ValidationTransitionID != expected.ValidationTransitionID || current.ValidationStatus != expected.ValidationStatus ||
+			current.ValidationTargetTier != expected.ValidationTargetTier || current.ValidationTargetGroupID != expected.ValidationTargetGroupID {
+			return false, nil
+		}
+		f.saveGroupFailoverState(state)
+		return true, nil
+	}
+	return false, nil
+}
+func (f *fakeStore) saveGroupFailoverState(state model.GroupFailoverState) {
 	f.states = append(f.states, state)
 	for index := range f.policies {
 		if f.policies[index].SourceID == state.SourceID && f.policies[index].KeyID == state.KeyID {
 			f.policies[index].State = state
 		}
 	}
-	return nil
 }
 func (f *fakeStore) CountCompletedGroupTierTransitions(_ context.Context, _ int64, _ string, since time.Time) (int, error) {
 	if time.Since(since) <= time.Hour {
@@ -50,9 +76,6 @@ func (f *fakeStore) GetAgentWindowStats(_ context.Context, accountID int64, _ ti
 	}
 	return f.windows[windowKey(label, accountID)], nil
 }
-func (f *fakeStore) GetAgentSettings(context.Context) (model.AgentSettings, error) {
-	return f.settings, nil
-}
 func (f *fakeStore) GetSettings(context.Context) (model.Settings, error) {
 	return f.dispatch, nil
 }
@@ -60,14 +83,24 @@ func (f *fakeStore) AddEvent(_ context.Context, event model.Event) error {
 	f.events = append(f.events, event)
 	return nil
 }
+func (f *fakeStore) ListGroupValidationEvidence(_ context.Context, _ []int64, _ []int64, monitorAfter, trafficAfter int64) ([]model.GroupValidationEvidence, error) {
+	items := make([]model.GroupValidationEvidence, 0, len(f.evidence))
+	for _, item := range f.evidence {
+		if (item.Source == "monitor" && item.ID > monitorAfter) || (item.Source == "traffic" && item.ID > trafficAfter) {
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
 
 type fakeSnapshots struct{ snapshot model.Snapshot }
 
 func (f *fakeSnapshots) Snapshot() model.Snapshot { return f.snapshot }
 
 type fakeUpstreams struct {
-	sources     []model.UpstreamSource
-	transitions []model.GroupTierTransitionRequest
+	sources               []model.UpstreamSource
+	transitions           []model.GroupTierTransitionRequest
+	transitionErrBySource map[int64]error
 }
 
 func (f *fakeUpstreams) List(context.Context) ([]model.UpstreamSource, error) {
@@ -75,7 +108,10 @@ func (f *fakeUpstreams) List(context.Context) ([]model.UpstreamSource, error) {
 }
 func (f *fakeUpstreams) TransitionGroupTier(_ context.Context, request model.GroupTierTransitionRequest) (model.GroupTierTransition, error) {
 	f.transitions = append(f.transitions, request)
-	return model.GroupTierTransition{SourceID: request.SourceID, KeyID: request.KeyID, ToTier: request.TargetTier, Status: model.GroupTransitionCompleted}, nil
+	if err := f.transitionErrBySource[request.SourceID]; err != nil {
+		return model.GroupTierTransition{}, err
+	}
+	return model.GroupTierTransition{SourceID: request.SourceID, KeyID: request.KeyID, ToTier: request.TargetTier, Status: model.GroupTransitionApplied}, nil
 }
 
 type fakeTelemetry struct{ at time.Time }
@@ -136,10 +172,10 @@ func TestCharacterizationControllerRejectsStaleSnapshotBeforeAnyTransition(t *te
 	}
 }
 
-func TestCurrentBehaviorAgentObserveModeMakesFailoverDryRun(t *testing.T) {
+func TestFailoverObserveModeMakesTransitionDryRun(t *testing.T) {
 	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
-	store.settings.Mode = model.AgentModeObserve
+	store.dispatch.FailoverMode = model.FailoverModeObserve
 	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
 	controller.now = func() time.Time { return now }
 	controller.outageSince["pool-a"] = now.Add(-5 * time.Minute)
@@ -151,7 +187,7 @@ func TestCurrentBehaviorAgentObserveModeMakesFailoverDryRun(t *testing.T) {
 	}
 }
 
-func TestCurrentBehaviorFirstPoolAssessmentFailureStopsLaterPools(t *testing.T) {
+func TestPoolAssessmentFailureDoesNotStopLaterPools(t *testing.T) {
 	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
 	secondPolicy := store.policies[0]
@@ -175,10 +211,52 @@ func TestCurrentBehaviorFirstPoolAssessmentFailureStopsLaterPools(t *testing.T) 
 	if err := controller.RunOnce(context.Background()); err == nil {
 		t.Fatal("first pool assessment failure unexpectedly allowed the round to succeed")
 	}
+	foundLaterPool := false
 	for _, accountID := range store.windowCalls {
-		if accountID == 202 {
-			t.Fatalf("later pool was evaluated after the first pool error: calls=%v", store.windowCalls)
-		}
+		foundLaterPool = foundLaterPool || accountID == 202
+	}
+	if !foundLaterPool {
+		t.Fatalf("later pool was not evaluated after the first pool error: calls=%v", store.windowCalls)
+	}
+}
+
+func TestFailoverMutationBudgetDefersLaterPoolWithoutSkippingAssessment(t *testing.T) {
+	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
+	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
+	addSecondFailoverPool(store, snapshots, upstreams, now)
+	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
+	controller.now = func() time.Time { return now }
+	controller.outageSince["pool-a"] = now.Add(-5 * time.Minute)
+	controller.outageSince["pool-b"] = now.Add(-5 * time.Minute)
+	if err := controller.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(upstreams.transitions) != 2 || upstreams.transitions[0].DryRun || !upstreams.transitions[1].DryRun {
+		t.Fatalf("mutation budget did not execute one and defer one: %+v", upstreams.transitions)
+	}
+	foundDeferred := false
+	for _, event := range store.events {
+		foundDeferred = foundDeferred || event.Type == "group_failover_mutation_deferred"
+	}
+	if !foundDeferred {
+		t.Fatal("deferred mutation reason was not recorded")
+	}
+}
+
+func TestFailoverTransitionFailureDoesNotStopLaterPool(t *testing.T) {
+	now := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
+	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 3)
+	addSecondFailoverPool(store, snapshots, upstreams, now)
+	upstreams.transitionErrBySource = map[int64]error{1: errors.New("injected transition failure")}
+	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
+	controller.now = func() time.Time { return now }
+	controller.outageSince["pool-a"] = now.Add(-5 * time.Minute)
+	controller.outageSince["pool-b"] = now.Add(-5 * time.Minute)
+	if err := controller.RunOnce(context.Background()); err == nil {
+		t.Fatal("aggregated cycle error was not returned")
+	}
+	if len(upstreams.transitions) != 2 || upstreams.transitions[1].SourceID != 2 || upstreams.transitions[1].DryRun {
+		t.Fatalf("later pool was not executed after the first transition failure: %+v", upstreams.transitions)
 	}
 }
 
@@ -294,13 +372,13 @@ func TestCharacterizationControllerRequiresPersistedDistinctMonitorStreak(t *tes
 	}
 }
 
-func TestControllerLocksPoolToBackupPolicyUntilPostSwitchEvidenceArrives(t *testing.T) {
+func TestControllerAwaitingEvidenceDoesNotEscalateOrSwitchAnotherKey(t *testing.T) {
 	now := time.Date(2026, 7, 15, 3, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 5)
 	started := now.Add(-3 * time.Minute)
 	store.policies[0].State = model.GroupFailoverState{
 		SourceID: 1, KeyID: "11", CurrentTier: model.GroupTierBackup, ObservedGroupID: "backup",
-		LastTransitionAt: &started, VerificationStartedAt: &started,
+		LastTransitionAt: &started, VerificationStartedAt: &started, ValidationStatus: model.GroupValidationAwaitingEvidence,
 	}
 	upstreams.sources[0].KeyRates[0].GroupID = "backup"
 
@@ -329,11 +407,6 @@ func TestControllerLocksPoolToBackupPolicyUntilPostSwitchEvidenceArrives(t *test
 		ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 5},
 	}
 	store.windows[windowKey("hard_tail", 202)] = store.windows[windowKey("5m", 202)]
-	store.windows[windowKey("post_group_switch", 101)] = model.AgentWindowStats{
-		SampleCount: 4, EligibleCount: 4, ErrorCount: 4,
-		ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 4},
-	}
-
 	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
 	controller.now = func() time.Time { return now }
 	controller.outageSince["pool-a"] = now.Add(-controller.interval)
@@ -344,85 +417,35 @@ func TestControllerLocksPoolToBackupPolicyUntilPostSwitchEvidenceArrives(t *test
 		t.Fatalf("backup verification switched another token or escalated early: %+v", upstreams.transitions)
 	}
 
-	// A second distinct post-switch monitor result is now visible, but only four
-	// post-switch traffic records exist. The active token must keep the pool lock.
-	now = now.Add(50 * time.Second)
-	updateFixtureTimes(snapshots, now)
-	controller.telemetry = fakeTelemetry{at: now}
-	if err := controller.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(upstreams.transitions) != 0 {
-		t.Fatalf("backup escalated without five post-switch requests: %+v", upstreams.transitions)
-	}
-
-	store.windows[windowKey("post_group_switch", 101)] = model.AgentWindowStats{
-		SampleCount: 5, EligibleCount: 5, ErrorCount: 5,
-		ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 5},
-	}
-	now = now.Add(50 * time.Second)
-	updateFixtureTimes(snapshots, now)
-	controller.telemetry = fakeTelemetry{at: now}
-	if err := controller.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(upstreams.transitions) != 1 {
-		t.Fatalf("expected one escalation after post-switch evidence, got %+v", upstreams.transitions)
-	}
-	if transition := upstreams.transitions[0]; transition.SourceID != 1 || transition.KeyID != "11" || transition.TargetTier != model.GroupTierEmergency {
-		t.Fatalf("wrong active rescue chain advanced: %+v", transition)
-	}
 }
 
-func TestControllerWaitsFullBackupVerificationWindow(t *testing.T) {
+func TestControllerConfirmedBackupFailureAdvancesToFixedEmergency(t *testing.T) {
 	now := time.Date(2026, 7, 15, 4, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusFailed, 5)
 	started := now.Add(-time.Minute)
 	store.policies[0].State = model.GroupFailoverState{
 		SourceID: 1, KeyID: "11", CurrentTier: model.GroupTierBackup, ObservedGroupID: "backup",
-		LastTransitionAt: &started, VerificationStartedAt: &started,
-	}
-	store.windows[windowKey("post_group_switch", 101)] = model.AgentWindowStats{
-		SampleCount: 5, EligibleCount: 5, ErrorCount: 5,
-		ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 5},
+		LastTransitionAt: &started, VerificationStartedAt: &started, ValidationStatus: model.GroupValidationConfirmedFailed,
 	}
 	upstreams.sources[0].KeyRates[0].GroupID = "backup"
 	controller := NewController(store, snapshots, upstreams, fakeTelemetry{at: now}, 50*time.Second, slog.Default())
 	controller.now = func() time.Time { return now }
-	controller.outageSince["pool-a"] = now.Add(-controller.interval)
-
-	if err := controller.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(50 * time.Second)
-	updateFixtureTimes(snapshots, now)
-	controller.telemetry = fakeTelemetry{at: now}
-	if err := controller.RunOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(upstreams.transitions) != 0 {
-		t.Fatalf("backup escalated before the full two-minute window: %+v", upstreams.transitions)
-	}
-
-	now = now.Add(20 * time.Second)
-	updateFixtureTimes(snapshots, now)
-	controller.telemetry = fakeTelemetry{at: now}
 	if err := controller.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(upstreams.transitions) != 1 || upstreams.transitions[0].TargetTier != model.GroupTierEmergency {
-		t.Fatalf("backup did not escalate after time and evidence gates: %+v", upstreams.transitions)
+		t.Fatalf("confirmed backup failure did not advance to fixed emergency: %+v", upstreams.transitions)
 	}
 }
 
-func TestControllerReturnsDirectlyToMainAfterStableRecovery(t *testing.T) {
+func TestControllerDoesNotAutoReturnToUnobservableMain(t *testing.T) {
 	now := time.Date(2026, 7, 15, 2, 0, 0, 0, time.UTC)
 	store, snapshots, upstreams := failoverFixture(now, model.StatusOperational, 0)
 	healthySince := now.Add(-31 * time.Minute)
 	lastTransition := now.Add(-40 * time.Minute)
 	store.policies[0].State = model.GroupFailoverState{
 		SourceID: 1, KeyID: "11", CurrentTier: model.GroupTierBackup, ObservedGroupID: "backup",
-		HealthySince: &healthySince, LastTransitionAt: &lastTransition,
+		HealthySince: &healthySince, LastTransitionAt: &lastTransition, ValidationStatus: model.GroupValidationConfirmedHealthy,
 	}
 	snapshots.snapshot.Bindings[0].MonitorState.HealthyStreak = 12
 	store.windows[windowKey("5m", 101)] = model.AgentWindowStats{EligibleCount: 5, SuccessCount: 5, SuccessRate: 100, ErrorCategoryCounts: map[string]int{}}
@@ -433,8 +456,8 @@ func TestControllerReturnsDirectlyToMainAfterStableRecovery(t *testing.T) {
 	if err := controller.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(upstreams.transitions) != 1 || upstreams.transitions[0].TargetTier != model.GroupTierMain {
-		t.Fatalf("recovery transition = %+v", upstreams.transitions)
+	if len(upstreams.transitions) != 0 {
+		t.Fatalf("unobservable main group caused automatic return: %+v", upstreams.transitions)
 	}
 }
 
@@ -446,7 +469,7 @@ func failoverFixture(now time.Time, status string, unhealthyStreak int) (*fakeSt
 		State: model.GroupFailoverState{SourceID: 1, KeyID: "11", CurrentTier: model.GroupTierMain, ObservedGroupID: "main"},
 	}
 	store := &fakeStore{
-		policies: []model.GroupFailoverPolicy{policy}, settings: model.AgentSettings{Mode: model.AgentModeControl},
+		policies: []model.GroupFailoverPolicy{policy},
 		dispatch: testFailoverSettings(),
 		windows: map[string]model.AgentWindowStats{
 			windowKey("5m", 101):        {SampleCount: 10, EligibleCount: 10, SuccessCount: 1, ErrorCount: 9, SuccessRate: 10, ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 9}},
@@ -470,8 +493,29 @@ func failoverFixture(now time.Time, status string, unhealthyStreak int) (*fakeSt
 	return store, snapshots, upstreams
 }
 
+func addSecondFailoverPool(store *fakeStore, snapshots *fakeSnapshots, upstreams *fakeUpstreams, now time.Time) {
+	secondPolicy := store.policies[0]
+	secondPolicy.SourceID, secondPolicy.KeyID, secondPolicy.Pool = 2, "22", "pool-b"
+	secondPolicy.AccountIDs = []int64{202}
+	secondPolicy.State.SourceID, secondPolicy.State.KeyID = 2, "22"
+	store.policies = append(store.policies, secondPolicy)
+	store.windows[windowKey("5m", 202)] = store.windows[windowKey("5m", 101)]
+	store.windows[windowKey("hard_tail", 202)] = store.windows[windowKey("hard_tail", 101)]
+	secondSource := upstreams.sources[0]
+	secondSource.ID, secondSource.NormalizedURL, secondSource.RoutingPool = 2, "https://upstream-b.example", "pool-b"
+	secondSource.KeyRates = []model.KeyRate{{ExternalID: "22", GroupID: "main", Status: "active"}}
+	upstreams.sources = append(upstreams.sources, secondSource)
+	secondBinding := snapshots.snapshot.Bindings[0]
+	secondBinding.Account.ID = 202
+	secondBinding.NormalizedEndpoint = secondSource.NormalizedURL
+	secondBinding.Monitor = &model.Monitor{ID: 8, Enabled: true, PrimaryStatus: model.StatusFailed, LastCheckedAt: &now}
+	secondBinding.MonitorState.MonitorID = 8
+	snapshots.snapshot.Bindings = append(snapshots.snapshot.Bindings, secondBinding)
+}
+
 func testFailoverSettings() model.Settings {
 	return model.Settings{
+		FailoverMode: model.FailoverModeControl, FailoverMutationBudget: 1,
 		FailoverAccountFreshMinutes: 3, FailoverTelemetryFreshMinutes: 6, FailoverGroupFreshMinutes: 30,
 		FailoverAgentGraceSeconds: 90, FailoverMonitorFailures: 3, FailoverNoTrafficFailures: 5,
 		FailoverTrafficWindowMinutes: 5, FailoverTrafficMinSamples: 10, FailoverTrafficSuccessBelow: 20,

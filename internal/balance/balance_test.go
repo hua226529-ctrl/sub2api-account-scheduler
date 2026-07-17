@@ -418,6 +418,13 @@ type fakeTrigger struct{}
 
 func (fakeTrigger) Trigger() {}
 
+func (fakeTrigger) Snapshot() model.Snapshot {
+	return model.Snapshot{Bindings: []model.ResolvedBinding{{
+		Account: model.Account{ID: 11},
+		Monitor: &model.Monitor{ID: 7, Enabled: true, IntervalSeconds: 60},
+	}}}
+}
+
 func writeTestJSON(w http.ResponseWriter, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/mutation"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/store"
 )
 
 func (m *Manager) ListGroupFailoverPolicies(ctx context.Context, sourceID int64) ([]model.GroupFailoverPolicy, error) {
@@ -34,6 +35,9 @@ func (m *Manager) SaveGroupFailoverPolicy(ctx context.Context, policy model.Grou
 	if err != nil {
 		return model.GroupFailoverPolicy{}, err
 	}
+	if err := m.validateGroupFailoverEvidenceSource(policy); err != nil {
+		return model.GroupFailoverPolicy{}, err
+	}
 	policy.KeyName = key.Name
 	policy.KeyHint = key.KeyHint
 	saved, err := m.store.SaveGroupFailoverPolicy(ctx, policy)
@@ -45,7 +49,13 @@ func (m *Manager) SaveGroupFailoverPolicy(ctx context.Context, policy model.Grou
 	state.KeyID = saved.KeyID
 	state.ObservedGroupID = key.GroupID
 	state.CurrentTier = observedTier
-	state.LastConfirmedAt = source.LastSuccessAt
+	state.LastConfirmedAt = nil
+	if state.ValidationStatus == "" {
+		state.ValidationStatus = model.GroupValidationUnknown
+	}
+	if state.ValidationMode == "" {
+		state.ValidationMode = model.GroupValidationModePassive
+	}
 	state.Frozen = observedTier == ""
 	if state.Frozen {
 		state.FreezeReason = "当前令牌分组不在已配置的主、备用、紧急分组中"
@@ -83,6 +93,9 @@ func (m *Manager) ConfirmGroupFailoverPolicy(ctx context.Context, sourceID int64
 	if tier == "" {
 		return model.GroupFailoverPolicy{}, errors.New("当前令牌分组不属于主、备用或紧急分组，不能确认自动救灾")
 	}
+	if err := m.validateGroupFailoverEvidenceSource(policy); err != nil {
+		return model.GroupFailoverPolicy{}, err
+	}
 	confirmed, err := m.store.ConfirmGroupFailoverPolicy(ctx, sourceID, keyID, version, fallbackActor(actor))
 	if err != nil {
 		return model.GroupFailoverPolicy{}, err
@@ -109,13 +122,11 @@ func (m *Manager) DeleteGroupFailoverPolicy(ctx context.Context, sourceID int64,
 // TransitionGroupTier is the only automated group-write entry point. The
 // caller selects a configured tier, never an arbitrary upstream group ID.
 func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTierTransitionRequest) (model.GroupTierTransition, error) {
-	m.runMu.Lock()
-	defer m.runMu.Unlock()
-
 	request.KeyID = strings.TrimSpace(request.KeyID)
 	request.TargetTier = strings.ToLower(strings.TrimSpace(request.TargetTier))
 	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
 	request.Actor = fallbackActor(request.Actor)
+	request.Producer, request.Authority = groupRequestIdentity(request)
 	if !validGroupTier(request.TargetTier) {
 		return model.GroupTierTransition{}, errors.New("目标层级只能是 main、backup 或 emergency")
 	}
@@ -123,6 +134,20 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 		return model.GroupTierTransition{}, errors.New("切换幂等编号不能为空")
 	}
 	if existing, err := m.store.GetGroupTierTransitionByKey(ctx, request.IdempotencyKey); err == nil {
+		if !groupRequestMatchesExisting(request, existing) {
+			return model.GroupTierTransition{}, store.ErrGroupTransitionIdempotencyConflict
+		}
+		return existing, nil
+	}
+	release, err := m.groupLocks.acquire(ctx, request.SourceID, request.KeyID)
+	if err != nil {
+		return model.GroupTierTransition{}, err
+	}
+	defer release()
+	if existing, err := m.store.GetGroupTierTransitionByKey(ctx, request.IdempotencyKey); err == nil {
+		if !groupRequestMatchesExisting(request, existing) {
+			return model.GroupTierTransition{}, store.ErrGroupTransitionIdempotencyConflict
+		}
 		return existing, nil
 	}
 	settings, err := m.store.GetSettings(ctx)
@@ -152,6 +177,14 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 	}
 	if (!request.Manual && !policy.Enabled) || !policy.Confirmed || policy.ConfirmedVersion != policy.Version {
 		return model.GroupTierTransition{}, errors.New("三级分组策略未启用或尚未确认当前版本")
+	}
+	if !request.Manual {
+		if err := m.validateGroupFailoverEvidenceSource(policy); err != nil {
+			return model.GroupTierTransition{}, err
+		}
+	}
+	if !tierEnabled(policy, request.TargetTier) || strings.TrimSpace(groupIDForTier(policy, request.TargetTier)) == "" {
+		return model.GroupTierTransition{}, errors.New("目标固定层级未配置或已停用")
 	}
 	if expectedPool := strings.TrimSpace(request.ExpectedPool); expectedPool != "" && expectedPool != strings.TrimSpace(policy.Pool) {
 		return model.GroupTierTransition{}, errors.New("调度池策略已变化，拒绝执行过期的切组动作")
@@ -209,7 +242,9 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 		state.PreviousTier = state.CurrentTier
 		state.PreviousGroupID = state.ObservedGroupID
 		state.ObservedGroupID = liveKey.GroupID
-		state.LastConfirmedAt = &now
+		state.LastConfirmedAt = nil
+		state.ValidationStatus = model.GroupValidationUncertain
+		state.LastError = "manual_switch_requires_new_evidence_boundary"
 		if liveTier == "" {
 			state.Frozen = true
 			state.FreezeReason = "切组前检测到上游后台已将令牌改到未知分组"
@@ -218,7 +253,6 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 			state.CurrentTier = liveTier
 			state.Frozen = false
 			state.FreezeReason = ""
-			state.LastError = ""
 			state.ManualHoldUntil = timePointer(now.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
 			state.ManualOverrideUntil = timePointer(now.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
 		}
@@ -253,43 +287,33 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 		if activeUntil(state.ManualOverrideUntil, state.ManualHoldUntil, now) {
 			return model.GroupTierTransition{}, errors.New("人工保护期内禁止自动切换")
 		}
-		mainTrialRollback := request.Trigger == "main_trial_rollback"
-		if mainTrialRollback {
-			validRollback := currentTier == model.GroupTierMain && state.PreviousStableTier != "" &&
-				request.TargetTier == state.PreviousStableTier && state.LastTransitionAt != nil &&
-				now.Sub(state.LastTransitionAt.UTC()) <= time.Duration(settings.FailoverMainVerifyMinutes)*time.Minute &&
-				(state.PreviousGroupID == "" || state.PreviousGroupID == targetGroupID)
-			if !validRollback {
-				return model.GroupTierTransition{}, errors.New("主分组试运行回滚条件已失效")
-			}
-		} else {
-			emergencyEscalation := currentTier == model.GroupTierBackup && request.TargetTier == model.GroupTierEmergency
-			if state.CooldownUntil != nil && now.Before(*state.CooldownUntil) && !emergencyEscalation {
-				return model.GroupTierTransition{}, fmt.Errorf("令牌仍在 %d 分钟切换冷却期", settings.FailoverSwitchCooldownMinutes)
-			}
-			count30, countErr := m.store.CountCompletedGroupTierTransitions(ctx, source.ID, policy.KeyID, now.Add(-time.Duration(settings.FailoverShortLimitWindowMinutes)*time.Minute))
-			if countErr != nil {
-				return model.GroupTierTransition{}, countErr
-			}
-			count6h, countErr := m.store.CountCompletedGroupTierTransitions(ctx, source.ID, policy.KeyID, now.Add(-time.Duration(settings.FailoverLongLimitWindowMinutes)*time.Minute))
-			if countErr != nil {
-				return model.GroupTierTransition{}, countErr
-			}
-			if count30 >= settings.FailoverShortLimitCount || count6h >= settings.FailoverLongLimitCount {
-				state.Frozen = true
-				state.FreezeReason = "自动切换次数达到安全上限"
-				state.LastError = state.FreezeReason
-				_ = m.store.SaveGroupFailoverState(ctx, state)
-				return model.GroupTierTransition{}, errors.New("自动切换次数达到上限，已冻结该令牌")
-			}
+		emergencyEscalation := currentTier == model.GroupTierBackup && request.TargetTier == model.GroupTierEmergency
+		if state.CooldownUntil != nil && now.Before(*state.CooldownUntil) && !emergencyEscalation {
+			return model.GroupTierTransition{}, fmt.Errorf("令牌仍在 %d 分钟切换冷却期", settings.FailoverSwitchCooldownMinutes)
+		}
+		count30, countErr := m.store.CountCompletedGroupTierTransitions(ctx, source.ID, policy.KeyID, now.Add(-time.Duration(settings.FailoverShortLimitWindowMinutes)*time.Minute))
+		if countErr != nil {
+			return model.GroupTierTransition{}, countErr
+		}
+		count6h, countErr := m.store.CountCompletedGroupTierTransitions(ctx, source.ID, policy.KeyID, now.Add(-time.Duration(settings.FailoverLongLimitWindowMinutes)*time.Minute))
+		if countErr != nil {
+			return model.GroupTierTransition{}, countErr
+		}
+		if count30 >= settings.FailoverShortLimitCount || count6h >= settings.FailoverLongLimitCount {
+			state.Frozen = true
+			state.FreezeReason = "自动切换次数达到安全上限"
+			state.LastError = state.FreezeReason
+			_ = m.store.SaveGroupFailoverState(ctx, state)
+			return model.GroupTierTransition{}, errors.New("自动切换次数达到上限，已冻结该令牌")
 		}
 	}
 
 	transition := model.GroupTierTransition{
 		IdempotencyKey: request.IdempotencyKey, SourceID: source.ID, KeyID: policy.KeyID,
 		FromTier: currentTier, ToTier: request.TargetTier, FromGroupID: key.GroupID, ToGroupID: targetGroupID,
-		Actor: request.Actor, Reason: strings.TrimSpace(request.Reason), Evidence: strings.TrimSpace(request.Evidence),
+		Actor: request.Actor, Producer: request.Producer, Authority: request.Authority, Reason: strings.TrimSpace(request.Reason), Evidence: strings.TrimSpace(request.Evidence), SnapshotVersion: strings.TrimSpace(request.SnapshotVersion),
 		Trigger: request.Trigger, PacketID: request.PacketID, RunID: request.RunID, Manual: request.Manual, DryRun: request.DryRun, CreatedAt: now,
+		BeforeState: key.GroupID,
 	}
 	if err := m.store.AssertNoPendingGroupTransition(ctx, source.ID, policy.KeyID); err != nil {
 		return model.GroupTierTransition{}, err
@@ -306,27 +330,67 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 		transition.CompletedAt = &now
 		return transition, nil
 	}
+	watermarks, err := m.store.GetFailoverEvidenceWatermarks(ctx)
+	if err != nil {
+		_ = m.store.FailGroupTierTransition(ctx, transition.ID, err.Error(), now)
+		return transition, fmt.Errorf("读取切换证据水位: %w", err)
+	}
+	previousValidationStatus := state.ValidationStatus
+	state.ValidationStatus = model.GroupValidationTransitioning
+	state.ValidationMode = model.GroupValidationModePassive
+	state.ValidationTransitionID = transition.ID
+	state.ValidationFromTier = currentTier
+	state.ValidationTargetTier = request.TargetTier
+	state.ValidationFromGroupID = key.GroupID
+	state.ValidationTargetGroupID = targetGroupID
+	state.SwitchRequestedAt = &now
+	state.SwitchVerifiedAt = nil
+	state.ValidationNotBefore = nil
+	state.EvidenceDeadline = nil
+	state.MonitorWatermark = watermarks.Monitor
+	state.TrafficWatermark = watermarks.Traffic
+	state.MonitorEvidenceCursor = watermarks.Monitor
+	state.TrafficEvidenceCursor = watermarks.Traffic
+	state.ActiveProbeAttempts = 0
+	state.SuccessfulEvidenceCount = 0
+	state.FailedEvidenceCount = 0
+	state.LastEvidenceID = ""
+	state.LastEvidenceSource = ""
+	state.LastEvidenceReason = ""
+	state.LastEvidenceAt = nil
+	if err := m.store.SaveGroupFailoverState(ctx, state); err != nil {
+		_ = m.store.FailGroupTierTransition(ctx, transition.ID, err.Error(), now)
+		return transition, err
+	}
 	if currentTier == request.TargetTier && key.GroupID == targetGroupID {
 		state.CurrentTier = currentTier
 		state.ObservedGroupID = key.GroupID
-		state.LastConfirmedAt = &now
+		state.ValidationStatus = previousValidationStatus
 		if err := m.store.CompleteGroupTierTransition(ctx, transition.ID, state, now); err != nil {
 			return transition, err
 		}
-		transition.Status = model.GroupTransitionCompleted
+		transition.Status = model.GroupTransitionApplied
+		transition.VerifiedAfter = key.GroupID
 		transition.CompletedAt = &now
 		return transition, nil
 	}
 
-	result, switchErr := m.switchAutomatedGroup(ctx, request.Manual, request.AutomationLeaseHeld, source, credentials, policy.KeyID, targetGroupID)
+	result, switchErr := m.executeGroupTransport(ctx, request.Manual, request.AutomationLeaseHeld, source, credentials, policy.KeyID, targetGroupID)
 	if switchErr != nil {
 		if mutation.IsUncertain(switchErr) {
 			_ = m.store.MarkGroupTierTransitionUncertain(ctx, transition.ID, switchErr.Error())
+			state.ValidationStatus = model.GroupValidationUncertain
+			state.LastError = "switch_result_uncertain"
+			_ = m.store.SaveGroupFailoverState(ctx, state)
 			transition.Error = switchErr.Error()
+			transition.Uncertain = true
 			m.record(ctx, model.Event{Type: "group_failover_transition_reconciling", Severity: "critical", Message: source.Name + " 三级分组切换结果不明确，已保留幂等流水并只允许回读: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)})
 			return transition, switchErr
 		}
 		_ = m.store.FailGroupTierTransition(ctx, transition.ID, switchErr.Error(), now)
+		state.ValidationStatus = previousValidationStatus
+		state.LastError = switchErr.Error()
+		_ = m.store.SaveGroupFailoverState(ctx, state)
 		m.record(ctx, model.Event{Type: "group_failover_transition_failed", Severity: "error", Message: source.Name + " 三级分组切换失败: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)})
 		return transition, switchErr
 	}
@@ -334,6 +398,9 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 	if !confirmed || confirmedKey.GroupID != targetGroupID {
 		switchErr = errors.New("上游写后确认结果与目标分组不一致")
 		_ = m.store.FailGroupTierTransition(ctx, transition.ID, switchErr.Error(), time.Now().UTC())
+		state.ValidationStatus = model.GroupValidationUncertain
+		state.LastError = "post_write_readback_mismatch"
+		_ = m.store.SaveGroupFailoverState(ctx, state)
 		return transition, switchErr
 	}
 	completedAt := time.Now().UTC()
@@ -348,16 +415,17 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 	state.LastSwitchAt = &completedAt
 	state.LastTransitionAt = &completedAt
 	state.VerificationStartedAt = &completedAt
-	state.LastConfirmedAt = &completedAt
+	state.LastConfirmedAt = nil
+	state.ValidationStatus = model.GroupValidationAwaitingEvidence
+	state.ValidationMode = model.GroupValidationModePassive
+	state.SwitchVerifiedAt = &completedAt
+	validationNotBefore := completedAt.Add(model.GroupValidationPropagationDelay)
+	evidenceDeadline := completedAt.Add(model.GroupValidationEvidenceTimeout)
+	state.ValidationNotBefore = &validationNotBefore
+	state.EvidenceDeadline = &evidenceDeadline
 	state.CooldownUntil = timePointer(completedAt.Add(time.Duration(settings.FailoverSwitchCooldownMinutes) * time.Minute))
 	state.HealthySince = nil
 	state.RecoveryHealthyCount = 0
-	if request.Trigger == "main_trial_rollback" && !request.Manual {
-		state.ReturnBlockedUntil = timePointer(completedAt.Add(time.Duration(settings.FailoverReturnRetryMinutes) * time.Minute))
-		state.PreviousTier = ""
-		state.PreviousStableTier = ""
-		state.PreviousGroupID = ""
-	}
 	if request.Manual {
 		state.ManualHoldUntil = timePointer(completedAt.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
 		state.ManualOverrideUntil = timePointer(completedAt.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
@@ -368,37 +436,164 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 	// The group write was already confirmed. A later balance-lock reconciliation
 	// failure must not turn a successful upstream mutation into an unknown state.
 	if err := m.applySuccess(ctx, &source, result); err != nil {
-		m.logger.Warn("group_transition_post_refresh_failed", "source_id", source.ID, "key_id", policy.KeyID, "error", err)
+		m.logger.Warn("group_transition_post_refresh_failed", "source_id", source.ID, "error", err)
 	}
-	transition.Status = model.GroupTransitionCompleted
+	transition.Status = model.GroupTransitionApplied
+	transition.VerifiedAfter = targetGroupID
 	transition.CompletedAt = &completedAt
-	m.record(ctx, model.Event{Type: "group_failover_transition_completed", Severity: "warning", Message: fmt.Sprintf("%s 令牌已从 %s 切换到 %s 并完成写后确认", source.Name, currentTier, request.TargetTier), BeforeState: currentTier, AfterState: request.TargetTier, Actor: request.Actor, Details: transitionDetails(transition)})
+	m.record(ctx, model.Event{Type: "group_failover_transition_applied", Severity: "warning", Message: fmt.Sprintf("%s 令牌已从 %s 切换到 %s 并完成写后确认，等待切换后证据", source.Name, currentTier, request.TargetTier), BeforeState: currentTier, AfterState: request.TargetTier, Actor: request.Actor, Details: transitionDetails(transition)})
 	m.trigger.Trigger()
 	return transition, nil
 }
 
-func (m *Manager) switchAutomatedGroup(ctx context.Context, manual, automationLeaseHeld bool, source model.UpstreamSource, credentials model.UpstreamCredentials, keyID, targetGroupID string) (model.UpstreamResult, error) {
-	if manual {
-		return m.fetcher.SwitchGroup(ctx, source.Provider, source.BaseURL, credentials, keyID, targetGroupID)
-	}
-	if m.barrier == nil || m.freeze == nil {
-		return model.UpstreamResult{}, errors.New("自动切组缺少全局冻结屏障，已拒绝外部写入")
-	}
-	if !automationLeaseHeld {
-		release, err := m.barrier.EnterMutation(ctx)
-		if err != nil {
-			return model.UpstreamResult{}, fmt.Errorf("等待自动切组冻结屏障: %w", err)
+func (m *Manager) executeGroupTransport(ctx context.Context, manual, automationLeaseHeld bool, source model.UpstreamSource, credentials model.UpstreamCredentials, keyID, targetGroupID string) (model.UpstreamResult, error) {
+	if !manual {
+		if m.barrier == nil || m.freeze == nil {
+			return model.UpstreamResult{}, errors.New("自动切组缺少全局冻结屏障，已拒绝外部写入")
 		}
-		defer release()
-	}
-	freeze, err := m.freeze.FreezeState(ctx)
-	if err != nil {
-		return model.UpstreamResult{}, fmt.Errorf("切组前读取自动化冻结状态失败: %w", err)
-	}
-	if freeze.AllAutomation {
-		return model.UpstreamResult{}, errors.New("全部自动化已冻结，自动切组被拒绝")
+		if !automationLeaseHeld {
+			release, err := m.barrier.EnterMutation(ctx)
+			if err != nil {
+				return model.UpstreamResult{}, fmt.Errorf("等待自动切组冻结屏障: %w", err)
+			}
+			defer release()
+		}
+		freeze, err := m.freeze.FreezeState(ctx)
+		if err != nil {
+			return model.UpstreamResult{}, fmt.Errorf("切组前读取自动化冻结状态失败: %w", err)
+		}
+		if freeze.AllAutomation {
+			return model.UpstreamResult{}, errors.New("全部自动化已冻结，自动切组被拒绝")
+		}
 	}
 	return m.fetcher.SwitchGroup(ctx, source.Provider, source.BaseURL, credentials, keyID, targetGroupID)
+}
+
+// RecoverGroupTransitions resolves pending journal rows by readback only. It
+// never replays a group write because the pre-crash transport outcome may be
+// unknown.
+func (m *Manager) RecoverGroupTransitions(ctx context.Context) error {
+	items, err := m.store.ListPendingGroupTierTransitions(ctx)
+	if err != nil {
+		return err
+	}
+	var recoveryErrors []error
+	for _, item := range items {
+		if err := m.recoverGroupTransition(ctx, item); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover transition %d: %w", item.ID, err))
+		}
+	}
+	return errors.Join(recoveryErrors...)
+}
+
+func (m *Manager) recoverGroupTransition(ctx context.Context, item model.GroupTierTransition) error {
+	release, err := m.groupLocks.acquire(ctx, item.SourceID, item.KeyID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	current, err := m.store.GetGroupTierTransitionByKey(ctx, item.IdempotencyKey)
+	if err != nil || current.Status != model.GroupTransitionPending {
+		return err
+	}
+	source, err := m.store.GetUpstreamSource(ctx, current.SourceID)
+	if err != nil {
+		return err
+	}
+	credentials, err := m.decrypt(source)
+	if err != nil {
+		return err
+	}
+	result, err := m.fetcher.Fetch(ctx, source.Provider, source.BaseURL, credentials)
+	if err != nil {
+		return err
+	}
+	key, ok := findKeyRate(result.KeyRates, current.KeyID)
+	if !ok {
+		return errors.New("readback did not contain the controlled key")
+	}
+	now := time.Now().UTC()
+	if key.GroupID == current.FromGroupID {
+		return m.store.FailGroupTierTransition(ctx, current.ID, "recovery readback confirmed the write was not applied", now)
+	}
+	if key.GroupID != current.ToGroupID {
+		return fmt.Errorf("readback group does not match journal before or target state")
+	}
+	policy, err := m.store.GetGroupFailoverPolicy(ctx, current.SourceID, current.KeyID)
+	if err != nil {
+		return err
+	}
+	state := policy.State
+	state.SourceID = current.SourceID
+	state.KeyID = current.KeyID
+	state.PreviousTier = current.FromTier
+	state.PreviousStableTier = current.FromTier
+	state.PreviousGroupID = current.FromGroupID
+	state.CurrentTier = current.ToTier
+	state.ObservedGroupID = current.ToGroupID
+	state.Frozen = false
+	state.FreezeReason = ""
+	state.LastError = ""
+	state.LastSwitchAt = &now
+	state.LastTransitionAt = &now
+	state.VerificationStartedAt = &now
+	state.LastConfirmedAt = nil
+	if state.ValidationTransitionID == current.ID && state.ValidationStatus == model.GroupValidationTransitioning {
+		state.ValidationStatus = model.GroupValidationAwaitingEvidence
+		state.SwitchVerifiedAt = &now
+		validationNotBefore := now.Add(model.GroupValidationPropagationDelay)
+		evidenceDeadline := now.Add(model.GroupValidationEvidenceTimeout)
+		state.ValidationNotBefore = &validationNotBefore
+		state.EvidenceDeadline = &evidenceDeadline
+	} else {
+		// Historical pending journals have no trustworthy pre-switch watermark.
+		state.ValidationStatus = model.GroupValidationUncertain
+		state.LastError = "recovered_without_evidence_watermark"
+	}
+	if err := m.store.CompleteGroupTierTransition(ctx, current.ID, state, now); err != nil {
+		return err
+	}
+	if err := m.applySuccess(ctx, &source, result); err != nil {
+		m.logger.Warn("group_transition_recovery_refresh_failed", "transition_id", current.ID, "error", err)
+	}
+	m.record(ctx, model.Event{Type: "group_transition_recovered", Severity: "warning", Message: "分组切换流水已通过只读回读恢复", Actor: "system:recovery", Details: transitionDetails(current)})
+	m.trigger.Trigger()
+	return nil
+}
+
+func groupRequestIdentity(request model.GroupTierTransitionRequest) (string, string) {
+	producer := strings.TrimSpace(request.Producer)
+	authority := strings.TrimSpace(request.Authority)
+	if producer == "" {
+		switch {
+		case request.Manual:
+			producer = "human_operator"
+		case strings.Contains(strings.ToLower(request.Actor), "agent"):
+			producer = "agent_operator"
+		default:
+			producer = "deterministic_failover"
+		}
+	}
+	if authority == "" {
+		if request.Manual {
+			authority = "administrator_command"
+		} else if producer == "agent_operator" {
+			authority = "autonomous_agent"
+		} else {
+			authority = "deterministic_safety"
+		}
+	}
+	return producer, authority
+}
+
+func groupRequestMatchesExisting(request model.GroupTierTransitionRequest, existing model.GroupTierTransition) bool {
+	producer, authority := groupRequestIdentity(request)
+	return request.SourceID == existing.SourceID && strings.TrimSpace(request.KeyID) == existing.KeyID &&
+		strings.ToLower(strings.TrimSpace(request.TargetTier)) == existing.ToTier && fallbackActor(request.Actor) == existing.Actor &&
+		producer == existing.Producer && authority == existing.Authority && strings.TrimSpace(request.Reason) == existing.Reason &&
+		strings.TrimSpace(request.Evidence) == existing.Evidence && strings.TrimSpace(request.SnapshotVersion) == existing.SnapshotVersion &&
+		request.Trigger == existing.Trigger && request.PacketID == existing.PacketID && request.RunID == existing.RunID &&
+		request.Manual == existing.Manual && request.DryRun == existing.DryRun
 }
 
 // ReconcileGroupFailoverStates detects manual changes made directly in the
@@ -459,8 +654,19 @@ func (m *Manager) reconcileGroupFailoverStatesForSourcesLocked(ctx context.Conte
 				state.CurrentTier = transition.ToTier
 				state.ObservedGroupID = transition.ToGroupID
 				state.LastTransitionAt = &now
-				state.LastConfirmedAt = &now
+				state.LastConfirmedAt = nil
 				state.VerificationStartedAt = &now
+				if state.ValidationTransitionID == transition.ID && state.ValidationStatus == model.GroupValidationTransitioning {
+					state.ValidationStatus = model.GroupValidationAwaitingEvidence
+					state.SwitchVerifiedAt = &now
+					validationNotBefore := now.Add(model.GroupValidationPropagationDelay)
+					evidenceDeadline := now.Add(model.GroupValidationEvidenceTimeout)
+					state.ValidationNotBefore = &validationNotBefore
+					state.EvidenceDeadline = &evidenceDeadline
+				} else {
+					state.ValidationStatus = model.GroupValidationUncertain
+					state.LastError = "recovered_without_evidence_watermark"
+				}
 				state.CooldownUntil = timePointer(now.Add(time.Duration(settings.FailoverSwitchCooldownMinutes) * time.Minute))
 				if err := m.store.CompleteGroupTierTransition(ctx, transition.ID, state, now); err != nil {
 					return err
@@ -483,9 +689,11 @@ func (m *Manager) reconcileGroupFailoverStatesForSourcesLocked(ctx context.Conte
 			state.ManualHoldUntil = timePointer(now.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
 			state.ManualOverrideUntil = timePointer(now.Add(time.Duration(settings.FailoverManualProtectionMinutes) * time.Minute))
 			state.LastTransitionAt = &now
+			state.ValidationStatus = model.GroupValidationUncertain
+			state.LastConfirmedAt = nil
+			state.LastError = "manual_switch_requires_new_evidence_boundary"
 			state.Frozen = false
 			state.FreezeReason = ""
-			state.LastError = ""
 			m.record(ctx, model.Event{Type: "group_manual_override_detected", Severity: "warning", Message: fmt.Sprintf("检测到上游后台人工切换令牌分组，已进入 %d 分钟保护", settings.FailoverManualProtectionMinutes), Actor: "system", Details: fmt.Sprintf(`{"source_id":%d,"key_id":%q,"tier":%q}`, policy.SourceID, policy.KeyID, tier)})
 		} else {
 			state.CurrentTier = tier
@@ -493,7 +701,6 @@ func (m *Manager) reconcileGroupFailoverStatesForSourcesLocked(ctx context.Conte
 			state.FreezeReason = ""
 		}
 		state.ObservedGroupID = key.GroupID
-		state.LastConfirmedAt = &now
 		if err := m.store.SaveGroupFailoverState(ctx, state); err != nil {
 			return err
 		}
@@ -502,9 +709,27 @@ func (m *Manager) reconcileGroupFailoverStatesForSourcesLocked(ctx context.Conte
 }
 
 func (m *Manager) validateGroupFailoverPolicy(ctx context.Context, policy model.GroupFailoverPolicy) (model.UpstreamSource, model.KeyRate, string, error) {
-	groups := []string{strings.TrimSpace(policy.MainGroupID), strings.TrimSpace(policy.BackupGroupID), strings.TrimSpace(policy.EmergencyGroupID)}
-	if groups[0] == "" || groups[1] == "" || groups[2] == "" || groups[0] == groups[1] || groups[0] == groups[2] || groups[1] == groups[2] {
-		return model.UpstreamSource{}, model.KeyRate{}, "", errors.New("主、备用、紧急分组必须存在且互不相同")
+	if !policy.MainEnabled && !policy.BackupEnabled && !policy.EmergencyEnabled {
+		policy.MainEnabled, policy.BackupEnabled, policy.EmergencyEnabled = true, true, true
+	}
+	groups := make([]string, 0, 3)
+	for _, tier := range []string{model.GroupTierMain, model.GroupTierBackup, model.GroupTierEmergency} {
+		if !tierEnabled(policy, tier) {
+			continue
+		}
+		groupID := strings.TrimSpace(groupIDForTier(policy, tier))
+		if groupID == "" {
+			return model.UpstreamSource{}, model.KeyRate{}, "", errors.New("启用的固定层级必须配置分组")
+		}
+		for _, existing := range groups {
+			if existing == groupID {
+				return model.UpstreamSource{}, model.KeyRate{}, "", errors.New("启用的固定层级必须使用不同分组")
+			}
+		}
+		groups = append(groups, groupID)
+	}
+	if len(groups) == 0 {
+		return model.UpstreamSource{}, model.KeyRate{}, "", errors.New("固定三级策略至少需要一个启用层级")
 	}
 	source, err := m.store.GetUpstreamSource(ctx, policy.SourceID)
 	if err != nil {
@@ -543,7 +768,7 @@ func (m *Manager) validateGroupFailoverPolicy(ctx context.Context, policy model.
 	}
 	for _, groupID := range groups {
 		if !containsGroup(availableGroups, groupID) {
-			return model.UpstreamSource{}, model.KeyRate{}, "", fmt.Errorf("分组 %s 不存在", groupID)
+			return model.UpstreamSource{}, model.KeyRate{}, "", errors.New("目标分组不存在")
 		}
 	}
 	accounts, err := m.api.ListAccounts(ctx)
@@ -565,6 +790,32 @@ func (m *Manager) validateGroupFailoverPolicy(ctx context.Context, policy model.
 	return source, key, tierForGroup(policy, key.GroupID), nil
 }
 
+func (m *Manager) validateGroupFailoverEvidenceSource(policy model.GroupFailoverPolicy) error {
+	if !policy.Enabled {
+		return nil
+	}
+	snapshots, ok := m.trigger.(validationSnapshotProvider)
+	if !ok {
+		return errors.New("validation_evidence_source_unavailable: 无法确认三级救灾的被动证据来源")
+	}
+	accountIDs := make(map[int64]bool, len(policy.AccountIDs))
+	for _, accountID := range policy.AccountIDs {
+		accountIDs[accountID] = true
+	}
+	for _, binding := range snapshots.Snapshot().Bindings {
+		monitor := binding.Monitor
+		if !accountIDs[binding.Account.ID] || monitor == nil || !monitor.Enabled || monitor.IntervalSeconds <= 0 {
+			continue
+		}
+		maximumEvidenceDelay := model.GroupValidationPropagationDelay +
+			time.Duration(monitor.IntervalSeconds)*time.Second + model.GroupValidationMonitorRequestTimeout
+		if maximumEvidenceDelay < model.GroupValidationEvidenceTimeout {
+			return nil
+		}
+	}
+	return errors.New("validation_evidence_source_unavailable: 没有关联 monitor 能在证据截止时间前完成一次切换后检查")
+}
+
 func groupIDForTier(policy model.GroupFailoverPolicy, tier string) string {
 	switch tier {
 	case model.GroupTierMain:
@@ -575,6 +826,19 @@ func groupIDForTier(policy model.GroupFailoverPolicy, tier string) string {
 		return policy.EmergencyGroupID
 	default:
 		return ""
+	}
+}
+
+func tierEnabled(policy model.GroupFailoverPolicy, tier string) bool {
+	switch tier {
+	case model.GroupTierMain:
+		return policy.MainEnabled
+	case model.GroupTierBackup:
+		return policy.BackupEnabled
+	case model.GroupTierEmergency:
+		return policy.EmergencyEnabled
+	default:
+		return false
 	}
 }
 
@@ -628,5 +892,7 @@ func fallbackActor(actor string) string {
 }
 
 func transitionDetails(item model.GroupTierTransition) string {
-	return fmt.Sprintf(`{"transition_id":%d,"idempotency_key":%q,"source_id":%d,"key_id":%q,"from_tier":%q,"to_tier":%q,"packet_id":%d,"run_id":%d}`, item.ID, item.IdempotencyKey, item.SourceID, item.KeyID, item.FromTier, item.ToTier, item.PacketID, item.RunID)
+	return fmt.Sprintf(`{"transition_id":%d,"source_id":%d,"from_tier":%q,"to_tier":%q,"producer":%q,"authority":%q,"status":%q,"verified":%t,"uncertain":%t,"packet_id":%d,"run_id":%d}`,
+		item.ID, item.SourceID, item.FromTier, item.ToTier, item.Producer, item.Authority, item.Status,
+		item.VerifiedAfter != "", item.Uncertain, item.PacketID, item.RunID)
 }

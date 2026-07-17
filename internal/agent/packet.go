@@ -273,9 +273,9 @@ func buildGroupFailoverTokens(sources []model.UpstreamSource, transitions []mode
 				Confirmed: policy.Confirmed && policy.ConfirmedVersion == policy.Version, PolicyVersion: policy.Version,
 				CurrentTier: policy.State.CurrentTier, PreviousTier: policy.State.PreviousTier,
 				PreviousStableTier: policy.State.PreviousStableTier,
-				Main:               groupTierSummary(model.GroupTierMain, policy.MainGroupID, groups),
-				Backup:             groupTierSummary(model.GroupTierBackup, policy.BackupGroupID, groups),
-				Emergency:          groupTierSummary(model.GroupTierEmergency, policy.EmergencyGroupID, groups),
+				Main:               groupTierSummary(model.GroupTierMain, policy.MainGroupID, policy.MainEnabled, groups),
+				Backup:             groupTierSummary(model.GroupTierBackup, policy.BackupGroupID, policy.BackupEnabled, groups),
+				Emergency:          groupTierSummary(model.GroupTierEmergency, policy.EmergencyGroupID, policy.EmergencyEnabled, groups),
 				AccountIDs:         append([]int64(nil), policy.AccountIDs...), AccountNames: names,
 				Balance: source.Balance, Unit: source.Unit, DataFresh: !source.Stale && source.LastSuccessAt != nil,
 				Frozen: policy.State.Frozen, FreezeReason: policy.State.FreezeReason,
@@ -298,9 +298,9 @@ func buildGroupFailoverTokens(sources []model.UpstreamSource, transitions []mode
 	return items
 }
 
-func groupTierSummary(tier, groupID string, groups map[string]model.UpstreamGroup) model.AgentGroupTierSummary {
+func groupTierSummary(tier, groupID string, enabled bool, groups map[string]model.UpstreamGroup) model.AgentGroupTierSummary {
 	group := groups[groupID]
-	return model.AgentGroupTierSummary{Tier: tier, Name: group.Name, RateMultiplier: group.RateMultiplier}
+	return model.AgentGroupTierSummary{Tier: tier, Name: group.Name, RateMultiplier: group.RateMultiplier, Configured: strings.TrimSpace(groupID) != "", Enabled: enabled}
 }
 
 func (b packetBuilder) buildAccountState(ctx context.Context, binding model.ResolvedBinding, upstreams map[string]model.UpstreamSource, settings model.Settings, cutoff time.Time) (model.AgentAccountState, error) {

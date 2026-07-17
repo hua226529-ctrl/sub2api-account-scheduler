@@ -9,11 +9,28 @@ const (
 	AgentModeObserve = "observe"
 	AgentModeControl = "control"
 
+	AgentOptimizerDisabled = "disabled"
+	AgentOptimizerObserve  = "observe"
+	AgentOptimizerPropose  = "propose"
+	AgentOptimizerAuto     = "auto"
+
+	AgentOperatorDisabled = "disabled"
+	AgentOperatorConfirm  = "confirm"
+	AgentOperatorDirect   = "direct"
+
 	AgentRunScheduled = "scheduled"
 	AgentRunEmergency = "emergency"
 	AgentRunManual    = "manual"
 	AgentRunChat      = "chat"
 	AgentRunDaily     = "daily"
+
+	PolicyStatusDraft           = "draft"
+	PolicyStatusSimulated       = "simulated"
+	PolicyStatusPendingApproval = "pending_approval"
+	PolicyStatusActive          = "active"
+	PolicyStatusRejected        = "rejected"
+	PolicyStatusRolledBack      = "rolled_back"
+	PolicyStatusSuperseded      = "superseded"
 )
 
 // AgentProvider stores one OpenAI-compatible model endpoint. The API key is
@@ -37,6 +54,9 @@ type AgentProvider struct {
 type AgentSettings struct {
 	Enabled                      bool       `json:"enabled"`
 	Mode                         string     `json:"mode"`
+	OptimizerMode                string     `json:"optimizer_mode"`
+	OperatorMode                 string     `json:"operator_mode"`
+	DailyPolicyChangeBudget      int        `json:"daily_policy_change_budget"`
 	AnalysisIntervalMinutes      int        `json:"analysis_interval_minutes"`
 	EmergencyCooldownMinutes     int        `json:"emergency_cooldown_minutes"`
 	ContextTokenBudget           int        `json:"context_token_budget"`
@@ -150,6 +170,8 @@ type AgentGroupTierSummary struct {
 	Tier           string  `json:"tier"`
 	Name           string  `json:"name"`
 	RateMultiplier float64 `json:"rate_multiplier"`
+	Configured     bool    `json:"configured"`
+	Enabled        bool    `json:"enabled"`
 }
 
 type AgentGroupTransitionResult struct {
@@ -266,17 +288,46 @@ type AgentToolCall struct {
 }
 
 type ScorePolicyVersion struct {
-	ID          int64           `json:"id"`
-	ScopeType   string          `json:"scope_type"`
-	ScopeID     string          `json:"scope_id"`
-	Version     int             `json:"version"`
-	Status      string          `json:"status"`
-	Config      json.RawMessage `json:"config"`
-	Reason      string          `json:"reason"`
-	AgentRunID  *int64          `json:"agent_run_id,omitempty"`
-	CreatedBy   string          `json:"created_by"`
-	ActivatedAt *time.Time      `json:"activated_at,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	ID                      int64            `json:"id"`
+	ScopeType               string           `json:"scope_type"`
+	ScopeID                 string           `json:"scope_id"`
+	Version                 int              `json:"version"`
+	Status                  string           `json:"status"`
+	Config                  json.RawMessage  `json:"config"`
+	Patch                   json.RawMessage  `json:"patch"`
+	Diff                    json.RawMessage  `json:"diff"`
+	Simulation              PolicySimulation `json:"simulation"`
+	RiskLevel               string           `json:"risk_level"`
+	AffectedAccountIDs      []int64          `json:"affected_account_ids"`
+	Reason                  string           `json:"reason"`
+	AgentRunID              *int64           `json:"agent_run_id,omitempty"`
+	SourceGoalID            *int64           `json:"source_goal_id,omitempty"`
+	BaseVersionID           *int64           `json:"base_version_id,omitempty"`
+	PreviousActiveVersionID *int64           `json:"previous_active_version_id,omitempty"`
+	CreatedBy               string           `json:"created_by"`
+	ApprovedBy              string           `json:"approved_by,omitempty"`
+	IdempotencyKey          string           `json:"idempotency_key,omitempty"`
+	SemanticHash            string           `json:"semantic_hash,omitempty"`
+	RollbackReason          string           `json:"rollback_reason,omitempty"`
+	OutcomeSummary          string           `json:"outcome_summary,omitempty"`
+	AutoRollbackCount       int              `json:"auto_rollback_count"`
+	ActivatedAt             *time.Time       `json:"activated_at,omitempty"`
+	CreatedAt               time.Time        `json:"created_at"`
+}
+
+type PolicySimulation struct {
+	Window               string   `json:"window"`
+	SampleCount          int      `json:"sample_count"`
+	CurrentActionCount   int      `json:"current_action_count"`
+	ProposedActionCount  int      `json:"proposed_action_count"`
+	PauseDelta           int      `json:"pause_delta"`
+	ResumeDelta          int      `json:"resume_delta"`
+	LoadAdjustmentDelta  int      `json:"load_adjustment_delta"`
+	FlapDelta            int      `json:"flap_delta"`
+	BaselineSuccessRate  float64  `json:"baseline_success_rate"`
+	DataSufficient       bool     `json:"data_sufficient"`
+	Passed               bool     `json:"passed"`
+	UnsimmulatableFields []string `json:"unsimmulatable_fields,omitempty"`
 }
 
 type DecisionOutcome struct {

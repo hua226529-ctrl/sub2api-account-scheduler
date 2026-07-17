@@ -90,13 +90,6 @@ export function refreshUpstream(id: number) {
   return request<UpstreamSource>(`upstreams/${id}/refresh`, { method: "POST", body: JSON.stringify({ confirm: true }) });
 }
 
-export function switchUpstreamKeyGroup(id: number, keyID: string, groupID: string) {
-  return request<UpstreamSource>(`upstreams/${id}/keys/${encodeURIComponent(keyID)}/group`, {
-    method: "POST",
-    body: JSON.stringify({ group_id: groupID, confirm: true })
-  });
-}
-
 export function saveUpstreamFailoverPolicy(id: number, input: UpstreamFailoverPolicyInput) {
   return request<GroupFailoverPolicy>(`upstreams/${id}/failover/policies/${encodeURIComponent(input.key_id)}`, {
     method: "PUT",
@@ -147,6 +140,12 @@ export function chatAgent(message: string, conversationID = 0) {
   });
 }
 
+export function confirmAgentGoal(goalID: number, token: string) {
+  return request<AgentChatReceipt>(`agent/goals/${goalID}/confirm`, {
+    method: "POST", body: JSON.stringify({ token, confirm: true })
+  });
+}
+
 export function getAgentMessages(conversationID: number) {
   return request<{ items: AgentMessage[] }>(`agent/conversations/${conversationID}/messages`);
 }
@@ -154,6 +153,18 @@ export function getAgentMessages(conversationID: number) {
 export function activateAgentPolicy(id: number) {
   return request<{ activated: boolean }>(`agent/policies/${id}/activate`, {
     method: "POST", body: JSON.stringify({ confirm: true })
+  });
+}
+
+export function rejectAgentPolicy(id: number, reason: string) {
+  return request<{ rejected: boolean }>(`agent/policies/${id}/reject`, {
+    method: "POST", body: JSON.stringify({ reason, confirm: true })
+  });
+}
+
+export function rollbackAgentPolicy(id: number, reason: string) {
+  return request<{ rolled_back: boolean }>(`agent/policies/${id}/rollback`, {
+    method: "POST", body: JSON.stringify({ reason, confirm: true })
   });
 }
 

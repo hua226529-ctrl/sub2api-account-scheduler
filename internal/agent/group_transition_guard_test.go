@@ -49,6 +49,23 @@ func TestAgentPoolOutageGuardAllowsFiveHardMonitorResultsWithoutTraffic(t *testi
 	}
 }
 
+func TestNextConfiguredAgentTierUsesFixedChainAndSkipsDisabledLevels(t *testing.T) {
+	policy := model.GroupFailoverPolicy{
+		MainGroupID: "main", BackupGroupID: "backup", EmergencyGroupID: "emergency",
+		MainEnabled: true, BackupEnabled: false, EmergencyEnabled: true,
+	}
+	if got := nextConfiguredAgentTier(policy, model.GroupTierMain); got != model.GroupTierEmergency {
+		t.Fatalf("disabled backup was not skipped: got %q", got)
+	}
+	if got := nextConfiguredAgentTier(policy, model.GroupTierEmergency); got != "" {
+		t.Fatalf("fixed chain advanced beyond emergency: got %q", got)
+	}
+	policy.EmergencyEnabled = false
+	if got := nextConfiguredAgentTier(policy, model.GroupTierMain); got != "" {
+		t.Fatalf("fixed chain selected a disabled level: got %q", got)
+	}
+}
+
 func hardGuardBinding(now time.Time, accountID int64, streak int) model.ResolvedBinding {
 	checkedAt := now.Add(-time.Second)
 	return model.ResolvedBinding{

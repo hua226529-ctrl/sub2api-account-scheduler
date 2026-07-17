@@ -274,7 +274,7 @@ func (m *Manager) assessCapabilityReconciliation(ctx context.Context, invocation
 	fresh := reconciliationReadbackFresh(invocation.Name, invocation.Arguments, current, attemptedAt)
 	if invocation.Name == "transition_token_group_tier" {
 		if transition, err := m.store.GetGroupTierTransitionByKey(ctx, invocation.IdempotencyKey); err == nil {
-			if transition.Status == model.GroupTransitionCompleted {
+			if groupTransitionWasApplied(transition.Status) {
 				return reconciliationAssessment{Verdict: reconciliationApplied, Reason: "幂等切组流水已完成并确认目标分组",
 					Fresh: true, Readback: current, CheckedAt: now}
 			}
@@ -285,6 +285,10 @@ func (m *Manager) assessCapabilityReconciliation(ctx context.Context, invocation
 	}
 	verdict, reason := evaluateCapabilityReconciliation(invocation.Name, invocation.Arguments, before, current, fresh)
 	return reconciliationAssessment{Verdict: verdict, Reason: reason, Fresh: fresh, Readback: current, CheckedAt: now}
+}
+
+func groupTransitionWasApplied(status string) bool {
+	return status == model.GroupTransitionApplied || status == model.GroupTransitionCompleted
 }
 
 func evaluateCapabilityReconciliation(capability string, arguments, before, current json.RawMessage,

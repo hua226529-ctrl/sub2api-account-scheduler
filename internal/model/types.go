@@ -48,10 +48,46 @@ const (
 	GroupTierBackup    = "backup"
 	GroupTierEmergency = "emergency"
 
-	GroupTransitionPending   = "pending"
+	GroupTransitionPending = "pending"
+	GroupTransitionApplied = "applied"
+	// GroupTransitionCompleted is retained for read compatibility with
+	// journals written before post-switch validation was separated.
 	GroupTransitionCompleted = "completed"
 	GroupTransitionFailed    = "failed"
 	GroupTransitionSimulated = "simulated"
+
+	GroupValidationUnknown          = "unknown"
+	GroupValidationStable           = "stable"
+	GroupValidationTransitioning    = "transitioning"
+	GroupValidationAwaitingEvidence = "awaiting_evidence"
+	GroupValidationProbing          = "probing"
+	GroupValidationConfirmedHealthy = "confirmed_healthy"
+	GroupValidationConfirmedFailed  = "confirmed_failed"
+	GroupValidationUncertain        = "uncertain"
+	GroupValidationExhausted        = "exhausted"
+
+	GroupValidationModePassive           = "passive"
+	GroupValidationModeActive            = "active"
+	GroupValidationModeActiveThenPassive = "active_then_passive"
+
+	GroupValidationPropagationDelay = 5 * time.Second
+	// GroupValidationMonitorRequestTimeout matches Sub2API's bounded model
+	// request timeout. It is used only when a monitor record cannot expose a
+	// request start time and completion must be conservatively attributed.
+	GroupValidationMonitorRequestTimeout = 45 * time.Second
+	GroupValidationEvidenceTimeout       = 10 * time.Minute
+	GroupValidationMinimumSuccesses      = 1
+
+	EvidenceTimeBasisMonitorRequestStart = "monitor_request_start"
+	EvidenceTimeBasisRequestStart        = "request_start"
+	EvidenceTimeBasisCompletion          = "completion"
+
+	SchedulerModeObserve = "observe"
+	SchedulerModeControl = "control"
+
+	FailoverModeDisabled = "disabled"
+	FailoverModeObserve  = "observe"
+	FailoverModeControl  = "control"
 )
 
 var HealthStageLabels = map[string]string{
@@ -231,6 +267,9 @@ type Policy struct {
 
 type Settings struct {
 	DryRun                           bool   `json:"dry_run"`
+	SchedulerMode                    string `json:"scheduler_mode"`
+	FailoverMode                     string `json:"failover_mode"`
+	FailoverMutationBudget           int    `json:"group_failover_mutation_budget"`
 	FailureThreshold                 int    `json:"failure_threshold"`
 	RecoveryThreshold                int    `json:"recovery_threshold"`
 	ManualHoldMinutes                int    `json:"manual_hold_minutes"`
@@ -320,31 +359,33 @@ type MonitorHistoryRecord struct {
 // TrafficSuccess contains only scheduler-relevant metadata. Request bodies,
 // credentials and the original request identifier never leave the client.
 type TrafficSuccess struct {
-	EventKey      string    `json:"-"`
-	AccountID     int64     `json:"account_id"`
-	Model         string    `json:"model"`
-	UpstreamModel string    `json:"upstream_model,omitempty"`
-	DurationMS    int64     `json:"duration_ms"`
-	Kind          string    `json:"kind,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+	EventKey         string     `json:"-"`
+	AccountID        int64      `json:"account_id"`
+	Model            string     `json:"model"`
+	UpstreamModel    string     `json:"upstream_model,omitempty"`
+	DurationMS       int64      `json:"duration_ms"`
+	Kind             string     `json:"kind,omitempty"`
+	RequestStartedAt *time.Time `json:"request_started_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 // TrafficError is the classified, redacted form of an upstream error. Message
 // and request_id from Sub2API are represented only by one-way fingerprints.
 type TrafficError struct {
-	EventKey          string    `json:"-"`
-	AccountID         int64     `json:"account_id"`
-	Model             string    `json:"model"`
-	RequestedModel    string    `json:"requested_model,omitempty"`
-	UpstreamModel     string    `json:"upstream_model,omitempty"`
-	Phase             string    `json:"phase,omitempty"`
-	Type              string    `json:"type,omitempty"`
-	Severity          string    `json:"severity,omitempty"`
-	StatusCode        int       `json:"status_code,omitempty"`
-	ErrorClass        string    `json:"error_class"`
-	ReasonCode        string    `json:"reason_code"`
-	ReasonFingerprint string    `json:"reason_fingerprint,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	EventKey          string     `json:"-"`
+	AccountID         int64      `json:"account_id"`
+	Model             string     `json:"model"`
+	RequestedModel    string     `json:"requested_model,omitempty"`
+	UpstreamModel     string     `json:"upstream_model,omitempty"`
+	Phase             string     `json:"phase,omitempty"`
+	Type              string     `json:"type,omitempty"`
+	Severity          string     `json:"severity,omitempty"`
+	StatusCode        int        `json:"status_code,omitempty"`
+	ErrorClass        string     `json:"error_class"`
+	ReasonCode        string     `json:"reason_code"`
+	ReasonFingerprint string     `json:"reason_fingerprint,omitempty"`
+	RequestStartedAt  *time.Time `json:"request_started_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 type TrafficWindow struct {
@@ -568,6 +609,9 @@ type GroupFailoverPolicy struct {
 	KeyName          string             `json:"key_name"`
 	KeyHint          string             `json:"key_hint"`
 	Enabled          bool               `json:"enabled"`
+	MainEnabled      bool               `json:"main_enabled"`
+	BackupEnabled    bool               `json:"backup_enabled"`
+	EmergencyEnabled bool               `json:"emergency_enabled"`
 	MainGroupID      string             `json:"main_group_id"`
 	BackupGroupID    string             `json:"backup_group_id"`
 	EmergencyGroupID string             `json:"emergency_group_id"`
@@ -584,28 +628,73 @@ type GroupFailoverPolicy struct {
 }
 
 type GroupFailoverState struct {
-	SourceID              int64      `json:"source_id"`
-	KeyID                 string     `json:"key_id"`
-	CurrentTier           string     `json:"current_tier"`
-	ObservedGroupID       string     `json:"observed_group_id"`
-	PreviousTier          string     `json:"previous_tier"`
-	PreviousStableTier    string     `json:"previous_stable_tier"`
-	PreviousGroupID       string     `json:"previous_group_id"`
-	Frozen                bool       `json:"frozen"`
-	FreezeReason          string     `json:"freeze_reason,omitempty"`
-	LastError             string     `json:"last_error,omitempty"`
-	ManualHoldUntil       *time.Time `json:"manual_hold_until,omitempty"`
-	ManualOverrideUntil   *time.Time `json:"manual_override_until,omitempty"`
-	CooldownUntil         *time.Time `json:"cooldown_until,omitempty"`
-	ReturnBlockedUntil    *time.Time `json:"return_blocked_until,omitempty"`
-	RecoverySince         *time.Time `json:"recovery_since,omitempty"`
-	LastSwitchAt          *time.Time `json:"last_switch_at,omitempty"`
-	LastTransitionAt      *time.Time `json:"last_transition_at,omitempty"`
-	VerificationStartedAt *time.Time `json:"verification_started_at,omitempty"`
-	HealthySince          *time.Time `json:"healthy_since,omitempty"`
-	RecoveryHealthyCount  int        `json:"recovery_healthy_count"`
-	LastConfirmedAt       *time.Time `json:"last_confirmed_at,omitempty"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	SourceID                int64      `json:"source_id"`
+	KeyID                   string     `json:"key_id"`
+	CurrentTier             string     `json:"current_tier"`
+	ObservedGroupID         string     `json:"observed_group_id"`
+	PreviousTier            string     `json:"previous_tier"`
+	PreviousStableTier      string     `json:"previous_stable_tier"`
+	PreviousGroupID         string     `json:"previous_group_id"`
+	Frozen                  bool       `json:"frozen"`
+	FreezeReason            string     `json:"freeze_reason,omitempty"`
+	LastError               string     `json:"last_error,omitempty"`
+	ManualHoldUntil         *time.Time `json:"manual_hold_until,omitempty"`
+	ManualOverrideUntil     *time.Time `json:"manual_override_until,omitempty"`
+	CooldownUntil           *time.Time `json:"cooldown_until,omitempty"`
+	ReturnBlockedUntil      *time.Time `json:"return_blocked_until,omitempty"`
+	RecoverySince           *time.Time `json:"recovery_since,omitempty"`
+	LastSwitchAt            *time.Time `json:"last_switch_at,omitempty"`
+	LastTransitionAt        *time.Time `json:"last_transition_at,omitempty"`
+	VerificationStartedAt   *time.Time `json:"verification_started_at,omitempty"`
+	HealthySince            *time.Time `json:"healthy_since,omitempty"`
+	RecoveryHealthyCount    int        `json:"recovery_healthy_count"`
+	LastConfirmedAt         *time.Time `json:"last_confirmed_at,omitempty"`
+	ValidationStatus        string     `json:"validation_status"`
+	ValidationMode          string     `json:"validation_mode"`
+	ValidationTransitionID  int64      `json:"validation_transition_id,omitempty"`
+	ValidationFromTier      string     `json:"validation_from_tier,omitempty"`
+	ValidationTargetTier    string     `json:"validation_target_tier,omitempty"`
+	ValidationFromGroupID   string     `json:"validation_from_group_id,omitempty"`
+	ValidationTargetGroupID string     `json:"validation_target_group_id,omitempty"`
+	SwitchRequestedAt       *time.Time `json:"switch_requested_at,omitempty"`
+	SwitchVerifiedAt        *time.Time `json:"switch_verified_at,omitempty"`
+	ValidationNotBefore     *time.Time `json:"validation_not_before,omitempty"`
+	EvidenceDeadline        *time.Time `json:"evidence_deadline,omitempty"`
+	MonitorWatermark        int64      `json:"monitor_watermark"`
+	TrafficWatermark        int64      `json:"traffic_watermark"`
+	MonitorEvidenceCursor   int64      `json:"monitor_evidence_cursor"`
+	TrafficEvidenceCursor   int64      `json:"traffic_evidence_cursor"`
+	ActiveProbeAttempts     int        `json:"active_probe_attempts"`
+	SuccessfulEvidenceCount int        `json:"successful_evidence_count"`
+	FailedEvidenceCount     int        `json:"failed_evidence_count"`
+	LastEvidenceID          string     `json:"last_evidence_id,omitempty"`
+	LastEvidenceSource      string     `json:"last_evidence_source,omitempty"`
+	LastEvidenceReason      string     `json:"last_evidence_reason,omitempty"`
+	LastEvidenceAt          *time.Time `json:"last_evidence_at,omitempty"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+}
+
+type FailoverEvidenceWatermarks struct {
+	Monitor int64
+	Traffic int64
+}
+
+type GroupValidationEvidence struct {
+	ID               int64
+	Source           string
+	MonitorID        int64
+	AccountID        int64
+	Status           string
+	ErrorClass       string
+	ReasonCode       string
+	ObservedAt       time.Time
+	RequestStartedAt *time.Time
+	TimeBasis        string
+	TransitionID     int64
+	SourceID         int64
+	KeyID            string
+	TargetTier       string
+	TargetGroupID    string
 }
 
 type GroupTierTransitionRequest struct {
@@ -614,8 +703,11 @@ type GroupTierTransitionRequest struct {
 	TargetTier       string     `json:"target_tier"`
 	IdempotencyKey   string     `json:"idempotency_key"`
 	Actor            string     `json:"actor"`
+	Producer         string     `json:"producer"`
+	Authority        string     `json:"authority"`
 	Reason           string     `json:"reason"`
 	Evidence         string     `json:"evidence,omitempty"`
+	SnapshotVersion  string     `json:"snapshot_version,omitempty"`
 	Trigger          string     `json:"trigger,omitempty"`
 	PacketID         int64      `json:"packet_id,omitempty"`
 	RunID            int64      `json:"run_id,omitempty"`
@@ -631,26 +723,33 @@ type GroupTierTransitionRequest struct {
 }
 
 type GroupTierTransition struct {
-	ID             int64      `json:"id"`
-	IdempotencyKey string     `json:"idempotency_key"`
-	SourceID       int64      `json:"source_id"`
-	KeyID          string     `json:"key_id"`
-	FromTier       string     `json:"from_tier"`
-	ToTier         string     `json:"to_tier"`
-	FromGroupID    string     `json:"from_group_id"`
-	ToGroupID      string     `json:"to_group_id"`
-	Status         string     `json:"status"`
-	Actor          string     `json:"actor"`
-	Reason         string     `json:"reason"`
-	Evidence       string     `json:"evidence,omitempty"`
-	Trigger        string     `json:"trigger,omitempty"`
-	PacketID       int64      `json:"packet_id,omitempty"`
-	RunID          int64      `json:"run_id,omitempty"`
-	Error          string     `json:"error,omitempty"`
-	Manual         bool       `json:"manual"`
-	DryRun         bool       `json:"dry_run"`
-	CreatedAt      time.Time  `json:"created_at"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	ID              int64      `json:"id"`
+	IdempotencyKey  string     `json:"idempotency_key"`
+	SourceID        int64      `json:"source_id"`
+	KeyID           string     `json:"key_id"`
+	FromTier        string     `json:"from_tier"`
+	ToTier          string     `json:"to_tier"`
+	FromGroupID     string     `json:"from_group_id"`
+	ToGroupID       string     `json:"to_group_id"`
+	Status          string     `json:"status"`
+	Actor           string     `json:"actor"`
+	Producer        string     `json:"producer"`
+	Authority       string     `json:"authority"`
+	Reason          string     `json:"reason"`
+	Evidence        string     `json:"evidence,omitempty"`
+	SnapshotVersion string     `json:"snapshot_version,omitempty"`
+	Trigger         string     `json:"trigger,omitempty"`
+	PacketID        int64      `json:"packet_id,omitempty"`
+	RunID           int64      `json:"run_id,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	AttemptCount    int        `json:"attempt_count"`
+	BeforeState     string     `json:"before_state,omitempty"`
+	VerifiedAfter   string     `json:"verified_after_state,omitempty"`
+	Uncertain       bool       `json:"uncertain"`
+	Manual          bool       `json:"manual"`
+	DryRun          bool       `json:"dry_run"`
+	CreatedAt       time.Time  `json:"created_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
 }
 
 type KeyRate struct {

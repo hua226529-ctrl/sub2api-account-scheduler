@@ -34,13 +34,15 @@ type AdministratorIntent struct {
 }
 
 type AdministratorIntentGrant struct {
-	Capability   string     `json:"capability"`
-	Clause       string     `json:"clause"` // immediate or scheduled
-	ResourceKeys []string   `json:"resource_keys,omitempty"`
-	LoadFactor   *int       `json:"load_factor,omitempty"`
-	TargetTier   string     `json:"target_tier,omitempty"`
-	Enabled      *bool      `json:"enabled,omitempty"`
-	ExecuteAt    *time.Time `json:"execute_at,omitempty"`
+	Capability    string     `json:"capability"`
+	Clause        string     `json:"clause"` // immediate or scheduled
+	ResourceKeys  []string   `json:"resource_keys,omitempty"`
+	LoadFactor    *int       `json:"load_factor,omitempty"`
+	TargetTier    string     `json:"target_tier,omitempty"`
+	Enabled       *bool      `json:"enabled,omitempty"`
+	ExecuteAt     *time.Time `json:"execute_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	PermanentHold bool       `json:"permanent_hold,omitempty"`
 }
 
 // AdministratorGrant is the typed, single-invocation privilege envelope.
@@ -74,7 +76,7 @@ var (
 	administratorClauseSeparators = []string{"，", ",", "；", ";", "。", "\n", "然后", "随后", "之后", "同时"}
 	administratorActionJoins      = []string{"并恢复", "并暂停", "并开启", "并关闭", "并切换", "并刷新", "并解除", "并回退"}
 	administratorLoadFactorRE     = regexp.MustCompile(`(?:负载(?:系数)?\s*)?(?:设为|设置为|调到|调整为)\s*(\d{1,3})`)
-	administratorClockRE          = regexp.MustCompile(`(?:(明天|今天|今晚|早上|上午|中午|下午|晚上|凌晨)\s*)?(\d{1,2})\s*(?:点|:)(?:(\d{1,2})\s*分?)?`)
+	administratorClockRE          = regexp.MustCompile(`(?:(明天|今天|今晚|早上|上午|中午|下午|晚上|凌晨)\s*)?([一二两三四五六七八九十\d]{1,3})\s*(?:点|:)(?:([一二两三四五六七八九十\d]{1,3})\s*分?)?`)
 	administratorNegatedActionRE  = regexp.MustCompile(`(?i)(?:先\s*别|暂(?:时)?\s*不|请勿|别|不(?:要|再|得|许|能|可|应(?:该)?|准|允许|必|需要)?|禁止|不得|无需|无须|never|do\s+not|don't|dont)[^，,；;。\n]{0,40}?(?:暂停|恢复|设置|设为|固定|切换|开启|启用|关闭|禁用|解除|回退|执行|pause|resume|set|switch|enable|disable)`)
 	administratorConditionalRE    = regexp.MustCompile(`(?:如果|假如|假设|若(?:是)?|倘若|一旦|除非|只要|仅当|只在|前提是|视情况|看情况|酌情|必要时|合适时|有需要时|条件允许|当[^，,；;。\n]{0,40}时|等(?:到)?[^，,；;。\n]{0,40}(?:后|再)|确认[^，,；;。\n]{0,40}后|(?:正常|异常|可用|不可用|失败|成功|满足|达到)[^，,；;。\n]{0,30}(?:时|后)[^，,；;。\n]{0,30}(?:暂停|恢复|切换|设置|开启|关闭))`)
 	administratorAmbiguousRE      = regexp.MustCompile(`(?:或者|或是|还是|任意|任选|随便|其中一个|可能|也许|或许|大概|尽量|尝试|考虑|建议|你决定|自行判断)`)
@@ -362,13 +364,13 @@ func parseAdministratorClock(text string, now time.Time) (time.Time, bool) {
 	if len(match) != 4 {
 		return time.Time{}, false
 	}
-	hour, hourErr := strconv.Atoi(match[2])
+	hour, hourOK := parseAdministratorClockNumber(match[2])
 	minute := 0
-	var minuteErr error
+	minuteOK := true
 	if match[3] != "" {
-		minute, minuteErr = strconv.Atoi(match[3])
+		minute, minuteOK = parseAdministratorClockNumber(match[3])
 	}
-	if hourErr != nil || minuteErr != nil || hour > 23 || minute > 59 {
+	if !hourOK || !minuteOK || hour > 23 || minute > 59 {
 		return time.Time{}, false
 	}
 	period := match[1]
@@ -389,6 +391,11 @@ func parseAdministratorClock(text string, now time.Time) (time.Time, bool) {
 		result = result.AddDate(0, 0, 1)
 	}
 	return result.UTC(), true
+}
+
+func parseAdministratorClockNumber(value string) (int, bool) {
+	value = strings.ReplaceAll(value, "两", "二")
+	return parseChatInteger(value)
 }
 
 func (m *Manager) resolveAdministratorResources(ctx context.Context, capability, clause string) ([]string, error) {
@@ -432,7 +439,7 @@ func (m *Manager) resolveAdministratorResources(ctx context.Context, capability,
 
 func administratorResourceKind(capability string) string {
 	switch capability {
-	case "pause_account", "resume_account", "set_load_factor", "pin_load_until", "clear_load_pin",
+	case "pause_account", "resume_account", "manual_hold_account", "set_load_factor", "pin_load_until", "clear_load_pin",
 		"clear_flap_protection", "clear_manual_override", "update_binding":
 		return "account"
 	case "update_upstream_control", "refresh_upstream", "transition_token_group_tier":
@@ -510,7 +517,7 @@ func (m *Manager) administratorNamedResources(ctx context.Context, kind string) 
 		if m.store == nil {
 			return nil, errors.New("策略存储不可用")
 		}
-		items, err := m.store.ListPolicyVersions(ctx, 500)
+		items, err := m.store.ListPolicyLifecycle(ctx, 500)
 		if err != nil {
 			return nil, fmt.Errorf("读取策略版本失败: %w", err)
 		}
@@ -658,6 +665,13 @@ func administratorConstraintsMatch(grant AdministratorIntentGrant, arguments jso
 			}
 		}
 		if actual.IsZero() || actual.UTC().Truncate(time.Minute) != grant.ExecuteAt.UTC().Truncate(time.Minute) {
+			return false
+		}
+	}
+	if grant.ExpiresAt != nil {
+		raw, ok := values["expires_at"].(string)
+		actual, err := time.Parse(time.RFC3339, raw)
+		if !ok || err != nil || actual.UTC().Truncate(time.Minute) != grant.ExpiresAt.UTC().Truncate(time.Minute) {
 			return false
 		}
 	}
@@ -838,7 +852,7 @@ func capabilityResourceKeys(capability string, arguments json.RawMessage) ([]str
 	if capability == "trigger_reconcile" {
 		keys = append(keys, "global:scheduler")
 	}
-	if capability == "update_dispatch_policy" {
+	if capability == "update_dispatch_policy" || capability == "propose_dispatch_policy" {
 		scopeType, _ := values["scope_type"].(string)
 		scopeID, _ := values["scope_id"].(string)
 		keys = append(keys, "policy_scope:"+scopeType+":"+scopeID)

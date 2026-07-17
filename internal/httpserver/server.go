@@ -2,19 +2,15 @@ package httpserver
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
@@ -31,18 +27,17 @@ import (
 const sessionCookie = "scheduler_session"
 
 type Server struct {
-	cfg      config.Config
-	store    *store.Store
-	engine   *reconcile.Engine
-	balances *balance.Manager
-	client   *sub2api.Client
-	agent    *agent.Manager
-	logger   *slog.Logger
-	mux      *http.ServeMux
-	loginMu  sync.Mutex
-	loginLog map[string][]time.Time
-	writeMu  sync.Mutex
-	writeLog map[string][]time.Time
+	cfg            config.Config
+	store          *store.Store
+	engine         *reconcile.Engine
+	balances       *balance.Manager
+	agent          *agent.Manager
+	logger         *slog.Logger
+	mux            *http.ServeMux
+	randomReader   io.Reader
+	trustedProxies []*net.IPNet
+	loginLimiter   *rateLimiter
+	writeLimiter   *rateLimiter
 }
 
 type sessionContextKey struct{}
@@ -52,7 +47,10 @@ type sessionInfo struct {
 }
 
 func New(cfg config.Config, database *store.Store, engine *reconcile.Engine, balances *balance.Manager, client *sub2api.Client, logger *slog.Logger, agents ...*agent.Manager) *Server {
-	s := &Server{cfg: cfg, store: database, engine: engine, balances: balances, client: client, logger: logger, mux: http.NewServeMux(), loginLog: map[string][]time.Time{}, writeLog: map[string][]time.Time{}}
+	_ = client
+	s := &Server{cfg: cfg, store: database, engine: engine, balances: balances, logger: logger,
+		mux: http.NewServeMux(), trustedProxies: parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs),
+		loginLimiter: newRateLimiter(5*time.Minute, 5), writeLimiter: newRateLimiter(time.Minute, 30)}
 	if len(agents) > 0 {
 		s.agent = agents[0]
 	}
@@ -102,7 +100,6 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/upstreams/{id}", s.mutation(http.HandlerFunc(s.updateUpstream)))
 	s.mux.Handle("DELETE /api/upstreams/{id}", s.mutation(http.HandlerFunc(s.deleteUpstream)))
 	s.mux.Handle("POST /api/upstreams/{id}/refresh", s.mutation(http.HandlerFunc(s.refreshUpstream)))
-	s.mux.Handle("POST /api/upstreams/{id}/keys/{keyID}/group", s.mutation(http.HandlerFunc(s.switchUpstreamKeyGroup)))
 	s.mux.Handle("PUT /api/upstreams/{id}/failover/policies/{keyID}", s.mutation(http.HandlerFunc(s.saveUpstreamFailoverPolicy)))
 	s.mux.Handle("DELETE /api/upstreams/{id}/failover/policies/{keyID}", s.mutation(http.HandlerFunc(s.deleteUpstreamFailoverPolicy)))
 	s.mux.Handle("POST /api/upstreams/{id}/failover/policies/{keyID}/confirm", s.mutation(http.HandlerFunc(s.confirmUpstreamFailoverPolicy)))
@@ -114,8 +111,11 @@ func (s *Server) routes() {
 	s.mux.Handle("PUT /api/agent/providers/{slot}", s.mutation(http.HandlerFunc(s.saveAgentProvider)))
 	s.mux.Handle("POST /api/agent/run", s.mutation(http.HandlerFunc(s.runAgent)))
 	s.mux.Handle("POST /api/agent/chat", s.mutation(http.HandlerFunc(s.chatAgent)))
+	s.mux.Handle("POST /api/agent/goals/{id}/confirm", s.mutation(http.HandlerFunc(s.confirmAgentGoal)))
 	s.mux.Handle("GET /api/agent/conversations/{id}/messages", s.auth(http.HandlerFunc(s.agentMessages)))
 	s.mux.Handle("POST /api/agent/policies/{id}/activate", s.mutation(http.HandlerFunc(s.activateAgentPolicy)))
+	s.mux.Handle("POST /api/agent/policies/{id}/reject", s.mutation(http.HandlerFunc(s.rejectAgentPolicy)))
+	s.mux.Handle("POST /api/agent/policies/{id}/rollback", s.mutation(http.HandlerFunc(s.rollbackAgentPolicy)))
 	s.mux.Handle("GET /api/agent/capabilities", s.auth(http.HandlerFunc(s.agentCapabilities)))
 	s.mux.Handle("GET /api/agent/goals", s.auth(http.HandlerFunc(s.agentGoals)))
 	s.mux.Handle("GET /api/agent/events", s.auth(http.HandlerFunc(s.agentRuntimeEvents)))
@@ -145,7 +145,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	if !s.allowLogin(ip) {
 		writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
@@ -158,17 +158,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate := strings.TrimSpace(body.APIKey)
-	if subtle.ConstantTimeCompare([]byte(candidate), []byte(s.cfg.AdminAPIKey)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(candidate), []byte(s.cfg.SchedulerAdminSecret)) != 1 {
 		writeError(w, http.StatusUnauthorized, "管理员密钥无效")
 		return
 	}
-	if err := s.client.Validate(r.Context(), candidate); err != nil {
-		s.logger.Warn("admin_key_validation_failed", "error", err)
-		writeError(w, http.StatusUnauthorized, "管理员密钥无法通过 Sub2API 验证")
+	token, err := randomToken(s.randomReader, 32)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "创建安全会话失败")
 		return
 	}
-	token := randomToken(32)
-	csrf := randomToken(24)
+	csrf, err := randomToken(s.randomReader, 24)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "创建安全会话失败")
+		return
+	}
 	if err := s.store.CreateSession(r.Context(), token, csrf, time.Now().UTC().Add(s.cfg.SessionIdleTimeout)); err != nil {
 		writeError(w, http.StatusInternalServerError, "创建会话失败")
 		return
@@ -319,28 +322,6 @@ func (s *Server) refreshUpstream(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, item)
 }
 
-func (s *Server) switchUpstreamKeyGroup(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseUpstreamID(w, r)
-	if !ok {
-		return
-	}
-	keyID := strings.TrimSpace(r.PathValue("keyID"))
-	var body struct {
-		GroupID string `json:"group_id"`
-		Confirm bool   `json:"confirm"`
-	}
-	if err := decodeJSON(r, &body); err != nil || !body.Confirm || keyID == "" || strings.TrimSpace(body.GroupID) == "" {
-		writeError(w, http.StatusBadRequest, "切换令牌分组需要二次确认")
-		return
-	}
-	item, err := s.balances.SwitchGroup(r.Context(), id, keyID, strings.TrimSpace(body.GroupID), "web")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, item)
-}
-
 func (s *Server) saveUpstreamFailoverPolicy(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUpstreamID(w, r)
 	if !ok {
@@ -440,9 +421,14 @@ func (s *Server) switchUpstreamKeyTier(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "目标层级只能是主分组、备用分组或紧急分组")
 		return
 	}
-	_, err := s.balances.TransitionGroupTier(r.Context(), model.GroupTierTransitionRequest{
-		SourceID: id, KeyID: keyID, TargetTier: tier, IdempotencyKey: "web-" + randomToken(18),
-		Actor: "web", Reason: "管理员在余额中心手动切换令牌分组层级", Trigger: "manual", Manual: true,
+	idempotencyToken, err := randomToken(s.randomReader, 18)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "创建安全操作标识失败")
+		return
+	}
+	_, err = s.balances.TransitionGroupTier(r.Context(), model.GroupTierTransitionRequest{
+		SourceID: id, KeyID: keyID, TargetTier: tier, IdempotencyKey: "web-" + idempotencyToken,
+		Actor: "web", Producer: "human_operator", Authority: "administrator_command", Reason: "管理员在余额中心手动切换令牌分组层级", Trigger: "manual", Manual: true,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -576,12 +562,33 @@ func (s *Server) chatAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "对话内容格式无效")
 		return
 	}
-	conversationID, goalID, runID, status, err := manager.ChatAsync(r.Context(), body.ConversationID, body.Message)
+	receipt, err := manager.ChatAsync(r.Context(), body.ConversationID, body.Message)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"conversation_id": conversationID, "goal_id": goalID, "run_id": runID, "status": status})
+	writeJSON(w, http.StatusAccepted, receipt)
+}
+
+func (s *Server) confirmAgentGoal(w http.ResponseWriter, r *http.Request) {
+	manager, ok := s.requireAgent(w)
+	if !ok {
+		return
+	}
+	goalID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err != nil || goalID <= 0 || decodeJSON(r, &body) != nil || strings.TrimSpace(body.Token) == "" {
+		writeError(w, http.StatusBadRequest, "确认请求无效")
+		return
+	}
+	receipt, err := manager.ConfirmChatGoal(r.Context(), goalID, body.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, receipt)
 }
 
 func (s *Server) agentMessages(w http.ResponseWriter, r *http.Request) {
@@ -612,7 +619,7 @@ func (s *Server) activateAgentPolicy(w http.ResponseWriter, r *http.Request) {
 		Confirm bool `json:"confirm"`
 	}
 	if err != nil || id <= 0 || decodeJSON(r, &body) != nil || !body.Confirm {
-		writeError(w, http.StatusBadRequest, "策略回退需要二次确认")
+		writeError(w, http.StatusBadRequest, "策略批准需要二次确认")
 		return
 	}
 	if err := manager.ActivatePolicy(r.Context(), id, "管理端"); err != nil {
@@ -620,6 +627,48 @@ func (s *Server) activateAgentPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"activated": true})
+}
+
+func (s *Server) rejectAgentPolicy(w http.ResponseWriter, r *http.Request) {
+	manager, ok := s.requireAgent(w)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	var body struct {
+		Confirm bool   `json:"confirm"`
+		Reason  string `json:"reason"`
+	}
+	if err != nil || id <= 0 || decodeJSON(r, &body) != nil || !body.Confirm || strings.TrimSpace(body.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "策略拒绝需要原因和二次确认")
+		return
+	}
+	if err := manager.RejectPolicy(r.Context(), id, "管理端", body.Reason); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rejected": true})
+}
+
+func (s *Server) rollbackAgentPolicy(w http.ResponseWriter, r *http.Request) {
+	manager, ok := s.requireAgent(w)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	var body struct {
+		Confirm bool   `json:"confirm"`
+		Reason  string `json:"reason"`
+	}
+	if err != nil || id <= 0 || decodeJSON(r, &body) != nil || !body.Confirm || strings.TrimSpace(body.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "策略回滚需要原因和二次确认")
+		return
+	}
+	if err := manager.RollbackPolicy(r.Context(), id, "管理端", body.Reason, false); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rolled_back": true})
 }
 
 func parseUpstreamID(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -833,7 +882,7 @@ func (s *Server) mutation(next http.Handler) http.Handler {
 
 func (s *Server) source(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !sameOriginRequest(r) {
+		if !s.sameOriginRequest(r) {
 			writeError(w, http.StatusForbidden, "请求来源校验失败")
 			return
 		}
@@ -843,7 +892,7 @@ func (s *Server) source(next http.Handler) http.Handler {
 
 func (s *Server) writeRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := clientIP(r)
+		key := s.clientIP(r)
 		if cookie, err := r.Cookie(sessionCookie); err == nil {
 			key += "|" + cookie.Value
 		}
@@ -856,64 +905,11 @@ func (s *Server) writeRateLimit(next http.Handler) http.Handler {
 }
 
 func (s *Server) allowLogin(ip string) bool {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-5 * time.Minute)
-	entries := s.loginLog[ip][:0]
-	for _, entry := range s.loginLog[ip] {
-		if entry.After(cutoff) {
-			entries = append(entries, entry)
-		}
-	}
-	if len(entries) >= 5 {
-		s.loginLog[ip] = entries
-		return false
-	}
-	s.loginLog[ip] = append(entries, now)
-	return true
+	return s.loginLimiter.Allow(ip)
 }
 
 func (s *Server) allowWrite(key string) bool {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-time.Minute)
-	entries := s.writeLog[key][:0]
-	for _, entry := range s.writeLog[key] {
-		if entry.After(cutoff) {
-			entries = append(entries, entry)
-		}
-	}
-	if len(entries) >= 30 {
-		s.writeLog[key] = entries
-		return false
-	}
-	s.writeLog[key] = append(entries, now)
-	return true
-}
-
-func sameOriginRequest(r *http.Request) bool {
-	if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" && site != "same-origin" {
-		return false
-	}
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return false
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Path != "" {
-		return false
-	}
-	scheme := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
-	if scheme == "" {
-		if r.TLS != nil {
-			scheme = "https"
-		} else {
-			scheme = "http"
-		}
-	}
-	return strings.EqualFold(parsed.Scheme, scheme) && strings.EqualFold(parsed.Host, r.Host)
+	return s.writeLimiter.Allow(key)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -940,21 +936,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
-}
-
-func randomToken(size int) string {
-	buffer := make([]byte, size)
-	_, _ = rand.Read(buffer)
-	return base64.RawURLEncoding.EncodeToString(buffer)
-}
-
-func clientIP(r *http.Request) string {
-	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
-		return forwarded
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
-	}
-	return r.RemoteAddr
 }

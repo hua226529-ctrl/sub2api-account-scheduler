@@ -52,6 +52,7 @@ func (s *Store) migrateTelemetry(ctx context.Context) error {
 			reason_code TEXT NOT NULL DEFAULT '',
 			reason_fingerprint TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
+			request_started_at TEXT,
 			ingested_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_events_account_created ON traffic_events(account_id,created_at DESC)`,
@@ -94,6 +95,9 @@ func (s *Store) migrateTelemetry(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate telemetry database: %w", err)
 		}
+	}
+	if err := s.ensureColumn(ctx, "traffic_events", "request_started_at", "TEXT"); err != nil {
+		return fmt.Errorf("migrate traffic request start: %w", err)
 	}
 	return nil
 }
@@ -205,9 +209,9 @@ func (s *Store) insertTraffic(ctx context.Context, successes []model.TrafficSucc
 			// back the valid evidence in the same polling batch.
 			continue
 		}
-		result, err := tx.ExecContext(ctx, `INSERT INTO traffic_events(event_key,account_id,model,upstream_model,kind,duration_ms,request_kind,created_at,ingested_at)
-			VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING`, telemetryFingerprint(item.EventKey), item.AccountID, item.Model,
-			item.UpstreamModel, "success", item.DurationMS, safeTelemetryToken(item.Kind), formatTelemetryTime(item.CreatedAt), now)
+		result, err := tx.ExecContext(ctx, `INSERT INTO traffic_events(event_key,account_id,model,upstream_model,kind,duration_ms,request_kind,created_at,request_started_at,ingested_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING`, telemetryFingerprint(item.EventKey), item.AccountID, item.Model,
+			item.UpstreamModel, "success", item.DurationMS, safeTelemetryToken(item.Kind), formatTelemetryTime(item.CreatedAt), nullableTime(item.RequestStartedAt), now)
 		if err != nil {
 			return 0, err
 		}
@@ -221,10 +225,10 @@ func (s *Store) insertTraffic(ctx context.Context, successes []model.TrafficSucc
 		if item.EventKey == "" || item.AccountID <= 0 || item.CreatedAt.IsZero() {
 			continue
 		}
-		result, err := tx.ExecContext(ctx, `INSERT INTO traffic_events(event_key,account_id,model,requested_model,upstream_model,kind,phase,error_type,severity,status_code,error_class,reason_code,reason_fingerprint,created_at,ingested_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING`, telemetryFingerprint(item.EventKey), item.AccountID,
+		result, err := tx.ExecContext(ctx, `INSERT INTO traffic_events(event_key,account_id,model,requested_model,upstream_model,kind,phase,error_type,severity,status_code,error_class,reason_code,reason_fingerprint,created_at,request_started_at,ingested_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING`, telemetryFingerprint(item.EventKey), item.AccountID,
 			item.Model, item.RequestedModel, item.UpstreamModel, "error", safeTelemetryToken(item.Phase), safeTelemetryToken(item.Type), safeTelemetryToken(item.Severity),
-			item.StatusCode, safeTelemetryToken(item.ErrorClass), safeTelemetryToken(item.ReasonCode), telemetryFingerprint(item.ReasonFingerprint), formatTelemetryTime(item.CreatedAt), now)
+			item.StatusCode, safeTelemetryToken(item.ErrorClass), safeTelemetryToken(item.ReasonCode), telemetryFingerprint(item.ReasonFingerprint), formatTelemetryTime(item.CreatedAt), nullableTime(item.RequestStartedAt), now)
 		if err != nil {
 			return 0, err
 		}

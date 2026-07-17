@@ -175,6 +175,7 @@ jobs:
             --tmpfs /tmp:rw,nosuid,noexec,size=16m,mode=1777 \
             --tmpfs /data:rw,nosuid,noexec,size=64m,uid=10001,gid=10001,mode=0700 \
             --env SUB2API_ADMIN_API_KEY=admin-local-test \
+            --env SCHEDULER_ADMIN_SECRET=scheduler-local-test \
             --env SUB2API_BASE_URL=http://127.0.0.1:18080 \
             --env LISTEN_ADDRESS=:8323 \
             --env DATABASE_PATH=/data/scheduler.db \

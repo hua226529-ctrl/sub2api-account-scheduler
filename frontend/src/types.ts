@@ -154,6 +154,9 @@ export interface Binding {
 
 export interface Settings {
   dry_run: boolean;
+  scheduler_mode: "observe" | "control";
+  failover_mode: "disabled" | "observe" | "control";
+  group_failover_mutation_budget: number;
   failure_threshold: number;
   recovery_threshold: number;
   manual_hold_minutes: number;
@@ -245,6 +248,28 @@ export interface GroupFailoverState {
   healthy_since?: string;
   recovery_healthy_count: number;
   last_confirmed_at?: string;
+	validation_status?: "unknown" | "stable" | "transitioning" | "awaiting_evidence" | "probing" | "confirmed_healthy" | "confirmed_failed" | "uncertain" | "exhausted";
+	validation_mode?: "passive" | "active" | "active_then_passive";
+	validation_transition_id?: number;
+	validation_from_tier?: FailoverTier;
+	validation_target_tier?: FailoverTier;
+	validation_from_group_id?: string;
+	validation_target_group_id?: string;
+	switch_requested_at?: string;
+	switch_verified_at?: string;
+	validation_not_before?: string;
+	evidence_deadline?: string;
+	monitor_watermark?: number;
+	traffic_watermark?: number;
+	monitor_evidence_cursor?: number;
+	traffic_evidence_cursor?: number;
+	active_probe_attempts?: number;
+	successful_evidence_count?: number;
+	failed_evidence_count?: number;
+	last_evidence_id?: string;
+	last_evidence_source?: string;
+	last_evidence_reason?: string;
+	last_evidence_at?: string;
   updated_at?: string;
 }
 
@@ -254,6 +279,9 @@ export interface GroupFailoverPolicy {
   key_id: string;
   key_name: string;
   key_hint: string;
+	main_enabled: boolean;
+	backup_enabled: boolean;
+	emergency_enabled: boolean;
   main_group_id: string;
   backup_group_id: string;
   emergency_group_id: string;
@@ -280,6 +308,8 @@ export interface GroupTierTransition {
   to_group_id: string;
   status: string;
   actor: string;
+  producer?: string;
+  authority?: string;
   reason: string;
   evidence?: string;
   trigger?: string;
@@ -288,6 +318,10 @@ export interface GroupTierTransition {
   error?: string;
   manual: boolean;
   dry_run: boolean;
+  attempt_count?: number;
+  before_state?: string;
+  verified_after_state?: string;
+  uncertain?: boolean;
   created_at: string;
   completed_at?: string;
 }
@@ -295,6 +329,9 @@ export interface GroupTierTransition {
 export interface UpstreamFailoverPolicyInput {
   enabled: boolean;
   key_id: string;
+	main_enabled: boolean;
+	backup_enabled: boolean;
+	emergency_enabled: boolean;
   main_group_id: string;
   backup_group_id: string;
   emergency_group_id: string;
@@ -405,6 +442,9 @@ export interface AgentProviderInput {
 export interface AgentSettings {
   enabled: boolean;
   mode: "observe" | "control";
+  optimizer_mode: "disabled" | "observe" | "propose" | "auto";
+  operator_mode: "disabled" | "confirm" | "direct";
+  daily_policy_change_budget: number;
   analysis_interval_minutes: number;
   emergency_cooldown_minutes: number;
   context_token_budget: number;
@@ -475,6 +515,23 @@ export interface ScorePolicyVersion {
   version: number;
   status: string;
   config: Record<string, unknown>;
+  patch?: Record<string, unknown>;
+  diff?: Record<string, unknown>;
+  simulation?: {
+    passed: boolean;
+    data_sufficient: boolean;
+    sample_count: number;
+    current_actions?: number;
+    proposed_actions?: number;
+    summary?: string;
+  };
+  risk_level?: "low" | "medium" | "high" | "critical";
+  affected_account_ids?: number[];
+  base_version_id?: number;
+  previous_active_version_id?: number;
+  approved_by?: string;
+  rollback_reason?: string;
+  outcome_summary?: string;
   reason: string;
   agent_run_id?: number;
   created_by: string;
@@ -664,8 +721,27 @@ export interface AgentCommandReceipt {
   run?: AgentRun;
 }
 
+export interface AgentChatIntent {
+  intent_type: "query" | "analysis" | "direct_action" | "policy_change" | "scheduled_action" | "ambiguous";
+  resource_type: string;
+  resource_ids?: string[];
+  operation: string;
+  duration_seconds?: number;
+  expires_at?: string;
+  scheduled_at?: string;
+  timezone?: string;
+  read_only: boolean;
+  requires_confirmation: boolean;
+  risk_level: string;
+  user_facing_summary: string;
+  clarification?: string;
+}
+
 export interface AgentChatReceipt extends AgentCommandReceipt {
   conversation_id: number;
+  intent: AgentChatIntent;
+  confirmation_token?: string;
+  confirmation_expires_at?: string;
 }
 
 export interface AgentGoalList {

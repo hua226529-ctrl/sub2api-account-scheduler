@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ type Config struct {
 	DatabasePath          string
 	Sub2APIBaseURL        string
 	AdminAPIKey           string
+	SchedulerAdminSecret  string
+	AllowLegacyAdminLogin bool
+	TrustedProxyCIDRs     []string
 	PollInterval          time.Duration
 	RequestTimeout        time.Duration
 	SessionIdleTimeout    time.Duration
@@ -34,6 +38,13 @@ type Config struct {
 	AllowInsecureUpstream bool
 }
 
+func (c Config) LegacyAdminLoginWarning() string {
+	if !c.AllowLegacyAdminLogin {
+		return ""
+	}
+	return "ALLOW_LEGACY_ADMIN_KEY_LOGIN is deprecated; configure SCHEDULER_ADMIN_SECRET"
+}
+
 func Load() (Config, error) {
 	cfg := Config{
 		ListenAddress:         env("LISTEN_ADDRESS", ":8323"),
@@ -41,6 +52,9 @@ func Load() (Config, error) {
 		DatabasePath:          env("DATABASE_PATH", "/data/scheduler.db"),
 		Sub2APIBaseURL:        strings.TrimRight(env("SUB2API_BASE_URL", "http://sub2api:8080"), "/"),
 		AdminAPIKey:           strings.TrimSpace(os.Getenv("SUB2API_ADMIN_API_KEY")),
+		SchedulerAdminSecret:  strings.TrimSpace(os.Getenv("SCHEDULER_ADMIN_SECRET")),
+		AllowLegacyAdminLogin: boolEnv("ALLOW_LEGACY_ADMIN_KEY_LOGIN", false),
+		TrustedProxyCIDRs:     csvEnv("TRUSTED_PROXY_CIDRS"),
 		PollInterval:          durationEnv("POLL_INTERVAL", 50*time.Second),
 		RequestTimeout:        durationEnv("REQUEST_TIMEOUT", 12*time.Second),
 		SessionIdleTimeout:    durationEnv("SESSION_IDLE_TIMEOUT", 30*time.Minute),
@@ -58,6 +72,17 @@ func Load() (Config, error) {
 	}
 	if cfg.AdminAPIKey == "" {
 		return Config{}, fmt.Errorf("SUB2API_ADMIN_API_KEY is required")
+	}
+	if cfg.SchedulerAdminSecret == "" {
+		if !cfg.AllowLegacyAdminLogin {
+			return Config{}, fmt.Errorf("SCHEDULER_ADMIN_SECRET is required")
+		}
+		cfg.SchedulerAdminSecret = cfg.AdminAPIKey
+	}
+	for _, raw := range cfg.TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(raw); err != nil {
+			return Config{}, fmt.Errorf("TRUSTED_PROXY_CIDRS contains invalid CIDR %q", raw)
+		}
 	}
 	if cfg.PollInterval < 10*time.Second {
 		return Config{}, fmt.Errorf("POLL_INTERVAL must be at least 10s")
@@ -144,6 +169,17 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func csvEnv(key string) []string {
+	parts := strings.Split(os.Getenv(key), ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func normalizeBasePath(value string) string {

@@ -66,14 +66,14 @@ func TestListOperationsPaginationQueryAndClassification(t *testing.T) {
 		var item map[string]any
 		switch r.URL.Path {
 		case "/api/v1/admin/ops/requests":
-			item = map[string]any{"account_id": 225, "request_id": "request-secret-" + strconv.Itoa(page), "model": "gpt-5.5", "duration_ms": page * 100, "kind": "chat", "created_at": now.Add(-time.Duration(page) * time.Minute)}
+			item = map[string]any{"account_id": 225, "request_id": "request-secret-" + strconv.Itoa(page), "model": "gpt-5.5", "duration_ms": page * 100, "kind": "chat", "request_started_at": now.Add(-time.Duration(page)*time.Minute - time.Second), "created_at": now.Add(-time.Duration(page) * time.Minute)}
 		case "/api/v1/admin/ops/errors":
 			message := "dial tcp private-host: connection timeout"
 			status := 502
 			if page == 2 {
 				message, status = "model not found: private-model", 404
 			}
-			item = map[string]any{"account_id": 225, "request_id": "error-secret-" + strconv.Itoa(page), "model": "gpt-5.5", "requested_model": "gpt-5.5", "phase": "upstream", "type": "request_error", "severity": "error", "status_code": status, "message": message, "created_at": now.Add(-time.Duration(page) * time.Minute)}
+			item = map[string]any{"account_id": 225, "request_id": "error-secret-" + strconv.Itoa(page), "model": "gpt-5.5", "requested_model": "gpt-5.5", "phase": "upstream", "type": "request_error", "severity": "error", "status_code": status, "message": message, "request_started_at": now.Add(-time.Duration(page)*time.Minute - time.Second), "created_at": now.Add(-time.Duration(page) * time.Minute)}
 		default:
 			http.NotFound(w, r)
 			return
@@ -92,10 +92,10 @@ func TestListOperationsPaginationQueryAndClassification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(successes) != 2 || len(successes[0].EventKey) != 64 || successes[0].DurationMS != 100 {
+	if len(successes) != 2 || len(successes[0].EventKey) != 64 || successes[0].DurationMS != 100 || successes[0].RequestStartedAt == nil {
 		t.Fatalf("unexpected successes: %+v", successes)
 	}
-	if len(failures) != 2 || failures[0].ErrorClass != model.ErrorClassInfrastructure || failures[1].ErrorClass != model.ErrorClassModelCapability {
+	if len(failures) != 2 || failures[0].ErrorClass != model.ErrorClassInfrastructure || failures[1].ErrorClass != model.ErrorClassModelCapability || failures[0].RequestStartedAt == nil {
 		t.Fatalf("unexpected classified errors: %+v", failures)
 	}
 	encoded, _ := json.Marshal(failures)

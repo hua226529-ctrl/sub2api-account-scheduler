@@ -14,7 +14,6 @@ const (
 	agentGroupAccountMaxAge = 3 * time.Minute
 	agentGroupTrafficMaxAge = 6 * time.Minute
 	agentGroupDataMaxAge    = 30 * time.Minute
-	agentGroupRecoveryAge   = 30 * time.Minute
 )
 
 // validateAutonomousGroupTransition repeats the disaster conditions outside
@@ -66,58 +65,53 @@ func (m *Manager) validateAutonomousGroupTransition(ctx context.Context, sourceI
 	if currentTier == targetTier {
 		return errors.New("令牌已经处于目标分组层级")
 	}
+	if targetTier == model.GroupTierMain {
+		return errors.New("自动返回主组的产品规则尚未定义，只允许管理员显式切回")
+	}
+	if expected := nextConfiguredAgentTier(policy, currentTier); expected == "" || expected != targetTier {
+		return errors.New("自主切组只能进入固定链的下一个已配置启用层级")
+	}
 	bindings := bindingsForAgentPool(snapshot.Bindings, sources, source, policy)
 	if len(bindings) == 0 {
 		return errors.New("调度池没有可核验的账号")
 	}
-	if targetTier == model.GroupTierMain {
-		return m.validateAutonomousReturnMain(ctx, policy, bindings, now)
-	}
 	if targetTier != model.GroupTierBackup && targetTier != model.GroupTierEmergency {
 		return errors.New("自动切组目标层级无效")
 	}
-	if !agentPoolOutageProven(ctx, m.store, bindings, now) {
+	if policy.State.ValidationStatus != model.GroupValidationConfirmedFailed && !agentPoolOutageProven(ctx, m.store, bindings, now) {
 		return errors.New("执行器未能独立证明整个调度池完全不可用，拒绝自动切组")
 	}
 	return nil
 }
 
-func (m *Manager) validateAutonomousReturnMain(ctx context.Context, policy model.GroupFailoverPolicy, bindings []model.ResolvedBinding, now time.Time) error {
-	state := policy.State
-	if state.CurrentTier != model.GroupTierBackup && state.CurrentTier != model.GroupTierEmergency {
-		return errors.New("只有备用或紧急分组可以自动试回主组")
+func nextConfiguredAgentTier(policy model.GroupFailoverPolicy, current string) string {
+	type level struct {
+		tier    string
+		groupID string
+		enabled bool
 	}
-	if state.ReturnBlockedUntil != nil && now.Before(state.ReturnBlockedUntil.UTC()) {
-		return errors.New("试回主组仍在失败保护期")
+	legacyEnablement := !policy.MainEnabled && !policy.BackupEnabled && !policy.EmergencyEnabled
+	levels := []level{
+		{tier: model.GroupTierMain, groupID: policy.MainGroupID, enabled: policy.MainEnabled},
+		{tier: model.GroupTierBackup, groupID: policy.BackupGroupID, enabled: policy.BackupEnabled},
+		{tier: model.GroupTierEmergency, groupID: policy.EmergencyGroupID, enabled: policy.EmergencyEnabled},
 	}
-	if state.HealthySince == nil || now.Sub(state.HealthySince.UTC()) < agentGroupRecoveryAge || state.RecoveryHealthyCount < 10 {
-		return errors.New("尚未连续稳定30分钟并获得10次正常监控结果")
-	}
-	accountIDs := make(map[int64]bool, len(policy.AccountIDs))
-	for _, id := range policy.AccountIDs {
-		accountIDs[id] = true
-	}
-	eligible, successes := 0, 0
-	for _, binding := range bindings {
-		if !accountIDs[binding.Account.ID] {
-			continue
+	currentIndex := -1
+	for index, level := range levels {
+		if level.tier == current {
+			currentIndex = index
+			break
 		}
-		if binding.Monitor == nil || !binding.Monitor.Enabled || binding.Monitor.LastCheckedAt == nil ||
-			now.Sub(binding.Monitor.LastCheckedAt.UTC()) > agentGroupAccountMaxAge ||
-			!strings.EqualFold(binding.Monitor.PrimaryStatus, model.StatusOperational) || binding.MonitorState.HealthyStreak < 10 {
-			return errors.New("关联账号尚未获得10次新鲜正常监控结果")
-		}
-		window, err := m.store.GetAgentWindowStats(ctx, binding.Account.ID, now.Add(-30*time.Minute), now.Add(time.Nanosecond), "agent_return_main")
-		if err != nil {
-			return fmt.Errorf("读取恢复流量证据失败: %w", err)
-		}
-		eligible += window.EligibleCount
-		successes += window.SuccessCount
 	}
-	if eligible < 20 || float64(successes)*100/float64(eligible) < 98 {
-		return errors.New("最近30分钟真实请求尚未达到20个样本和98%成功率")
+	if currentIndex < 0 {
+		return ""
 	}
-	return nil
+	for _, level := range levels[currentIndex+1:] {
+		if strings.TrimSpace(level.groupID) != "" && (level.enabled || legacyEnablement) {
+			return level.tier
+		}
+	}
+	return ""
 }
 
 type agentWindowStore interface {
@@ -174,11 +168,11 @@ func bindingsForAgentPool(all []model.ResolvedBinding, sources []model.UpstreamS
 	}
 	endpoints := make(map[string]bool)
 	for _, source := range sources {
-		candidate := strings.TrimSpace(source.RoutingPool)
-		if candidate == "" {
-			candidate = source.Name
+		sourcePool := strings.TrimSpace(source.RoutingPool)
+		if sourcePool == "" {
+			sourcePool = source.Name
 		}
-		if candidate == pool {
+		if sourcePool == pool {
 			endpoints[source.NormalizedURL] = true
 		}
 	}

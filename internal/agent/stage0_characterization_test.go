@@ -30,30 +30,30 @@ func TestCharacterizationChatAsyncPersistsPlannedGoalWithoutModelCall(t *testing
 	ctx := context.Background()
 	manager.interactiveWake <- struct{}{}
 	started := time.Now()
-	conversationID, goalID, runID, status, err := manager.ChatAsync(ctx, 0, "分析当前账号状态")
+	receipt, err := manager.ChatAsync(ctx, 0, "分析最近整体调度效果。")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conversationID <= 0 || goalID <= 0 || runID != 0 || status != model.AgentGoalStatusPlanned {
-		t.Fatalf("ChatAsync result = conversation:%d goal:%d run:%d status:%q", conversationID, goalID, runID, status)
+	if receipt.ConversationID <= 0 || receipt.GoalID <= 0 || receipt.RunID != 0 || receipt.Status != model.AgentGoalStatusPlanned {
+		t.Fatalf("ChatAsync result = %+v", receipt)
 	}
 	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
 		t.Fatalf("ChatAsync blocked instead of returning after durable enqueue: %v", elapsed)
 	} else {
 		t.Logf("ChatAsync durable return: %v", elapsed)
 	}
-	goal, err := database.Store.GetAgentGoal(ctx, goalID)
+	goal, err := database.Store.GetAgentGoal(ctx, receipt.GoalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if goal.Status != model.AgentGoalStatusPlanned || goal.Lane != model.AgentLaneInteractive || goal.Source != "administrator" || goal.ConversationID == nil || *goal.ConversationID != conversationID {
+	if goal.Status != model.AgentGoalStatusPlanned || goal.Lane != model.AgentLaneInteractive || goal.Source != "administrator" || goal.ConversationID == nil || *goal.ConversationID != receipt.ConversationID {
 		t.Fatalf("persisted goal changed: %+v", goal)
 	}
-	messages, err := database.Store.ListAgentMessages(ctx, conversationID, 10)
+	messages, err := database.Store.ListAgentMessages(ctx, receipt.ConversationID, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 1 || messages[0].Role != "user" || messages[0].Content != "分析当前账号状态" {
+	if len(messages) != 1 || messages[0].Role != "user" || messages[0].Content != "分析最近整体调度效果。" {
 		t.Fatalf("persisted messages = %+v", messages)
 	}
 }
@@ -61,14 +61,14 @@ func TestCharacterizationChatAsyncPersistsPlannedGoalWithoutModelCall(t *testing
 func TestInteractiveGoalDoesNotWaitForBackgroundLane(t *testing.T) {
 	manager, database := stage0AgentManager(t)
 	ctx := context.Background()
-	_, goalID, _, _, err := manager.ChatAsync(ctx, 0, "分析当前账号状态")
+	receipt, err := manager.ChatAsync(ctx, 0, "分析最近整体调度效果。")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !manager.processNextRuntimeGoalLane(ctx, model.AgentLaneInteractive) {
 		t.Fatal("interactive worker did not select the queued goal")
 	}
-	goal, err := database.Store.GetAgentGoal(ctx, goalID)
+	goal, err := database.Store.GetAgentGoal(ctx, receipt.GoalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestIdleInteractiveGoalClaimWithinLatencyTarget(t *testing.T) {
 	defer cancel()
 	go manager.runtimeWorker(ctx, model.AgentLaneInteractive)
 	started := time.Now()
-	if _, _, _, _, err := manager.ChatAsync(ctx, 0, "idle interactive claim"); err != nil {
+	if _, err := manager.ChatAsync(ctx, 0, "分析最近整体调度效果。"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -153,6 +153,8 @@ func TestBackgroundModelWaitDoesNotDelayInteractiveClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings.Enabled = true
+	settings.OptimizerMode = model.AgentOptimizerPropose
+	settings.OperatorMode = model.AgentOperatorConfirm
 	if err := database.Store.UpdateAgentSettings(context.Background(), settings); err != nil {
 		t.Fatal(err)
 	}
@@ -172,16 +174,28 @@ func TestBackgroundModelWaitDoesNotDelayInteractiveClaim(t *testing.T) {
 		backgroundRelease()
 		t.Fatal(err)
 	}
-	if lane := <-claimed; lane != model.AgentLaneBackground {
+	select {
+	case lane := <-claimed:
+		if lane != model.AgentLaneBackground {
+			backgroundRelease()
+			t.Fatalf("unexpected first claimed lane: %q", lane)
+		}
+	case <-time.After(500 * time.Millisecond):
 		backgroundRelease()
-		t.Fatalf("unexpected first claimed lane: %q", lane)
+		t.Fatal("background goal was not claimed")
 	}
-	if lane := <-waiting; lane != model.AgentLaneBackground {
+	select {
+	case lane := <-waiting:
+		if lane != model.AgentLaneBackground {
+			backgroundRelease()
+			t.Fatalf("background worker did not reach its occupied model slot: %q", lane)
+		}
+	case <-time.After(500 * time.Millisecond):
 		backgroundRelease()
-		t.Fatalf("background worker did not reach its occupied model slot: %q", lane)
+		t.Fatal("background worker did not reach its occupied model slot")
 	}
 	started := time.Now()
-	if _, _, _, _, err := manager.ChatAsync(ctx, 0, "interactive while background is blocked"); err != nil {
+	if _, err := manager.ChatAsync(ctx, 0, "分析最近整体调度效果。"); err != nil {
 		backgroundRelease()
 		t.Fatal(err)
 	}
@@ -207,7 +221,7 @@ func TestBackgroundModelWaitDoesNotDelayInteractiveClaim(t *testing.T) {
 func TestCharacterizationMissingModelProviderDoesNotStopDeterministicReconcile(t *testing.T) {
 	manager, _ := stage0AgentManager(t)
 	ctx := context.Background()
-	if _, _, _, _, err := manager.ChatAsync(ctx, 0, "分析当前账号状态"); err != nil {
+	if _, err := manager.ChatAsync(ctx, 0, "分析最近整体调度效果。"); err != nil {
 		t.Fatal(err)
 	}
 	if !manager.processNextRuntimeGoal(ctx) {

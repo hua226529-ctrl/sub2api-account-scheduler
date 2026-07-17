@@ -435,8 +435,9 @@ func (s *Service) finalize(ctx context.Context, submission Submission, mutation 
 	event.BeforeState = formatState(mutation.Before)
 	event.AfterState = formatState(mutation.After)
 	details, _ := json.Marshal(map[string]any{
-		"mutation_id": mutation.ID, "intent_id": mutation.IntentID, "authority": mutation.WinningAuthority,
-		"status": mutation.Status,
+		"mutation_id": mutation.ID, "intent_id": mutation.IntentID, "producer": mutation.WinningProducer,
+		"authority": mutation.WinningAuthority, "operation": mutation.Operation, "status": mutation.Status,
+		"expires_at": mutation.WinningExpiresAt, "verified_after": mutation.After, "uncertain": mutation.Status == StatusUncertain,
 	})
 	event.Details = string(details)
 	finalization := Finalization{

@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,12 +101,17 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 	if err != nil {
 		t.Fatal(err)
 	}
-	if transition.Status != model.GroupTransitionCompleted || currentGroup.Load().(string) != "backup" || writes.Load() != 1 {
+	if transition.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "backup" || writes.Load() != 1 {
 		t.Fatalf("unexpected transition: %+v group=%s writes=%d", transition, currentGroup.Load(), writes.Load())
 	}
 	repeated, err := manager.TransitionGroupTier(ctx, request)
 	if err != nil || repeated.ID != transition.ID || writes.Load() != 1 {
 		t.Fatalf("idempotency failed: %+v, %v, writes=%d", repeated, err, writes.Load())
+	}
+	conflictRequest := request
+	conflictRequest.TargetTier = model.GroupTierEmergency
+	if _, err := manager.TransitionGroupTier(ctx, conflictRequest); !errors.Is(err, store.ErrGroupTransitionIdempotencyConflict) {
+		t.Fatalf("same idempotency key with different target was not rejected: %v", err)
 	}
 	stored, err := database.GetGroupFailoverPolicy(ctx, source.ID, "1")
 	if err != nil {
@@ -112,6 +119,9 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 	}
 	if stored.State.CurrentTier != model.GroupTierBackup || stored.State.ManualOverrideUntil == nil || stored.State.CooldownUntil == nil {
 		t.Fatalf("transition state was not persisted: %+v", stored.State)
+	}
+	if stored.State.ValidationStatus != model.GroupValidationAwaitingEvidence || stored.State.LastConfirmedAt != nil {
+		t.Fatalf("applied transition was incorrectly treated as healthy: %+v", stored.State)
 	}
 	if remaining := time.Until(stored.State.ManualOverrideUntil.UTC()); remaining < 6*time.Minute || remaining > 8*time.Minute {
 		t.Fatalf("configured manual protection was not applied: %s", remaining)
@@ -134,25 +144,36 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 		SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierMain,
 		IdempotencyKey: "return-main", Actor: "system", Reason: "stable", Trigger: "stable_return_main",
 	})
-	if err != nil || returned.Status != model.GroupTransitionCompleted || currentGroup.Load().(string) != "main" {
+	if err != nil || returned.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "main" {
 		t.Fatalf("return to main failed: transition=%+v err=%v group=%s", returned, err, currentGroup.Load())
 	}
-	rolledBack, err := manager.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
+	nonManualState, err := database.GetGroupFailoverPolicy(ctx, source.ID, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nonManualState.State.ValidationStatus != model.GroupValidationAwaitingEvidence || nonManualState.State.LastConfirmedAt != nil {
+		t.Fatalf("non-manual transition was incorrectly treated as healthy: %+v", nonManualState.State)
+	}
+	_, err = manager.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
 		SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierBackup,
 		IdempotencyKey: "rollback-main", Actor: "system", Reason: "main failed", Trigger: "main_trial_rollback",
 	})
-	if err != nil || rolledBack.Status != model.GroupTransitionCompleted || currentGroup.Load().(string) != "backup" {
-		t.Fatalf("main trial rollback did not bypass cooldown: transition=%+v err=%v group=%s", rolledBack, err, currentGroup.Load())
+	if err == nil || currentGroup.Load().(string) != "main" {
+		t.Fatalf("automatic trial rollback bypassed cooldown: err=%v group=%s", err, currentGroup.Load())
+	}
+	rolledBack, err := manager.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
+		SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierBackup,
+		IdempotencyKey: "administrator-return-backup", Actor: "administrator:test", Reason: "explicit administrator switch", Manual: true,
+	})
+	if err != nil || rolledBack.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "backup" {
+		t.Fatalf("explicit administrator switch failed: transition=%+v err=%v group=%s", rolledBack, err, currentGroup.Load())
 	}
 	stored, err = database.GetGroupFailoverPolicy(ctx, source.ID, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State.ReturnBlockedUntil == nil || stored.State.PreviousStableTier != "" {
-		t.Fatalf("rollback state not finalized safely: %+v", stored.State)
-	}
-	if remaining := time.Until(stored.State.ReturnBlockedUntil.UTC()); remaining < 16*time.Minute || remaining > 18*time.Minute {
-		t.Fatalf("configured return retry delay was not applied: %s", remaining)
+	if stored.State.ValidationStatus != model.GroupValidationAwaitingEvidence || stored.State.LastConfirmedAt != nil {
+		t.Fatalf("manual switch was incorrectly treated as healthy: %+v", stored.State)
 	}
 	cutoff := time.Now().UTC().Add(-time.Minute)
 	poolChanged, err := database.HasAutomaticGroupTransitionInPoolSince(ctx, "gpt", cutoff)
@@ -168,6 +189,12 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 		t.Fatal("stale agent packet ignored a newer automatic transition in the same pool")
 	}
 
+	confirmedAt := time.Now().UTC()
+	stored.State.ValidationStatus = model.GroupValidationConfirmedHealthy
+	stored.State.LastConfirmedAt = &confirmedAt
+	if err := database.SaveGroupFailoverState(ctx, stored.State); err != nil {
+		t.Fatal(err)
+	}
 	currentGroup.Store("emergency")
 	_, err = manager.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
 		SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierEmergency,
@@ -180,7 +207,7 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State.CurrentTier != model.GroupTierEmergency || stored.State.ManualHoldUntil == nil {
+	if stored.State.CurrentTier != model.GroupTierEmergency || stored.State.ManualHoldUntil == nil || stored.State.ValidationStatus != model.GroupValidationUncertain || stored.State.LastConfirmedAt != nil || stored.State.LastError != "manual_switch_requires_new_evidence_boundary" {
 		t.Fatalf("upstream-side manual group change was not protected: %+v", stored.State)
 	}
 
@@ -193,14 +220,69 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 		t.Fatalf("changed policy retained stale confirmation: %+v", changed)
 	}
 
+	recovery, existed, err := database.BeginGroupTierTransition(ctx, model.GroupTierTransition{
+		IdempotencyKey: "recover-with-readback", SourceID: source.ID, KeyID: "1", FromTier: model.GroupTierEmergency,
+		ToTier: model.GroupTierEmergency, FromGroupID: "emergency", ToGroupID: "emergency-2", Actor: "system:recovery",
+		Producer: "deterministic_failover", Authority: "deterministic_safety", Reason: "recover uncertain write", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil || existed {
+		t.Fatalf("begin recovery transition: existed=%v err=%v", existed, err)
+	}
+	if err := database.MarkGroupTierTransitionUncertain(ctx, recovery.ID, "write result unknown"); err != nil {
+		t.Fatal(err)
+	}
+	currentGroup.Store("emergency-2")
+	writesBeforeRecovery := writes.Load()
+	if err := manager.RecoverGroupTransitions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := database.GetGroupTierTransitionByKey(ctx, recovery.IdempotencyKey)
+	if err != nil || recovered.Status != model.GroupTransitionApplied || recovered.VerifiedAfter != "emergency-2" {
+		t.Fatalf("uncertain transition was not recovered by readback: %+v err=%v", recovered, err)
+	}
+	if writes.Load() != writesBeforeRecovery {
+		t.Fatalf("recovery replayed the upstream write: before=%d after=%d", writesBeforeRecovery, writes.Load())
+	}
+
 	freeze.state = model.FreezeState{AllAutomation: true}
 	writesBeforeFreeze := writes.Load()
 	credentials := model.UpstreamCredentials{AuthMode: "password", Username: "owner", Password: "secret"}
-	if _, err := manager.switchAutomatedGroup(ctx, false, false, source, credentials, "1", "backup"); err == nil {
+	if _, err := manager.executeGroupTransport(ctx, false, false, source, credentials, "1", "backup"); err == nil {
 		t.Fatal("automatic group write crossed the global freeze")
 	}
 	if writes.Load() != writesBeforeFreeze {
 		t.Fatalf("frozen group write reached the upstream: before=%d after=%d", writesBeforeFreeze, writes.Load())
+	}
+}
+
+type snapshotTrigger struct{ snapshot model.Snapshot }
+
+func (snapshotTrigger) Trigger()                         {}
+func (trigger snapshotTrigger) Snapshot() model.Snapshot { return trigger.snapshot }
+
+func TestGroupFailoverEvidenceSourceMustFitValidationDeadline(t *testing.T) {
+	policy := model.GroupFailoverPolicy{Enabled: true, AccountIDs: []int64{11}}
+	manager := &Manager{trigger: fakeTrigger{}}
+	if err := manager.validateGroupFailoverEvidenceSource(policy); err != nil {
+		t.Fatalf("valid monitor rejected: %v", err)
+	}
+	manager.trigger = snapshotTrigger{snapshot: model.Snapshot{Bindings: []model.ResolvedBinding{{
+		Account: model.Account{ID: 11}, Monitor: &model.Monitor{ID: 7, Enabled: true, IntervalSeconds: 600},
+	}}}}
+	if err := manager.validateGroupFailoverEvidenceSource(policy); err == nil || !strings.Contains(err.Error(), "validation_evidence_source_unavailable") {
+		t.Fatalf("monitor outside evidence deadline accepted: %v", err)
+	}
+	manager.trigger = snapshotTrigger{}
+	if err := manager.validateGroupFailoverEvidenceSource(policy); err == nil || !strings.Contains(err.Error(), "validation_evidence_source_unavailable") {
+		t.Fatalf("missing evidence source accepted: %v", err)
+	}
+	manager.trigger = nil
+	if err := manager.validateGroupFailoverEvidenceSource(policy); err == nil || !strings.Contains(err.Error(), "validation_evidence_source_unavailable") {
+		t.Fatalf("unobservable evidence source accepted: %v", err)
+	}
+	policy.Enabled = false
+	if err := manager.validateGroupFailoverEvidenceSource(policy); err != nil {
+		t.Fatalf("disabled policy requires runtime evidence: %v", err)
 	}
 }
 
@@ -284,7 +366,7 @@ func TestManualGroupTransitionBypassesAutomaticEligibilityOnly(t *testing.T) {
 		SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierBackup, IdempotencyKey: "administrator-bypass",
 		Actor: "administrator:agent", Reason: "exact administrator command", Manual: true,
 	})
-	if err != nil || transition.Status != model.GroupTransitionCompleted || currentGroup.Load().(string) != "backup" || writes.Load() != 1 {
+	if err != nil || transition.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "backup" || writes.Load() != 1 {
 		t.Fatalf("administrator command was blocked by automatic eligibility: transition=%+v err=%v group=%s writes=%d", transition, err, currentGroup.Load(), writes.Load())
 	}
 	_, err = manager.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{

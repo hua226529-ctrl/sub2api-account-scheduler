@@ -343,7 +343,7 @@ func (f *FakeSub2API) TransitionGroupTier(ctx context.Context, request model.Gro
 	transition := model.GroupTierTransition{
 		ID: int64(len(f.transitions) + 1), IdempotencyKey: request.IdempotencyKey,
 		SourceID: request.SourceID, KeyID: request.KeyID, FromTier: from, ToTier: request.TargetTier,
-		FromGroupID: from, ToGroupID: request.TargetTier, Status: model.GroupTransitionCompleted,
+		FromGroupID: from, ToGroupID: request.TargetTier, Status: model.GroupTransitionApplied,
 		Actor: request.Actor, Reason: request.Reason, Manual: request.Manual, DryRun: request.DryRun,
 		CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}

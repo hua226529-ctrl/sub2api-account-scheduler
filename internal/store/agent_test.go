@@ -32,7 +32,8 @@ func TestAgentSettingsRoundTrip(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 	updated := model.AgentSettings{
-		Enabled: true, Mode: model.AgentModeControl, AnalysisIntervalMinutes: 45,
+		OptimizerMode: model.AgentOptimizerAuto, OperatorMode: model.AgentOperatorConfirm, DailyPolicyChangeBudget: 3,
+		AnalysisIntervalMinutes:  45,
 		EmergencyCooldownMinutes: 7, ContextTokenBudget: 12000, MaxAnomalies: 12,
 		MaxDrilldowns: 4, RetentionDays: 45, ObservationStartedAt: &now,
 		SuccessfulObservationRuns: 41, ObservationProposedActions: 20,
@@ -46,7 +47,8 @@ func TestAgentSettingsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Enabled || loaded.Mode != model.AgentModeControl || loaded.AnalysisIntervalMinutes != 45 ||
+	if !loaded.Enabled || loaded.Mode != model.AgentModeControl || loaded.OptimizerMode != model.AgentOptimizerAuto ||
+		loaded.OperatorMode != model.AgentOperatorConfirm || loaded.DailyPolicyChangeBudget != 3 || loaded.AnalysisIntervalMinutes != 45 ||
 		loaded.ContextTokenBudget != 12000 || loaded.SuccessfulObservationRuns != 41 ||
 		loaded.ObservationProposedActions != 20 || loaded.ObservationExecutableActions != 19 ||
 		loaded.ObservationViolations != 1 || loaded.ObservationStructureErrors != 2 ||
@@ -56,7 +58,7 @@ func TestAgentSettingsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAgentObservationActivationGate(t *testing.T) {
+func TestAgentObservationDoesNotImplicitlyEnableControl(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -72,8 +74,8 @@ func TestAgentObservationActivationGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	settings.Enabled = true
-	settings.Mode = model.AgentModeObserve
+	settings.OptimizerMode = model.AgentOptimizerObserve
+	settings.OperatorMode = model.AgentOperatorDisabled
 	settings.ObservationStartedAt = &started
 	settings.SuccessfulObservationRuns = 39
 	settings.ObservationProposedActions = 20
@@ -86,12 +88,11 @@ func TestAgentObservationActivationGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !activated || activatedSettings.Mode != model.AgentModeControl || activatedSettings.SuccessfulObservationRuns != 40 {
-		t.Fatalf("eligible observation should activate control: activated=%v settings=%+v", activated, activatedSettings)
+	if activated || activatedSettings.OptimizerMode != model.AgentOptimizerObserve || activatedSettings.SuccessfulObservationRuns != 40 {
+		t.Fatalf("observation must not activate control: activated=%v settings=%+v", activated, activatedSettings)
 	}
 
 	settings = activatedSettings
-	settings.Mode = model.AgentModeObserve
 	settings.ObservationStartedAt = &started
 	settings.SuccessfulObservationRuns = 39
 	settings.ObservationViolations = 1
@@ -102,8 +103,8 @@ func TestAgentObservationActivationGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if activated || blockedSettings.Mode != model.AgentModeObserve {
-		t.Fatalf("observation violation must block activation: activated=%v settings=%+v", activated, blockedSettings)
+	if activated || blockedSettings.OptimizerMode != model.AgentOptimizerObserve {
+		t.Fatalf("observation mode changed unexpectedly: activated=%v settings=%+v", activated, blockedSettings)
 	}
 }
 
@@ -116,8 +117,8 @@ func TestPublishPolicyVersionAtomicallyUpdatesProjectionAndActivation(t *testing
 	}
 	defer database.Close()
 
-	oldVersion := model.ScorePolicyVersion{ScopeType: "pool", ScopeID: "gpt", Config: json.RawMessage(`{"failure_threshold":3}`), CreatedBy: "test"}
-	if err := database.CreatePolicyVersion(ctx, &oldVersion, true); err != nil {
+	oldVersion := testLifecycleProposal("old-pool-policy", "pool", "gpt", json.RawMessage(`{"failure_threshold":3}`), nil)
+	if err := database.CreatePolicyProposal(ctx, &oldVersion); err != nil {
 		t.Fatal(err)
 	}
 	oldID := oldVersion.ID
@@ -128,8 +129,17 @@ func TestPublishPolicyVersionAtomicallyUpdatesProjectionAndActivation(t *testing
 			t.Fatal(err)
 		}
 	}
-	newVersion := model.ScorePolicyVersion{ScopeType: "pool", ScopeID: "gpt", Config: json.RawMessage(`{"failure_threshold":5}`), CreatedBy: "test"}
-	if err := database.CreatePolicyVersion(ctx, &newVersion, false); err != nil {
+	initialProjection := make([]model.Policy, 0, 2)
+	for _, accountID := range []int64{298, 299} {
+		threshold := 3
+		initialProjection = append(initialProjection, model.Policy{AccountID: accountID, Enabled: true, FailureThreshold: &threshold,
+			ScorePolicySource: "pool", ScorePolicyVersionID: &oldID})
+	}
+	if err := database.PublishPolicyProposal(ctx, oldVersion.ID, "test", nil, initialProjection); err != nil {
+		t.Fatal(err)
+	}
+	newVersion := testLifecycleProposal("new-pool-policy", "pool", "gpt", json.RawMessage(`{"failure_threshold":5}`), &oldID)
+	if err := database.CreatePolicyProposal(ctx, &newVersion); err != nil {
 		t.Fatal(err)
 	}
 	newID := newVersion.ID
@@ -143,7 +153,7 @@ func TestPublishPolicyVersionAtomicallyUpdatesProjectionAndActivation(t *testing
 		BEGIN SELECT RAISE(ABORT, 'injected publish failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.PublishPolicyVersion(ctx, newVersion.ID, nil, projection); err == nil {
+	if err := database.PublishPolicyProposal(ctx, newVersion.ID, "test", nil, projection); err == nil {
 		t.Fatal("injected publication failure was ignored")
 	}
 	policies, err := database.ListPolicies(ctx)
@@ -156,16 +166,16 @@ func TestPublishPolicyVersionAtomicallyUpdatesProjectionAndActivation(t *testing
 			t.Fatalf("failed publication changed account %d: %+v", accountID, policy)
 		}
 	}
-	oldLoaded, _ := database.GetPolicyVersion(ctx, oldVersion.ID)
-	newLoaded, _ := database.GetPolicyVersion(ctx, newVersion.ID)
-	if oldLoaded.Status != "active" || newLoaded.Status != "draft" {
+	oldLoaded, _ := database.GetPolicyLifecycle(ctx, oldVersion.ID)
+	newLoaded, _ := database.GetPolicyLifecycle(ctx, newVersion.ID)
+	if oldLoaded.Status != model.PolicyStatusActive || newLoaded.Status != model.PolicyStatusSimulated {
 		t.Fatalf("failed projection changed active pointer: old=%+v new=%+v", oldLoaded, newLoaded)
 	}
 
 	if _, err := database.db.ExecContext(ctx, `DROP TRIGGER reject_atomic_policy_publish`); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.PublishPolicyVersion(ctx, newVersion.ID, nil, projection); err != nil {
+	if err := database.PublishPolicyProposal(ctx, newVersion.ID, "test", nil, projection); err != nil {
 		t.Fatal(err)
 	}
 	policies, _ = database.ListPolicies(ctx)
@@ -175,9 +185,9 @@ func TestPublishPolicyVersionAtomicallyUpdatesProjectionAndActivation(t *testing
 			t.Fatalf("successful publication did not update account %d: %+v", accountID, policy)
 		}
 	}
-	oldLoaded, _ = database.GetPolicyVersion(ctx, oldVersion.ID)
-	newLoaded, _ = database.GetPolicyVersion(ctx, newVersion.ID)
-	if oldLoaded.Status != "superseded" || newLoaded.Status != "active" {
+	oldLoaded, _ = database.GetPolicyLifecycle(ctx, oldVersion.ID)
+	newLoaded, _ = database.GetPolicyLifecycle(ctx, newVersion.ID)
+	if oldLoaded.Status != model.PolicyStatusSuperseded || newLoaded.Status != model.PolicyStatusActive {
 		t.Fatalf("successful projection did not move active pointer: old=%+v new=%+v", oldLoaded, newLoaded)
 	}
 }
@@ -274,7 +284,7 @@ func TestAnalysisPacketRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPolicyVersionActivationAndRollback(t *testing.T) {
+func TestPolicyLifecycleActivationAndRollback(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -284,25 +294,29 @@ func TestPolicyVersionActivationAndRollback(t *testing.T) {
 	}
 	defer database.Close()
 
-	first := model.ScorePolicyVersion{
-		ScopeType: "account", ScopeID: "225", Config: json.RawMessage(`{"failure_threshold":3}`),
-		Reason: "initial", CreatedBy: "agent",
-	}
-	if err := database.CreatePolicyVersion(ctx, &first, true); err != nil {
+	first := testLifecycleProposal("first-account-policy", "account", "225", json.RawMessage(`{"failure_threshold":3}`), nil)
+	if err := database.CreatePolicyProposal(ctx, &first); err != nil {
 		t.Fatal(err)
 	}
-	second := model.ScorePolicyVersion{
-		ScopeType: "account", ScopeID: "225", Config: json.RawMessage(`{"failure_threshold":4}`),
-		Reason: "tune", CreatedBy: "agent",
-	}
-	if err := database.CreatePolicyVersion(ctx, &second, true); err != nil {
+	firstThreshold := 3
+	firstProjection := []model.Policy{{AccountID: 225, Enabled: true, FailureThreshold: &firstThreshold, ScorePolicySource: "account_version", ScorePolicyVersionID: &first.ID}}
+	if err := database.PublishPolicyProposal(ctx, first.ID, "test", nil, firstProjection); err != nil {
 		t.Fatal(err)
 	}
-	if first.Version != 1 || second.Version != 2 || second.Status != "active" {
+	second := testLifecycleProposal("second-account-policy", "account", "225", json.RawMessage(`{"failure_threshold":4}`), &first.ID)
+	if err := database.CreatePolicyProposal(ctx, &second); err != nil {
+		t.Fatal(err)
+	}
+	secondThreshold := 4
+	secondProjection := []model.Policy{{AccountID: 225, Enabled: true, FailureThreshold: &secondThreshold, ScorePolicySource: "account_version", ScorePolicyVersionID: &second.ID}}
+	if err := database.PublishPolicyProposal(ctx, second.ID, "test", nil, secondProjection); err != nil {
+		t.Fatal(err)
+	}
+	if first.Version != 1 || second.Version != 2 || second.Status != model.PolicyStatusSimulated {
 		t.Fatalf("unexpected versions: first=%+v second=%+v", first, second)
 	}
 
-	items, err := database.ListPolicyVersions(ctx, 10)
+	items, err := database.ListPolicyLifecycle(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,17 +324,24 @@ func TestPolicyVersionActivationAndRollback(t *testing.T) {
 	if statuses[first.ID] != "superseded" || statuses[second.ID] != "active" {
 		t.Fatalf("unexpected active policy before rollback: %#v", statuses)
 	}
-	if err := database.ActivatePolicyVersion(ctx, first.ID); err != nil {
+	if err := database.RollbackPolicyProposal(ctx, second.ID, first.ID, "test", "rollback test", nil, firstProjection); err != nil {
 		t.Fatal(err)
 	}
-	items, err = database.ListPolicyVersions(ctx, 10)
+	items, err = database.ListPolicyLifecycle(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	statuses = policyStatuses(items)
-	if statuses[first.ID] != "active" || statuses[second.ID] != "superseded" {
+	if statuses[first.ID] != model.PolicyStatusActive || statuses[second.ID] != model.PolicyStatusRolledBack {
 		t.Fatalf("unexpected active policy after rollback: %#v", statuses)
 	}
+}
+
+func testLifecycleProposal(key, scopeType, scopeID string, patch json.RawMessage, baseID *int64) model.ScorePolicyVersion {
+	return model.ScorePolicyVersion{ScopeType: scopeType, ScopeID: scopeID, Status: model.PolicyStatusSimulated,
+		Config: append(json.RawMessage(nil), patch...), Patch: append(json.RawMessage(nil), patch...), Diff: json.RawMessage(`{}`),
+		Simulation: model.PolicySimulation{Passed: true, SampleCount: 100}, RiskLevel: model.AgentRiskLow,
+		Reason: "test", CreatedBy: "test", BaseVersionID: baseID, IdempotencyKey: key, SemanticHash: key + "-semantic"}
 }
 
 func TestAccountScorePolicyRoundTrip(t *testing.T) {

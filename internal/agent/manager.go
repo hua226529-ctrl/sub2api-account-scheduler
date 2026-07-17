@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"strings"
@@ -58,6 +60,7 @@ type Manager struct {
 	workerID             string
 	onGoalClaimed        func(string, int64)
 	onModelSlotWait      func(string)
+	randomReader         io.Reader
 }
 
 func NewManager(database *store.Store, engine *reconcile.Engine, balances *balance.Manager, box *balance.SecretBox, logger *slog.Logger, telemetryManagers ...*telemetry.Manager) *Manager {
@@ -68,7 +71,7 @@ func NewManager(database *store.Store, engine *reconcile.Engine, balances *balan
 	manager := &Manager{store: database, engine: engine, balances: balances, telemetry: telemetryManager, box: box, logger: logger,
 		interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1),
 		interactiveModelSlot: make(chan struct{}, 1), backgroundModelSlot: make(chan struct{}, 1),
-		workerID: fmt.Sprintf("agent-%d", time.Now().UTC().UnixNano())}
+		workerID: fmt.Sprintf("agent-%d", time.Now().UTC().UnixNano()), randomReader: cryptorand.Reader}
 	manager.builder = packetBuilder{store: database, engine: engine, balances: balances, telemetry: telemetryManager}
 	return manager
 }
@@ -112,7 +115,11 @@ func (m *Manager) tick(ctx context.Context) {
 		_ = m.store.CleanupAgentData(ctx, before)
 		_ = m.store.CleanupAgentV2Data(ctx, before)
 	}
-	if !settings.Enabled {
+	m.evaluatePolicyRollbacks(ctx, now)
+	if settings.OptimizerMode == model.AgentOptimizerAuto {
+		m.activateEligibleOptimizerProposal(ctx)
+	}
+	if settings.OptimizerMode == model.AgentOptimizerDisabled {
 		return
 	}
 	interval := time.Duration(settings.AnalysisIntervalMinutes) * time.Minute
@@ -125,6 +132,27 @@ func (m *Manager) tick(ctx context.Context) {
 	}
 	m.maybeDaily(ctx, now)
 	m.evaluateOutcomes(ctx, now)
+}
+
+func (m *Manager) activateEligibleOptimizerProposal(ctx context.Context) {
+	versions, err := m.store.ListPolicyLifecycle(ctx, 100)
+	if err != nil {
+		return
+	}
+	for index := len(versions) - 1; index >= 0; index-- {
+		version := versions[index]
+		if version.Status != model.PolicyStatusSimulated || version.RiskLevel != model.AgentRiskLow || version.SourceGoalID == nil {
+			continue
+		}
+		goal, err := m.store.GetAgentGoal(ctx, *version.SourceGoalID)
+		if err != nil || goal.Lane != model.AgentLaneBackground || goal.Source == "administrator" {
+			continue
+		}
+		if err := m.ActivatePolicyProposal(ctx, version.ID, "", true); err != nil && m.logger != nil {
+			m.logger.Warn("optimizer_policy_auto_activation_skipped", "policy_id", version.ID, "error", err)
+		}
+		return
+	}
 }
 
 func (m *Manager) syncPoolPolicyProjections(ctx context.Context) error {
@@ -226,7 +254,7 @@ func (m *Manager) Overview(ctx context.Context) (Overview, error) {
 	runs, _ := m.store.ListAgentRuns(ctx, 40)
 	assessments, _ := m.store.ListLatestAvailabilityAssessments(ctx)
 	reports, _ := m.store.ListDailyReports(ctx, 30)
-	policies, _ := m.store.ListPolicyVersions(ctx, 100)
+	policies, _ := m.store.ListPolicyLifecycle(ctx, 100)
 	packets, _ := m.store.ListAnalysisPackets(ctx, 20)
 	toolCalls := []model.AgentToolCall{}
 	if len(runs) > 0 {
@@ -253,33 +281,29 @@ func (m *Manager) UpdateSettings(ctx context.Context, settings model.AgentSettin
 	settings.ObservationViolations = current.ObservationViolations
 	settings.ObservationStructureErrors = current.ObservationStructureErrors
 	settings.LastScheduledAt, settings.LastEmergencyAt = current.LastScheduledAt, current.LastEmergencyAt
-	if !settings.Enabled {
-		settings.Mode = model.AgentModeObserve
-		settings.ObservationStartedAt = nil
-		settings.SuccessfulObservationRuns = 0
-		settings.ObservationProposedActions, settings.ObservationExecutableActions = 0, 0
-		settings.ObservationViolations, settings.ObservationStructureErrors = 0, 0
-	} else if !current.Enabled || current.ObservationStartedAt == nil {
+	if settings.OptimizerMode == model.AgentOptimizerObserve &&
+		(current.OptimizerMode != model.AgentOptimizerObserve || current.ObservationStartedAt == nil) {
 		now := time.Now().UTC()
 		settings.ObservationStartedAt = &now
 		settings.SuccessfulObservationRuns = 0
 		settings.ObservationProposedActions, settings.ObservationExecutableActions = 0, 0
 		settings.ObservationViolations, settings.ObservationStructureErrors = 0, 0
-		settings.Mode = model.AgentModeObserve
+	} else if settings.OptimizerMode == model.AgentOptimizerObserve {
+		settings.ObservationStartedAt = current.ObservationStartedAt
 	} else {
 		settings.ObservationStartedAt = current.ObservationStartedAt
-		if current.Mode == model.AgentModeControl && settings.Mode == model.AgentModeObserve {
-			now := time.Now().UTC()
-			settings.ObservationStartedAt = &now
-			settings.SuccessfulObservationRuns = 0
-			settings.ObservationProposedActions, settings.ObservationExecutableActions = 0, 0
-			settings.ObservationViolations, settings.ObservationStructureErrors = 0, 0
-		}
-		if settings.Mode == model.AgentModeControl && current.Mode != model.AgentModeControl {
-			settings.Mode = model.AgentModeObserve
-		}
 	}
-	return m.store.UpdateAgentSettings(ctx, settings)
+	if err := m.store.UpdateAgentSettings(ctx, settings); err != nil {
+		return err
+	}
+	if current.OptimizerMode != settings.OptimizerMode || current.OperatorMode != settings.OperatorMode ||
+		current.DailyPolicyChangeBudget != settings.DailyPolicyChangeBudget {
+		m.recordEvent(ctx, "agent_operating_modes_updated", "warning", 0,
+			fmt.Sprintf("Optimizer %s -> %s; Operator %s -> %s; daily budget %d -> %d",
+				current.OptimizerMode, settings.OptimizerMode, current.OperatorMode, settings.OperatorMode,
+				current.DailyPolicyChangeBudget, settings.DailyPolicyChangeBudget), 0)
+	}
+	return nil
 }
 
 func (m *Manager) ValidateProvider(ctx context.Context, input ProviderInput) (model.AgentProvider, error) {
@@ -371,131 +395,6 @@ func (m *Manager) providerFromInput(ctx context.Context, input ProviderInput, al
 	return provider, key, nil
 }
 
-func (m *Manager) Run(ctx context.Context, kind, trigger string, conversationID *int64, userMessage string) (model.AgentRun, error) {
-	return m.run(ctx, kind, trigger, conversationID, userMessage, nil, "")
-}
-
-func (m *Manager) run(ctx context.Context, kind, trigger string, conversationID *int64, userMessage string, cutoff *time.Time, reportDate string) (model.AgentRun, error) {
-	settings, err := m.store.GetAgentSettings(ctx)
-	if err != nil {
-		return model.AgentRun{}, err
-	}
-	if !settings.Enabled && kind != model.AgentRunManual {
-		return model.AgentRun{}, errors.New("智能体未启用")
-	}
-	var packet model.AnalysisPacket
-	if cutoff != nil {
-		packet, err = m.builder.BuildAt(ctx, kind, settings, *cutoff)
-	} else {
-		packet, err = m.builder.Build(ctx, kind, settings)
-	}
-	if err != nil {
-		return model.AgentRun{}, err
-	}
-	packetID := packet.ID
-	run := model.AgentRun{Kind: kind, Trigger: trigger, Status: "running", PacketID: &packetID,
-		ConversationID: conversationID, StartedAt: time.Now().UTC(), ActionsJSON: json.RawMessage("[]")}
-	if err := m.store.CreateAgentRun(ctx, &run); err != nil {
-		return run, err
-	}
-	if kind == model.AgentRunDaily {
-		userMessage = "根据数据包中截至北京时间日界的最近24小时统计生成上一自然日总结，包含可用率、延迟、成本、容量、动作效果、预测准确度和迭代建议；只生成报告，不返回任何执行动作。"
-	}
-	decision, provider, err := m.callModelInteractive(ctx, run.ID, packet, settings, userMessage, conversationID)
-	if err != nil {
-		completedAt := time.Now().UTC()
-		run.CompletedAt = &completedAt
-		run.Status, run.Error = "failed", err.Error()
-		_ = m.store.UpdateAgentRun(ctx, run)
-		m.recordEvent(ctx, "agent_run_failed", "error", 0, err.Error(), run.ID)
-		return run, err
-	}
-	if err := m.validateDecision(packet, decision); err != nil {
-		completedAt := time.Now().UTC()
-		run.CompletedAt = &completedAt
-		run.ProviderSlot, run.Model = provider.Slot, provider.Model
-		run.Status, run.Error = "rejected", err.Error()
-		_ = m.store.UpdateAgentRun(ctx, run)
-		m.recordEvent(ctx, "agent_decision_rejected", "error", 0, err.Error(), run.ID)
-		return run, err
-	}
-	if kind == model.AgentRunDaily && len(decision.Actions) > 0 {
-		err := errors.New("日报模型返回了执行动作，已拒绝整次结果")
-		completedAt := time.Now().UTC()
-		run.CompletedAt, run.ProviderSlot, run.Model = &completedAt, provider.Slot, provider.Model
-		run.Status, run.Error = "rejected", err.Error()
-		_ = m.store.UpdateAgentRun(ctx, run)
-		return run, err
-	}
-	run.ProviderSlot, run.Model = provider.Slot, provider.Model
-	run.Summary, run.Conclusion, run.Confidence = decision.Summary, decision.Conclusion, decision.Confidence
-	run.ActionsJSON, _ = json.Marshal(decision.Actions)
-	run.Status = "acting"
-	if err := m.store.UpdateAgentRun(ctx, run); err != nil {
-		return run, err
-	}
-
-	if kind != model.AgentRunDaily {
-		actionSettings := settings
-		if decision.Confidence < .65 {
-			actionSettings.Mode = model.AgentModeObserve
-			m.recordEvent(ctx, "agent_low_confidence", "warning", 0, "模型置信度不足，所有动作仅记录为提案", run.ID)
-		}
-		m.executeActions(ctx, run, actionSettings, decision.Actions)
-	}
-	if conversationID != nil {
-		content := decision.Summary
-		if decision.Conclusion != "" {
-			content += "\n\n" + decision.Conclusion
-		}
-		_ = m.store.AddAgentMessage(ctx, &model.AgentMessage{ConversationID: *conversationID, Role: "assistant", Content: content, RunID: &run.ID})
-	}
-	if kind == model.AgentRunDaily {
-		m.saveDailyReport(ctx, run, packet, decision, reportDate)
-	}
-	completedAt := time.Now().UTC()
-	run.CompletedAt = &completedAt
-	run.Status = "completed"
-	if err := m.store.UpdateAgentRun(ctx, run); err != nil {
-		return run, err
-	}
-	m.advanceSchedule(ctx, settings, kind, completedAt)
-	m.recordEvent(ctx, "agent_run_completed", "info", 0, decision.Summary, run.ID)
-	return run, nil
-}
-
-func (m *Manager) callModelInteractive(ctx context.Context, runID int64, packet model.AnalysisPacket, settings model.AgentSettings, userMessage string, conversationID *int64) (ModelDecision, model.AgentProvider, error) {
-	release, err := m.acquireModelSlot(ctx, model.AgentLaneInteractive)
-	if err != nil {
-		return ModelDecision{}, model.AgentProvider{}, err
-	}
-	if release == nil {
-		return m.callModel(ctx, runID, packet, settings, userMessage, conversationID)
-	}
-	defer release()
-	return m.callModel(ctx, runID, packet, settings, userMessage, conversationID)
-}
-
-func (m *Manager) Chat(ctx context.Context, conversationID int64, message string) (model.AgentRun, int64, error) {
-	message = strings.TrimSpace(message)
-	if message == "" || len([]rune(message)) > 4000 {
-		return model.AgentRun{}, conversationID, errors.New("对话内容为空或过长")
-	}
-	message = redactAgentText(message)
-	if conversationID <= 0 {
-		conversation, err := m.store.CreateConversation(ctx, message)
-		if err != nil {
-			return model.AgentRun{}, 0, err
-		}
-		conversationID = conversation.ID
-	}
-	if err := m.store.AddAgentMessage(ctx, &model.AgentMessage{ConversationID: conversationID, Role: "user", Content: message}); err != nil {
-		return model.AgentRun{}, conversationID, err
-	}
-	run, err := m.Run(ctx, model.AgentRunChat, "管理员对话命令", &conversationID, message)
-	return run, conversationID, err
-}
-
 func (m *Manager) Messages(ctx context.Context, conversationID int64) ([]model.AgentMessage, error) {
 	return m.store.ListAgentMessages(ctx, conversationID, 80)
 }
@@ -504,200 +403,19 @@ func (m *Manager) ActivatePolicy(ctx context.Context, id int64, actor string) er
 	if id <= 0 {
 		return errors.New("策略版本编号无效")
 	}
-	if err := m.activatePolicyVersion(ctx, id, actor); err != nil {
+	if err := m.ActivatePolicyProposal(ctx, id, actor, false); err != nil {
 		return err
 	}
-	m.recordEvent(ctx, "agent_policy_activated", "warning", 0, "已由"+actor+"激活历史评分策略版本", 0)
+	m.recordEvent(ctx, "agent_policy_activated", "warning", 0, "已由"+actor+"批准并激活评分策略提案", 0)
 	return nil
 }
 
-func (m *Manager) callModel(ctx context.Context, runID int64, packet model.AnalysisPacket, settings model.AgentSettings, userMessage string, conversationID *int64) (ModelDecision, model.AgentProvider, error) {
-	providers, err := m.store.ListAgentProviders(ctx)
-	if err != nil {
-		return ModelDecision{}, model.AgentProvider{}, err
+func (m *Manager) RejectPolicy(ctx context.Context, id int64, actor, reason string) error {
+	if err := m.store.RejectPolicyProposal(ctx, id, actor, reason); err != nil {
+		return err
 	}
-	systemPrompt := agentSystemPrompt()
-	input, err := modelInput(packet, settings)
-	if err != nil {
-		return ModelDecision{}, model.AgentProvider{}, err
-	}
-	if userMessage != "" {
-		input += "\n管理员当前命令：" + userMessage
-	}
-	if conversationID != nil {
-		messages, _ := m.store.ListAgentMessages(ctx, *conversationID, 12)
-		history, _ := json.Marshal(messages)
-		input += "\n最近对话：" + string(history)
-	}
-	var failures []string
-	for _, provider := range providers {
-		if !provider.Enabled || provider.BaseURL == "" || provider.Model == "" || len(provider.CredentialCiphertext) == 0 {
-			continue
-		}
-		if m.box == nil {
-			failures = append(failures, provider.Slot+": 缺少模型凭据加密密钥")
-			continue
-		}
-		plaintext, err := m.box.Decrypt(provider.CredentialNonce, provider.CredentialCiphertext)
-		if err != nil {
-			failures = append(failures, provider.Slot+": 凭据解密失败")
-			continue
-		}
-		decision, err := m.client.Complete(ctx, provider, string(plaintext), systemPrompt, input)
-		if err == nil {
-			decision, err = m.completeEvidenceDrilldowns(ctx, runID, provider, string(plaintext), systemPrompt, input, packet, settings, decision)
-		}
-		if err == nil {
-			now := time.Now().UTC()
-			_ = m.store.UpdateAgentProviderStatus(ctx, provider.Slot, "", &now)
-			return decision, provider, nil
-		}
-		failures = append(failures, provider.Slot+": "+err.Error())
-		_ = m.store.UpdateAgentProviderStatus(ctx, provider.Slot, err.Error(), nil)
-	}
-	if len(failures) == 0 {
-		return ModelDecision{}, model.AgentProvider{}, errors.New("没有可用的主模型或备用模型")
-	}
-	return ModelDecision{}, model.AgentProvider{}, errors.New(strings.Join(failures, "; "))
-}
-
-func (m *Manager) completeEvidenceDrilldowns(ctx context.Context, runID int64, provider model.AgentProvider, apiKey, systemPrompt,
-	baseInput string, packet model.AnalysisPacket, settings model.AgentSettings, decision ModelDecision) (ModelDecision, error) {
-	remaining := settings.MaxDrilldowns
-	if remaining < 0 {
-		remaining = 0
-	}
-	input := baseInput
-	for len(decision.EvidenceRequests) > 0 {
-		if remaining == 0 {
-			return decision, errors.New("模型证据追查请求超过单轮限制")
-		}
-		if decision.Confidence >= .80 && !packetHasEvidenceConflict(packet) {
-			return decision, errors.New("数据无明显冲突且置信度充足，拒绝扩大证据查询")
-		}
-		requests := decision.EvidenceRequests
-		if len(requests) > remaining {
-			requests = requests[:remaining]
-		}
-		results := make([]map[string]any, 0, len(requests))
-		for _, request := range requests {
-			result, err := m.collectEvidence(ctx, runID, packet, request)
-			if err != nil {
-				return decision, err
-			}
-			results = append(results, result)
-			remaining--
-		}
-		payload, _ := json.Marshal(results)
-		input += "\n本地证据工具返回以下脱敏结果。请据此完成最终结论；如证据已足够，evidence_requests 必须为空：\n" + string(payload)
-		var err error
-		decision, err = m.client.Complete(ctx, provider, apiKey, systemPrompt, input)
-		if err != nil {
-			return decision, err
-		}
-	}
-	return decision, nil
-}
-
-func packetHasEvidenceConflict(packet model.AnalysisPacket) bool {
-	for _, item := range packet.AccountCompactStates {
-		if item.EvidenceConflict {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *Manager) collectEvidence(ctx context.Context, runID int64, packet model.AnalysisPacket, request EvidenceRequest) (map[string]any, error) {
-	limit := request.Limit
-	if limit < 1 || limit > 50 {
-		limit = 20
-	}
-	arguments, _ := json.Marshal(request)
-	call := model.AgentToolCall{RunID: runID, Tool: request.Tool, Arguments: arguments, Status: "pending"}
-	if err := m.store.AddAgentToolCall(ctx, &call); err != nil {
-		return nil, errors.New("证据追查意图无法写入审计")
-	}
-	result := map[string]any{"tool": request.Tool}
-	var err error
-	switch request.Tool {
-	case "get_account_evidence":
-		found := false
-		for _, account := range packet.AccountCompactStates {
-			if account.AccountID == request.AccountID {
-				found = true
-				result["account_state"] = account
-				break
-			}
-		}
-		if !found {
-			err = errors.New("证据账号不在当前数据包")
-			break
-		}
-		result["records"], err = m.store.ListAccountEvidence(ctx, request.AccountID, limit)
-	case "get_pool_evidence":
-		items := make([]model.AgentAccountState, 0)
-		for _, account := range packet.AccountCompactStates {
-			if account.Pool == request.Pool && len(items) < limit {
-				items = append(items, account)
-			}
-		}
-		if len(items) == 0 {
-			err = errors.New("证据池不在当前数据包")
-		} else {
-			result["accounts"] = items
-			failover := make([]model.AgentGroupFailoverToken, 0)
-			for _, token := range packet.GroupFailoverTokens {
-				if token.Pool == request.Pool {
-					failover = append(failover, token)
-				}
-			}
-			result["group_failover_tokens"] = failover
-		}
-	case "get_policy_history":
-		items, listErr := m.store.ListPolicyVersions(ctx, 100)
-		if listErr != nil {
-			err = listErr
-			break
-		}
-		filtered := make([]model.ScorePolicyVersion, 0)
-		for _, item := range items {
-			if (request.ScopeType == "" || item.ScopeType == request.ScopeType) && (request.ScopeID == "" || item.ScopeID == request.ScopeID) {
-				filtered = append(filtered, item)
-				if len(filtered) >= limit {
-					break
-				}
-			}
-		}
-		result["versions"] = filtered
-	case "get_action_outcome":
-		items, listErr := m.store.ListRecentDecisionOutcomes(ctx, 100)
-		if listErr != nil {
-			err = listErr
-			break
-		}
-		filtered := make([]model.DecisionOutcome, 0)
-		for _, item := range items {
-			if request.RunID == 0 || item.RunID == request.RunID {
-				filtered = append(filtered, item)
-				if len(filtered) >= limit {
-					break
-				}
-			}
-		}
-		result["outcomes"] = filtered
-	default:
-		err = errors.New("不允许的证据追查工具")
-	}
-	if err != nil {
-		call.Status, call.Result = "failed", err.Error()
-		_ = m.store.UpdateAgentToolCall(ctx, call)
-		return nil, err
-	}
-	encoded, _ := json.Marshal(result)
-	call.Status, call.Result = "completed", fmt.Sprintf("返回 %d 字节脱敏证据", len(encoded))
-	_ = m.store.UpdateAgentToolCall(ctx, call)
-	return result, nil
+	m.recordEvent(ctx, "agent_policy_rejected", "info", 0, fmt.Sprintf("策略提案 %d 已被拒绝", id), 0)
+	return nil
 }
 
 func modelInput(packet model.AnalysisPacket, settings model.AgentSettings) (string, error) {
@@ -764,36 +482,12 @@ func prioritizeAccounts(items []model.AgentAccountState) {
 	})
 }
 
-func agentSystemPrompt() string {
-	return `你是 Sub2API 智能调度中心的最高运行决策智能体。目标优先级固定为：可用性、倍率成本、响应速度。
-你不得输出密钥，不得要求源码或任意数据库查询。黄色性能下降且真实请求成功时不得仅因延迟判为不可用。
-请直接输出一个 JSON 对象，不要使用 Markdown。字段必须是：
-summary(中文简明总结), conclusion(中文详细结论), confidence(0到1), no_change(布尔值),
-actions(数组), advice(字符串数组), data_limitations(字符串数组), evidence_requests(数组)。
-actions 的 type 只能是 pause_account、resume_account、set_load_factor、clear_flap_protection、clear_manual_override、
-trigger_reconcile、transition_token_group_tier、update_score_policy、activate_policy_version。
-每个动作包含 reason 和 prediction；prediction 包含 success_rate_delta、latency_delta_ms、cost_delta。
-transition_token_group_tier 只能包含 source_id、key_id、target_tier(main/backup/emergency)，不得提供真实分组编号；
-它只能引用 group_failover_tokens 中已启用、已确认、数据新鲜且未冻结的令牌，一轮最多一个，整体置信度不得低于0.90。
-从 main 升到 backup 或从 backup 升到 emergency 前，目标池必须全部不可用且监控与真实流量证据新鲜；
-黄色性能下降、数据不足、余额不足、凭据错误、客户端错误和单模型不支持均不能触发分组救灾。
-返回 main 只能在数据包显示已满足恢复与冷却约束时提出。智能体不得绕过人工保护、冷却或回退阻断。
-update_score_policy 必须包含 scope_type(global/pool/account)、scope_id 和 config 对象。
-只有证据冲突或置信度不足时才可请求 evidence_requests；tool 只能是 get_account_evidence、get_pool_evidence、
-get_policy_history、get_action_outcome，单次 limit 不得超过50。最终结论必须将 evidence_requests 置为空数组。
-没有必要修改时必须设置 no_change=true 且 actions=[]。数据不足时明确说明，不伪造结论。`
-}
-
 func (m *Manager) advanceSchedule(ctx context.Context, settings model.AgentSettings, kind string, completed time.Time) {
 	_ = settings
-	_, activated, err := m.store.AdvanceAgentSchedule(ctx, kind, completed)
+	_, _, err := m.store.AdvanceAgentSchedule(ctx, kind, completed)
 	if err != nil {
 		m.recordEvent(ctx, "agent_schedule_update_failed", "error", 0, err.Error(), 0)
 		return
-	}
-	if activated {
-		m.recordEvent(ctx, "agent_control_activated", "warning", 0,
-			"智能体已完成24小时、至少40次有效观察、模拟动作可执行率不低于95%且零越权或结构错误，自动进入完全控制模式", 0)
 	}
 }
 
@@ -893,7 +587,7 @@ func (m *Manager) saveDailyReport(ctx context.Context, run model.AgentRun, packe
 	}
 	metrics, _ := json.Marshal(packet.SystemSummary)
 	advice, _ := json.Marshal(decision.Advice)
-	item := model.AgentDailyReport{ReportDate: reportDate, PacketID: &packet.ID, RunID: &run.ID, Status: "completed", Attempts: attempts,
+	item := model.AgentDailyReport{ReportDate: reportDate, PacketID: &packet.ID, Status: "completed", Attempts: attempts,
 		Summary: decision.Summary + "\n\n" + decision.Conclusion, MetricsJSON: metrics, AdviceJSON: advice}
 	_ = m.store.UpsertDailyReport(ctx, &item)
 }

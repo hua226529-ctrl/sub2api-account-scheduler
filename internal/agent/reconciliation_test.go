@@ -90,6 +90,20 @@ func TestEvaluateTokenTierReconciliationUsesOnlyConfirmedTier(t *testing.T) {
 	}
 }
 
+func TestGroupTransitionReconciliationAcceptsAppliedAndLegacyCompleted(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{model.GroupTransitionApplied, model.GroupTransitionCompleted} {
+		if !groupTransitionWasApplied(status) {
+			t.Errorf("applied group transition status %q was not accepted", status)
+		}
+	}
+	for _, status := range []string{model.GroupTransitionPending, model.GroupTransitionFailed, model.GroupTransitionSimulated} {
+		if groupTransitionWasApplied(status) {
+			t.Errorf("non-applied group transition status %q was accepted", status)
+		}
+	}
+}
+
 func TestEvaluateUnobservableMutationStaysQuarantined(t *testing.T) {
 	t.Parallel()
 	verdict, _ := evaluateCapabilityReconciliation("activate_policy_version", json.RawMessage(`{"policy_id":7}`),

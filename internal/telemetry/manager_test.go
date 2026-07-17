@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -14,6 +15,24 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/store"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/sub2api"
 )
+
+type failoverEvidenceProcessorFake struct {
+	database  *store.Store
+	monitorID int64
+	calls     int
+	err       error
+	committed bool
+}
+
+func (f *failoverEvidenceProcessorFake) ProcessFailoverEvidence(ctx context.Context) error {
+	f.calls++
+	items, err := f.database.ListGroupValidationEvidence(ctx, []int64{f.monitorID}, nil, 0, 0)
+	if err != nil {
+		return err
+	}
+	f.committed = len(items) > 0
+	return f.err
+}
 
 type fakeTelemetryAPI struct {
 	monitor  model.Monitor
@@ -165,6 +184,67 @@ func TestTelemetryRequestsOnlyAccountsWithNewCommittedTraffic(t *testing.T) {
 	case ids := <-requester.accounts:
 		t.Fatalf("duplicate telemetry unexpectedly requested accounts: %#v", ids)
 	default:
+	}
+}
+
+func TestTelemetryProcessesFailoverEvidenceOnlyAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
+		FailureThreshold: 3, RecoveryThreshold: 3, ManualHoldMinutes: 10,
+		FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now().UTC().Add(-time.Second)
+	api := &fakeTelemetryAPI{
+		monitor: model.Monitor{ID: 2, PrimaryModel: "gpt"},
+		history: []model.MonitorHistoryRecord{{MonitorID: 2, Model: "gpt", Status: model.StatusOperational, CheckedAt: now}},
+	}
+	processor := &failoverEvidenceProcessorFake{database: database, monitorID: 2}
+	manager := NewManager(api, database, 2*time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.SetFailoverEvidenceProcessor(processor)
+	if err := manager.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if processor.calls != 1 || !processor.committed {
+		t.Fatalf("failover processor ran before commit or was not called: %+v", processor)
+	}
+	if err := manager.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if processor.calls != 1 {
+		t.Fatalf("duplicate telemetry woke failover evidence processor: calls=%d", processor.calls)
+	}
+}
+
+func TestTelemetryFailoverEvidenceErrorDoesNotRollbackCommittedMonitor(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
+		FailureThreshold: 3, RecoveryThreshold: 3, ManualHoldMinutes: 10,
+		FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now().UTC().Add(-time.Second)
+	api := &fakeTelemetryAPI{
+		monitor: model.Monitor{ID: 2, PrimaryModel: "gpt"},
+		history: []model.MonitorHistoryRecord{{MonitorID: 2, Model: "gpt", Status: model.StatusOperational, CheckedAt: now}},
+	}
+	processor := &failoverEvidenceProcessorFake{database: database, monitorID: 2, err: errors.New("injected evidence failure")}
+	manager := NewManager(api, database, 2*time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	manager.SetFailoverEvidenceProcessor(processor)
+	err = manager.RunOnce(ctx)
+	var partial *PartialError
+	if !errors.As(err, &partial) || len(partial.Issues) != 1 || partial.Issues[0].Code != "failover_evidence_failed" {
+		t.Fatalf("evidence error was not isolated as partial success: %v", err)
+	}
+	history, queryErr := database.ListMonitorHistory(ctx, 2, "gpt", 10)
+	if queryErr != nil || len(history) != 1 || !processor.committed {
+		t.Fatalf("evidence processor failure rolled back monitor commit: history=%+v err=%v", history, queryErr)
 	}
 }
 

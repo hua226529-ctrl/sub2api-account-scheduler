@@ -6,9 +6,11 @@ import {
   BrainCircuit, MessageSquareText, Pencil, Pause, Play, Plus, RefreshCw, Save, ServerCog, Settings2, ShieldAlert,
   ShieldCheck, ShieldOff, Snowflake, Sparkles, Target, Trash2, Unlink, WalletCards, Wrench, X
 } from "@lucide/vue";
-import { accountAction, activateAgentPolicy, chatAgent, confirmUpstreamFailoverPolicy, createUpstream, deleteUpstream, getAgentCapabilities, getAgentFreezeState, getAgentGoals, getAgentMemories, getAgentMessages, getAgentOverview, getAgentRuntimeEvents, getAgentTasks, getEvents, getOverview, getUpstreamFailoverTransitions, getUpstreams, login, logout, openAgentStream, refreshUpstream, restoreSession, runAgent, saveAgentProvider, saveUpstreamFailoverPolicy, setAgentFreezeState, switchUpstreamKeyGroup, switchUpstreamKeyTier, triggerReconcile, updateAgentSettings, updatePolicy, updateSettings, updateUpstream, validateAgentProvider, validateUpstream } from "./api";
+import { accountAction, activateAgentPolicy, chatAgent, confirmAgentGoal, confirmUpstreamFailoverPolicy, createUpstream, deleteUpstream, getAgentCapabilities, getAgentFreezeState, getAgentGoals, getAgentMemories, getAgentMessages, getAgentOverview, getAgentRuntimeEvents, getAgentTasks, getEvents, getOverview, getUpstreamFailoverTransitions, getUpstreams, login, logout, openAgentStream, refreshUpstream, rejectAgentPolicy, restoreSession, rollbackAgentPolicy, runAgent, saveAgentProvider, saveUpstreamFailoverPolicy, setAgentFreezeState, switchUpstreamKeyTier, triggerReconcile, updateAgentSettings, updatePolicy, updateSettings, updateUpstream, validateAgentProvider, validateUpstream } from "./api";
 import { getDiagnostics } from "./api";
-import type { AgentCapability, AgentCommandReceipt, AgentFreezeMode, AgentFreezeState, AgentGoal, AgentMemory, AgentMessage, AgentOverview, AgentProvider, AgentProviderInput, AgentRun, AgentRuntimeEvent, AgentScheduledTask, AgentSettings, AgentStep, Binding, Diagnostics, EventItem, FailoverTier, GroupFailoverPolicy, GroupTierTransition, Monitor, Settings, UpstreamFailoverPolicyInput, UpstreamInput, UpstreamPreview, UpstreamSource } from "./types";
+import ChatIntentReceipt from "./components/agent/ChatIntentReceipt.vue";
+import PolicyLifecyclePanel from "./components/agent/PolicyLifecyclePanel.vue";
+import type { AgentCapability, AgentChatReceipt, AgentCommandReceipt, AgentFreezeMode, AgentFreezeState, AgentGoal, AgentMemory, AgentMessage, AgentOverview, AgentProvider, AgentProviderInput, AgentRun, AgentRuntimeEvent, AgentScheduledTask, AgentSettings, AgentStep, Binding, Diagnostics, EventItem, FailoverTier, GroupFailoverPolicy, GroupTierTransition, Monitor, ScorePolicyVersion, Settings, UpstreamFailoverPolicyInput, UpstreamInput, UpstreamPreview, UpstreamSource } from "./types";
 
 type BalanceRow = UpstreamSource & { row_key: string; discovered: boolean };
 
@@ -32,7 +34,6 @@ const upstreamAccountOptions = ref<UpstreamSource["matched_accounts"]>([]);
 const discoveredUpstream = ref(false);
 const expandedSource = ref<number | null>(null);
 const upstreamPreview = ref<UpstreamPreview | null>(null);
-const groupSelections = reactive<Record<string, string>>({});
 const failoverTransitions = reactive<Record<string, GroupTierTransition[]>>({});
 const failoverTransitionLoading = reactive<Record<string, boolean>>({});
 const failoverTransitionErrors = reactive<Record<string, string>>({});
@@ -53,6 +54,7 @@ const agentStreamState = ref<"idle" | "connected" | "polling">("idle");
 const trackedAgentGoalID = ref(0);
 const trackedAgentRunID = ref(0);
 const trackedAgentStatus = ref("");
+const lastChatReceipt = ref<AgentChatReceipt | null>(null);
 const confirmState = reactive({ title: "", message: "", action: async () => {} });
 const policyForm = reactive({
   monitor_id: "", excluded: false, enabled: true, failure_threshold: "", recovery_threshold: "",
@@ -62,7 +64,8 @@ const policyForm = reactive({
   hard_failures_10_threshold: "", persistent_slow_rate: ""
 });
 const settingsForm = reactive<Settings>({
-  dry_run: true, failure_threshold: 3, recovery_threshold: 3, manual_hold_minutes: 10,
+	dry_run: true, scheduler_mode: "observe", failover_mode: "observe", group_failover_mutation_budget: 1,
+	failure_threshold: 3, recovery_threshold: 3, manual_hold_minutes: 10,
   flap_window_minutes: 60, flap_pause_threshold: 3, flap_recovery_threshold: 10,
   health_engine_mode: "observe", healthy_score_threshold: 80, watch_score_threshold: 60,
   quarantine_score_threshold: 35, latency_warning_ms: 8000, latency_critical_ms: 15000,
@@ -76,7 +79,8 @@ const upstreamForm = reactive<UpstreamInput>({
   pause_below: 5, resume_at: 10, enabled: true, selected_key_id: "", routing_enabled: false, routing_pool: ""
 });
 const failoverForm = reactive<UpstreamFailoverPolicyInput>({
-  enabled: false, key_id: "", main_group_id: "", backup_group_id: "", emergency_group_id: "", account_ids: [], pool: ""
+  enabled: false, key_id: "", main_enabled: true, backup_enabled: true, emergency_enabled: true,
+	main_group_id: "", backup_group_id: "", emergency_group_id: "", account_ids: [], pool: ""
 });
 const failoverTiers: FailoverTier[] = ["main", "backup", "emergency"];
 const agentProviderForm = reactive<AgentProviderInput>({
@@ -84,7 +88,8 @@ const agentProviderForm = reactive<AgentProviderInput>({
   timeout_seconds: 90, max_output_tokens: 4096, temperature: 0.1
 });
 const agentSettingsForm = reactive<AgentSettings>({
-  enabled: false, mode: "observe", analysis_interval_minutes: 30, emergency_cooldown_minutes: 5,
+	enabled: false, mode: "observe", optimizer_mode: "disabled", operator_mode: "disabled", daily_policy_change_budget: 2,
+	analysis_interval_minutes: 30, emergency_cooldown_minutes: 5,
   context_token_budget: 16000, max_anomalies: 20, max_drilldowns: 8, retention_days: 90,
   successful_observation_runs: 0
 });
@@ -369,14 +374,26 @@ function requestAgentRun() {
 async function sendAgentMessage() {
   const message = agentMessage.value.trim();
   if (!message) return;
-  await runTask(async () => {
-    const result = await chatAgent(message, agentConversationID.value);
-    agentConversationID.value = result.conversation_id;
+	await runTask(async () => {
+		const result = await chatAgent(message, agentConversationID.value);
+		lastChatReceipt.value = result;
+		agentConversationID.value = result.conversation_id;
     trackAgentCommand(result);
     agentMessage.value = "";
     agentMessages.value = (await getAgentMessages(result.conversation_id)).items ?? [];
     await refreshAgentExecution();
-  }, "命令已提交智能体任务队列");
+	}, "命令已提交智能体任务队列");
+}
+
+function confirmChatIntent() {
+	const receipt = lastChatReceipt.value;
+	if (!receipt?.confirmation_token || !receipt.goal_id) return;
+	confirmAction("确认智能体高风险动作", receipt.intent.user_facing_summary, async () => {
+		const confirmed = await confirmAgentGoal(receipt.goal_id!, receipt.confirmation_token!);
+		lastChatReceipt.value = confirmed;
+		trackAgentCommand(confirmed);
+		await refreshAgentExecution();
+	});
 }
 
 function trackAgentCommand(result: AgentRun | AgentCommandReceipt) {
@@ -421,10 +438,25 @@ function isTerminalAgentStatus(status?: string) {
   return ["completed", "failed", "cancelled", "canceled", "rejected", "interrupted", "expired"].includes((status ?? "").toLowerCase());
 }
 
-function rollbackAgentPolicy(id: number, label: string) {
-  confirmAction("激活历史策略", `确认重新激活${label}？该版本将立即成为当前活动策略。`, async () => {
-    await activateAgentPolicy(id);
-  });
+function approvePolicy(policy: ScorePolicyVersion) {
+	confirmAction("批准并激活策略", `确认批准 ${policy.scope_type} v${policy.version}？激活前仍会重新检查 base version。`, async () => {
+		await activateAgentPolicy(policy.id);
+		await refreshAgentExecution();
+	});
+}
+
+function rejectPolicy(policy: ScorePolicyVersion) {
+	confirmAction("拒绝策略提案", `确认拒绝 ${policy.scope_type} v${policy.version}？`, async () => {
+		await rejectAgentPolicy(policy.id, "管理员拒绝该策略提案");
+		await refreshAgentExecution();
+	});
+}
+
+function rollbackPolicy(policy: ScorePolicyVersion) {
+	confirmAction("回滚活动策略", `确认将 ${policy.scope_type} v${policy.version} 回滚到其记录的上一活动版本？`, async () => {
+		await rollbackAgentPolicy(policy.id, "管理员从策略面板执行回滚");
+		await refreshAgentExecution();
+	});
 }
 
 function assessmentReasons(value: string) {
@@ -563,7 +595,7 @@ async function savePolicy() {
 
 async function saveSettings() {
   await runTask(async () => {
-    settingsForm.dry_run = settingsForm.health_engine_mode === "observe";
+		settingsForm.dry_run = settingsForm.scheduler_mode !== "control";
     await updateSettings({ ...settingsForm });
     modal.value = null;
     await refreshAll();
@@ -589,6 +621,9 @@ function openUpstream(source?: UpstreamSource) {
   Object.assign(failoverForm, {
     enabled: policy?.enabled ?? Boolean(configured?.routing_enabled),
     key_id: policy?.key_id ?? legacyKeyID,
+		main_enabled: policy?.main_enabled ?? true,
+		backup_enabled: policy?.backup_enabled ?? true,
+		emergency_enabled: policy?.emergency_enabled ?? true,
     main_group_id: policy?.main_group_id ?? legacyKey?.group_id ?? "",
     backup_group_id: policy?.backup_group_id ?? "",
     emergency_group_id: policy?.emergency_group_id ?? "",
@@ -656,9 +691,9 @@ function buildFailoverConfirmationLines(policy: UpstreamFailoverPolicyInput) {
     `受控令牌：${key?.name || "未命名令牌"}（${key?.key_hint || "已脱敏"}）`,
     `绑定账号：${accountNames.join("、") || "未选择"}`,
     `策略池：${policy.pool || "未填写"}`,
-    `主用分组：${failoverGroupSummary(policy.main_group_id)}`,
-    `备用分组：${failoverGroupSummary(policy.backup_group_id)}`,
-    `应急分组：${failoverGroupSummary(policy.emergency_group_id)}`,
+		`主用分组：${policy.main_enabled ? failoverGroupSummary(policy.main_group_id) : "已停用"}`,
+		`备用分组：${policy.backup_enabled ? failoverGroupSummary(policy.backup_group_id) : "已停用"}`,
+		`应急分组：${policy.emergency_enabled ? failoverGroupSummary(policy.emergency_group_id) : "已停用"}`,
     "确认规则：修改受控令牌、绑定账号、任一分组或策略池都会使原确认失效；保存后将确认服务端生成的新版本。"
   ];
 }
@@ -673,12 +708,16 @@ function selectFailoverKey() {
   if (existing) {
     Object.assign(failoverForm, {
       enabled: existing.enabled, main_group_id: existing.main_group_id, backup_group_id: existing.backup_group_id,
-      emergency_group_id: existing.emergency_group_id, account_ids: [...existing.account_ids], pool: existing.pool
+			main_enabled: existing.main_enabled, backup_enabled: existing.backup_enabled, emergency_enabled: existing.emergency_enabled,
+			emergency_group_id: existing.emergency_group_id, account_ids: [...existing.account_ids], pool: existing.pool
     });
     return;
   }
   const key = upstreamFormRates.value.find((item) => item.external_id === failoverForm.key_id);
   failoverForm.main_group_id = key?.group_id ?? "";
+	failoverForm.main_enabled = true;
+	failoverForm.backup_enabled = true;
+	failoverForm.emergency_enabled = true;
   failoverForm.backup_group_id = "";
   failoverForm.emergency_group_id = "";
   failoverForm.account_ids = upstreamAccountOptions.value.map((account) => account.id);
@@ -686,8 +725,22 @@ function selectFailoverKey() {
 
 function validateFailoverForm() {
   if (!failoverForm.enabled) return true;
-  if (!failoverForm.key_id || !failoverForm.main_group_id || !failoverForm.backup_group_id || !failoverForm.emergency_group_id) {
-    showToast("启用三级故障转移时必须选择受控令牌及主用、备用、应急分组");
+	if (!failoverForm.key_id) {
+		showToast("启用三级故障转移时必须选择受控令牌");
+		return false;
+	}
+	const levels = [
+		{ enabled: failoverForm.main_enabled, group: failoverForm.main_group_id, label: "主用" },
+		{ enabled: failoverForm.backup_enabled, group: failoverForm.backup_group_id, label: "备用" },
+		{ enabled: failoverForm.emergency_enabled, group: failoverForm.emergency_group_id, label: "应急" }
+	];
+	if (!levels.some((level) => level.enabled)) {
+		showToast("固定三级策略至少需要启用一个级别");
+		return false;
+	}
+	const missing = levels.find((level) => level.enabled && !level.group);
+	if (missing) {
+		showToast(`已启用的${missing.label}级必须选择分组`);
     return false;
   }
   if (!failoverForm.pool.trim()) {
@@ -698,9 +751,9 @@ function validateFailoverForm() {
     showToast("受控令牌至少需要绑定一个关联账号");
     return false;
   }
-  const groups = [failoverForm.main_group_id, failoverForm.backup_group_id, failoverForm.emergency_group_id];
+	const groups = levels.filter((level) => level.enabled).map((level) => level.group);
   if (new Set(groups).size !== groups.length) {
-    showToast("主用、备用、应急必须配置为三个不同分组");
+		showToast("已启用的固定级别必须配置为不同分组");
     return false;
   }
   return true;
@@ -740,25 +793,8 @@ function refreshBalance(source: UpstreamSource) {
 	});
 }
 
-function selectedGroup(source: UpstreamSource, keyID: string, currentGroup: string) {
-  return groupSelections[`${source.id}:${keyID}`] ?? currentGroup;
-}
-
-function setSelectedGroup(source: UpstreamSource, keyID: string, value: string) {
-  groupSelections[`${source.id}:${keyID}`] = value;
-}
-
-function changeKeyGroup(source: UpstreamSource, keyID: string, keyName: string, currentGroup: string) {
-  const groupID = selectedGroup(source, keyID, currentGroup);
-  const group = source.groups.find((item) => item.external_id === groupID);
-  if (!groupID || groupID === currentGroup || !group) return;
-  confirmAction("切换令牌分组", `确认将「${keyName || `密钥 #${keyID}`}」切换到「${group.name}（${group.rate_multiplier.toFixed(2)} 倍）」？系统会写入后重新读取确认。`, async () => {
-    await switchUpstreamKeyGroup(source.id, keyID, groupID);
-  });
-}
-
 function switchKeyTier(source: UpstreamSource, policy: GroupFailoverPolicy, tier: FailoverTier) {
-  if (!policy.enabled || !policy.confirmed || policy.state?.frozen || !policy.key_id || policy.state?.current_tier === tier) return;
+	if (!policy.enabled || !policy.confirmed || !failoverTierEnabled(policy, tier) || policy.state?.frozen || !policy.key_id || policy.state?.current_tier === tier) return;
   const groupID = tier === "main" ? policy.main_group_id : tier === "backup" ? policy.backup_group_id : policy.emergency_group_id;
   const group = source.groups.find((item) => item.external_id === groupID);
   confirmAction("人工切换故障层级", `确认将受控令牌切换到${tierLabel(tier)}「${group?.name ?? groupID}」？该操作会覆盖当前自动层级。`, async () => {
@@ -1002,6 +1038,19 @@ function eventEvidence(event: EventItem) {
   return "-";
 }
 
+function eventControlMetadata(event: EventItem) {
+	const details = safeEventDetails(event);
+	const parts: string[] = [];
+	if (typeof details.producer === "string" && details.producer) parts.push(`Producer ${details.producer}`);
+	if (typeof details.authority === "string" && details.authority) parts.push(`Authority ${details.authority}`);
+	if (typeof details.operation === "string" && details.operation) parts.push(details.operation);
+	if (typeof details.status === "string" && details.status) parts.push(details.status);
+	if (details.uncertain === true) parts.push("uncertain");
+	if (details.verified === true || details.verified_after) parts.push("已回读");
+	if (typeof details.expires_at === "string" && details.expires_at) parts.push(`TTL 至 ${formatTime(details.expires_at)}`);
+	return parts.join(" · ");
+}
+
 function actorLabel(actor: string) {
   return ({ web: "管理端", system: "调度器", scheduler: "调度器", sub2api: "外部人工" } as Record<string, string>)[actor] ?? (actor || "系统");
 }
@@ -1065,11 +1114,12 @@ function tierLabel(tier?: FailoverTier) {
   return ({ main: "主用层", backup: "备用层", emergency: "应急层" } as Record<string, string>)[tier ?? ""] ?? "等待判定";
 }
 function transitionStatusLabel(status: string) {
-  return ({ pending: "等待回读", completed: "回读确认", failed: "执行失败", simulated: "观察记录" } as Record<string, string>)[status] ?? status;
+  return ({ pending: "等待回读", applied: "切换已应用", completed: "历史已完成", failed: "执行失败", simulated: "观察记录" } as Record<string, string>)[status] ?? status;
 }
 function transitionReadback(item: GroupTierTransition) {
   if (item.error) return `错误：${item.error}`;
-  if (item.status === "completed") return `回读已确认目标分组 ${item.to_group_id}`;
+	if (item.status === "applied") return `回读已确认目标分组 ${item.to_group_id}；等待新分组监控证据`;
+	if (item.status === "completed") return `历史回读已确认目标分组 ${item.to_group_id}`;
   if (item.status === "pending") return "已提交写入，等待上游回读确认";
   if (item.status === "simulated" || item.dry_run) return "观察模式，未向上游写入";
   return "未返回回读详情";
@@ -1081,11 +1131,17 @@ function failoverStatusLabel(policy?: GroupFailoverPolicy) {
   if (!policy) return "未配置三级策略";
   if (!policy.enabled) return "三级策略已停用";
   if (!policy.confirmed || policy.confirmed_version !== policy.version) return `策略 v${policy.version} 待确认`;
-  if (policy.state?.frozen) return "策略已冻结";
-  if (policy.state?.last_error) return "层级切换异常";
+	if (policy.state?.validation_status === "exhausted") return "固定三级已耗尽";
+	if (policy.state?.frozen) return "策略已冻结";
+	if (policy.state?.validation_status) return validationStatusLabel(policy.state.validation_status);
+	if (policy.state?.last_error) return "层级切换异常";
   return `当前${tierLabel(policy.state?.current_tier)}`;
 }
 function failoverRuntimeDetail(policy: GroupFailoverPolicy) {
+	if (policy.state?.validation_status === "awaiting_evidence") return "已切换，等待新分组监控证据";
+	if (policy.state?.validation_status === "probing") return "已切换，正在执行受控后置探测";
+	if (policy.state?.validation_status === "exhausted") return "固定三级均已确认失败，已停止自动切换";
+	if (policy.state?.validation_status === "uncertain") return `验证不确定：${policy.state.last_error || "等待管理员处理或新证据"}`;
   if (policy.state?.freeze_reason) return policy.state.freeze_reason;
   if (policy.state?.last_error) return policy.state.last_error;
   if (policy.state?.manual_override_until) return `人工层级保持至 ${formatTime(policy.state.manual_override_until)}`;
@@ -1093,6 +1149,12 @@ function failoverRuntimeDetail(policy: GroupFailoverPolicy) {
   const expectedGroup = policy.state?.current_tier === "main" ? policy.main_group_id : policy.state?.current_tier === "backup" ? policy.backup_group_id : policy.state?.current_tier === "emergency" ? policy.emergency_group_id : "";
   if (policy.state?.observed_group_id && expectedGroup && policy.state.observed_group_id !== expectedGroup) return `观察分组 ${policy.state.observed_group_id}，等待确认 ${expectedGroup}`;
   return `${policy.key_hint || `令牌 #${policy.key_id}`} · 绑定 ${policy.account_ids.length} 个账号 · 策略池 ${policy.pool}`;
+}
+function validationStatusLabel(status?: string) {
+	return ({ unknown: "验证状态未知", stable: "当前级稳定", transitioning: "正在切换", awaiting_evidence: "等待切换后证据", probing: "后置探测中", confirmed_healthy: "切换后证据已确认健康", confirmed_failed: "当前级已确认失败", uncertain: "验证不确定", exhausted: "固定三级已耗尽" } as Record<string, string>)[status ?? ""] ?? status ?? "验证状态未知";
+}
+function failoverTierEnabled(policy: GroupFailoverPolicy, tier: FailoverTier) {
+	return tier === "main" ? policy.main_enabled : tier === "backup" ? policy.backup_enabled : policy.emergency_enabled;
 }
 function upstreamState(source: UpstreamSource) {
 	if (!source.credential_configured) return { label: "待配置", tone: "neutral" };
@@ -1314,8 +1376,9 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
             <div v-for="message in agentMessages" :key="message.id" :class="['chat-message', message.role]"><span>{{ message.role === 'user' ? '管理员' : '智能体' }}</span><p>{{ message.content }}</p></div>
             <div v-if="agentMessages.length === 0" class="agent-empty"><MessageSquareText :size="20" /><span>可以询问账号异常原因、要求调整负载或切换策略。</span></div>
           </div>
-          <div v-if="trackedAgentGoalID || trackedAgentRunID" class="agent-command-receipt"><span :class="{ active: trackedAgentPending }"></span><strong>{{ trackedAgentPending ? '任务已进入队列' : '最近任务已结束' }}</strong><small><template v-if="trackedAgentGoalID">目标 #{{ trackedAgentGoalID }}</template><template v-if="trackedAgentRunID"> · 运行 #{{ trackedAgentRunID }}</template></small></div>
-          <form class="agent-chat-form" @submit.prevent="sendAgentMessage"><textarea v-model="agentMessage" rows="3" maxlength="4000" placeholder="输入分析问题或调度命令"></textarea><button class="primary-button inline" :disabled="loading || !agentMessage.trim()"><ArrowRight :size="16" />发送</button></form>
+		  <div v-if="trackedAgentGoalID || trackedAgentRunID" class="agent-command-receipt"><span :class="{ active: trackedAgentPending }"></span><strong>{{ trackedAgentPending ? '任务已进入队列' : '最近任务已结束' }}</strong><small><template v-if="trackedAgentGoalID">目标 #{{ trackedAgentGoalID }}</template><template v-if="trackedAgentRunID"> · 运行 #{{ trackedAgentRunID }}</template></small></div>
+		  <ChatIntentReceipt v-if="lastChatReceipt" :receipt="lastChatReceipt" :pending="trackedAgentPending" @confirm="confirmChatIntent" />
+		  <form class="agent-chat-form" @submit.prevent="sendAgentMessage"><textarea v-model="agentMessage" rows="3" maxlength="4000" placeholder="输入分析问题或调度命令"></textarea><button class="primary-button inline" :disabled="loading || !agentMessage.trim()"><ArrowRight :size="16" />发送</button></form>
         </section>
       </div>
 
@@ -1332,7 +1395,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
 
       <div class="agent-bottom-grid">
         <section><div class="section-heading"><div><h2>数据包记录</h2><p>相同哈希表示核心状态没有重要变化。</p></div></div><div class="compact-list"><div v-for="packet in agentOverview?.packets?.slice(0, 8) ?? []" :key="packet.id"><span>#{{ packet.id }} · {{ agentRunKind(packet.kind) }}</span><strong>{{ packet.token_estimate.toLocaleString() }} 令牌</strong><small>{{ packet.no_material_change ? '无重要变化' : `${packet.changes?.length ?? 0} 项变化` }} · {{ formatTime(packet.created_at) }}</small></div><p v-if="!agentOverview?.packets?.length" class="agent-empty">暂无数据包</p></div></section>
-        <section><div class="section-heading"><div><h2>策略版本</h2><p>全局、池和账号三级版本均可追溯。</p></div></div><div class="compact-list"><div v-for="policy in agentOverview?.policy_versions?.slice(0, 8) ?? []" :key="policy.id"><span>{{ policy.scope_type }} {{ policy.scope_id || '默认' }} · v{{ policy.version }}</span><strong>{{ policy.status === 'active' ? '当前活动' : '历史版本' }}</strong><small>{{ policy.reason || '未填写原因' }}</small><button v-if="policy.status !== 'active'" class="text-button" @click="rollbackAgentPolicy(policy.id, `${policy.scope_type} v${policy.version}`)">激活</button></div><p v-if="!agentOverview?.policy_versions?.length" class="agent-empty">暂无策略版本</p></div></section>
+		<PolicyLifecyclePanel :policies="agentOverview?.policy_versions ?? []" :optimizer-mode="agentOverview?.settings.optimizer_mode ?? 'disabled'" @activate="approvePolicy" @reject="rejectPolicy" @rollback="rollbackPolicy" />
       </div>
     </section>
 
@@ -1366,7 +1429,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
 			  </tr>
 			  <tr v-if="source.credential_configured && expandedSource === source.id" class="rate-row"><td></td><td colspan="7"><div class="rate-panel">
                 <section v-for="policy in source.failover_policies ?? []" :key="policy.key_id" class="failover-policy-block">
-                  <div class="failover-runtime"><div><span>三级故障转移 · v{{ policy.version }} {{ policy.confirmed ? '已确认' : '待确认' }}</span><strong>{{ policy.key_name || `令牌 #${policy.key_id}` }} · {{ failoverStatusLabel(policy) }}</strong><small>{{ failoverRuntimeDetail(policy) }}</small></div><div class="tier-actions"><button v-for="tier in failoverTiers" :key="tier" :class="['tier-button', tier, { active: policy.state?.current_tier === tier }]" :disabled="!policy.enabled || !policy.confirmed || policy.state?.frozen || policy.state?.current_tier === tier" @click="switchKeyTier(source, policy, tier)">{{ tierLabel(tier) }}</button></div></div>
+                  <div class="failover-runtime"><div><span>三级故障转移 · v{{ policy.version }} {{ policy.confirmed ? '已确认' : '待确认' }}</span><strong>{{ policy.key_name || `令牌 #${policy.key_id}` }} · {{ failoverStatusLabel(policy) }}</strong><small>{{ failoverRuntimeDetail(policy) }}</small><div class="validation-meta"><span>当前 {{ tierLabel(policy.state?.current_tier) }} · {{ policy.state?.observed_group_id || '未回读分组' }}</span><span>验证 {{ validationStatusLabel(policy.state?.validation_status) }}</span><span>证据 {{ policy.state?.last_evidence_source || '尚无' }} · 成功 {{ policy.state?.successful_evidence_count ?? 0 }} / 失败 {{ policy.state?.failed_evidence_count ?? 0 }}</span><span v-if="policy.state?.last_evidence_at">最近证据 {{ formatTime(policy.state.last_evidence_at) }}</span><span v-if="policy.state?.evidence_deadline">证据截止 {{ formatTime(policy.state.evidence_deadline) }}</span></div></div><div class="tier-actions"><button v-for="tier in failoverTiers" :key="tier" :class="['tier-button', tier, { active: policy.state?.current_tier === tier }]" :disabled="!policy.enabled || !policy.confirmed || !failoverTierEnabled(policy, tier) || policy.state?.frozen || policy.state?.current_tier === tier" @click="switchKeyTier(source, policy, tier)">{{ tierLabel(tier) }}</button></div></div>
                   <div class="transition-heading"><strong>最近切换流水</strong><button class="text-button" :disabled="failoverTransitionLoading[transitionListKey(source.id, policy.key_id)]" @click="loadFailoverTransitions(source.id, policy.key_id)">刷新</button></div>
                   <div v-if="failoverTransitionLoading[transitionListKey(source.id, policy.key_id)]" class="transition-empty">正在读取切换记录...</div>
                   <div v-else-if="failoverTransitionErrors[transitionListKey(source.id, policy.key_id)]" class="transition-empty error">{{ failoverTransitionErrors[transitionListKey(source.id, policy.key_id)] }}</div>
@@ -1381,7 +1444,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
                   <div v-else class="transition-empty">暂无切换流水</div>
                 </section>
                 <div v-if="source.routing_enabled && !source.failover_policies?.length" class="legacy-policy-warning"><AlertTriangle :size="16" />旧倍率路由尚未配置完整三级分组，请编辑账户完成迁移。</div>
-                <div class="rate-panel-title"><KeyRound :size="16" /><strong>密钥实际分组倍率</strong><span>高级操作会直接修改令牌分组</span></div><div v-if="source.key_rates.length" class="rate-grid"><div v-for="rate in source.key_rates" :key="rate.external_id"><span><strong>{{ rate.name || `密钥 #${rate.external_id}` }}</strong><small>{{ rate.key_hint || '已脱敏' }} · 当前 {{ rate.group_name || '动态分组' }}</small></span><div class="rate-actions"><b :class="{ dynamic: rate.dynamic }">{{ rateText(rate.rate_multiplier, rate.dynamic) }}</b><select :value="selectedGroup(source, rate.external_id, rate.group_id)" :aria-label="`${rate.name || rate.external_id}目标分组`" @change="setSelectedGroup(source, rate.external_id, ($event.target as HTMLSelectElement).value)"><option value="">选择分组</option><option v-for="group in source.groups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select><button class="secondary-button rate-change-button" :disabled="!selectedGroup(source, rate.external_id, rate.group_id) || selectedGroup(source, rate.external_id, rate.group_id) === rate.group_id" @click="changeKeyGroup(source, rate.external_id, rate.name, rate.group_id)">切换</button></div></div></div><p v-else class="empty-rates">该账户没有可展示的密钥</p>
+				<div class="rate-panel-title"><KeyRound :size="16" /><strong>密钥实际分组倍率</strong><span>分组写入只允许通过已确认的三级层级控制</span></div><div v-if="source.key_rates.length" class="rate-grid"><div v-for="rate in source.key_rates" :key="rate.external_id"><span><strong>{{ rate.name || `密钥 #${rate.external_id}` }}</strong><small>{{ rate.key_hint || '已脱敏' }} · 当前 {{ rate.group_name || '动态分组' }}</small></span><div class="rate-actions"><b :class="{ dynamic: rate.dynamic }">{{ rateText(rate.rate_multiplier, rate.dynamic) }}</b><small>只读状态</small></div></div></div><p v-else class="empty-rates">该账户没有可展示的密钥</p>
               </div></td></tr>
 			</template>
 			<tr v-if="!balanceRows.length"><td colspan="8" class="empty-row">尚未发现带上游地址的账号</td></tr>
@@ -1402,7 +1465,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
               <td><div class="event-message"><strong>{{ event.message }}</strong><span :class="['severity', event.severity]">{{ event.severity === 'error' ? '错误' : event.severity === 'warning' ? '警告' : '信息' }}</span></div></td>
               <td><div class="event-evidence">{{ eventEvidence(event) }}</div></td>
               <td><div class="state-change"><span>{{ eventStateLabel(event.before_state) }}</span><ArrowRight :size="13" /><strong>{{ eventStateLabel(event.after_state) }}</strong></div></td>
-              <td>{{ actorLabel(event.actor) }}</td>
+			  <td><div>{{ actorLabel(event.actor) }}</div><small v-if="eventControlMetadata(event)">{{ eventControlMetadata(event) }}</small></td>
             </tr>
             <tr v-if="events.length === 0"><td colspan="7" class="empty-row">暂无操作记录</td></tr>
           </tbody>
@@ -1466,9 +1529,9 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
             <div v-if="failoverForm.enabled" class="failover-grid">
               <label class="full">受控令牌<select v-model="failoverForm.key_id" @change="selectFailoverKey"><option value="">选择要绑定此账户的固定倍率令牌</option><option v-for="rate in upstreamFormRates" :key="rate.external_id" :value="rate.external_id" :disabled="rate.dynamic">{{ rate.name || `密钥 #${rate.external_id}` }} · 当前 {{ rate.group_name || '未分组' }}</option></select></label>
               <label class="full">策略池<input v-model.trim="failoverForm.pool" type="text" placeholder="例如：GPT 主线路" /></label>
-              <label>主用分组<select v-model="failoverForm.main_group_id"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label>
-              <label>备用分组<select v-model="failoverForm.backup_group_id"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label>
-              <label class="full">应急分组<select v-model="failoverForm.emergency_group_id"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label>
+					<div class="failover-level"><label class="toggle-row"><input v-model="failoverForm.main_enabled" type="checkbox" />启用主用层</label><label>主用分组<select v-model="failoverForm.main_group_id" :disabled="!failoverForm.main_enabled"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label></div>
+					<div class="failover-level"><label class="toggle-row"><input v-model="failoverForm.backup_enabled" type="checkbox" />启用备用层</label><label>备用分组<select v-model="failoverForm.backup_group_id" :disabled="!failoverForm.backup_enabled"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label></div>
+					<div class="failover-level full"><label class="toggle-row"><input v-model="failoverForm.emergency_enabled" type="checkbox" />启用应急层</label><label>应急分组<select v-model="failoverForm.emergency_group_id" :disabled="!failoverForm.emergency_enabled"><option value="">请选择</option><option v-for="group in upstreamFormGroups" :key="group.external_id" :value="group.external_id">{{ group.name }} · {{ group.rate_multiplier.toFixed(2) }} 倍</option></select></label></div>
               <div class="account-bindings full"><span>绑定关联账号</span><div v-if="upstreamAccountOptions.length" class="account-binding-list"><label v-for="account in upstreamAccountOptions" :key="account.id"><input v-model="failoverForm.account_ids" type="checkbox" :value="account.id" />#{{ account.id }} {{ account.name }}</label></div><small v-else>该上游尚未关联 Sub2API 账号，无法启用受控令牌策略。</small></div>
               <div class="failover-confirmation-summary full"><strong>保存前确认摘要</strong><span v-for="line in failoverConfirmationLines" :key="line">{{ line }}</span></div>
             </div>
@@ -1486,9 +1549,12 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
       <section v-else-if="modal === 'settings'" class="modal-panel settings-modal">
         <header><div><h3>全局调度策略</h3><p>评分、隔离和分阶段恢复应用到所有未单独覆盖的账号。</p></div><button class="icon-button" @click="modal = null"><X :size="18" /></button></header>
         <div class="settings-groups">
-          <fieldset><legend>运行方式</legend><div class="form-grid compact-grid">
-            <label class="full">判定模式<select v-model="settingsForm.health_engine_mode"><option value="legacy">旧判定</option><option value="observe">只观察</option><option value="adaptive">智能调度</option></select></label>
-          </div><p class="field-help">只观察会计算评分并记录拟执行动作；智能调度会自动降载、隔离和恢复。</p></fieldset>
+		<fieldset><legend>运行方式</legend><div class="form-grid compact-grid">
+		  <label>调度器模式<select v-model="settingsForm.scheduler_mode"><option value="observe">只观察</option><option value="control">执行控制</option></select></label>
+		  <label>救灾模式<select v-model="settingsForm.failover_mode"><option value="disabled">停用</option><option value="observe">只观察</option><option value="control">执行控制</option></select></label>
+		  <label>单轮分组变更预算<input v-model.number="settingsForm.group_failover_mutation_budget" type="number" min="1" max="10" /></label>
+		  <label>健康判定<select v-model="settingsForm.health_engine_mode"><option value="legacy">旧判定</option><option value="observe">只观察</option><option value="adaptive">自适应评分</option></select></label>
+		</div><p class="field-help">确定性调度器与分组救灾独立运行；Agent 模式不会隐式改变这两个开关。</p></fieldset>
           <fieldset><legend>评分与延迟</legend><div class="form-grid compact-grid">
             <label>健康分数线<input v-model.number="settingsForm.healthy_score_threshold" type="number" min="1" max="100" /></label>
             <label>观察分数线<input v-model.number="settingsForm.watch_score_threshold" type="number" min="1" max="100" /></label>
@@ -1542,10 +1608,11 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
       <section v-else-if="modal === 'agent-settings'" class="modal-panel settings-modal">
         <header><div><h3>智能体运行设置</h3><p>控制统计包大小、运行周期、紧急唤醒和观察期。</p></div><button class="icon-button" @click="modal = null"><X :size="18" /></button></header>
         <div class="settings-groups">
-          <fieldset><legend>运行状态</legend><div class="form-grid compact-grid">
-            <label class="toggle-row full"><input v-model="agentSettingsForm.enabled" type="checkbox" />启用智能体定时分析</label>
-            <label>有效模式<select v-model="agentSettingsForm.mode" disabled><option value="observe">24小时观察</option><option value="control">完全控制</option></select></label>
-            <label>全量分析周期（分钟）<input v-model.number="agentSettingsForm.analysis_interval_minutes" type="number" min="5" /></label>
+		<fieldset><legend>运行状态</legend><div class="form-grid compact-grid">
+		  <label>Optimizer 模式<select v-model="agentSettingsForm.optimizer_mode"><option value="disabled">停用</option><option value="observe">只分析</option><option value="propose">生成提案</option><option value="auto">低风险自动发布</option></select></label>
+		  <label>Operator 模式<select v-model="agentSettingsForm.operator_mode"><option value="disabled">停用</option><option value="confirm">动作需确认</option><option value="direct">授权内直接执行</option></select></label>
+		  <label>每日策略变更预算<input v-model.number="agentSettingsForm.daily_policy_change_budget" type="number" min="1" max="20" /></label>
+		  <label>全量分析周期（分钟）<input v-model.number="agentSettingsForm.analysis_interval_minutes" type="number" min="5" /></label>
             <label>紧急分析冷却（分钟）<input v-model.number="agentSettingsForm.emergency_cooldown_minutes" type="number" min="1" /></label>
             <label>记录保留天数<input v-model.number="agentSettingsForm.retention_days" type="number" min="7" /></label>
           </div></fieldset>
@@ -1556,7 +1623,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
             <label>成功观察次数<input :value="agentSettingsForm.successful_observation_runs" type="number" readonly /></label>
           </div></fieldset>
         </div>
-        <div class="modal-warning"><AlertTriangle :size="17" />模式由服务端控制：至少连续观察24小时并完成40次有效分析后才会自动进入完全控制；停用或更换模型会重新观察。</div>
+		<div class="modal-warning"><AlertTriangle :size="17" />Optimizer 与 Operator 独立；只有低风险、模拟通过且未超过预算的提案可自动发布。</div>
         <footer><button class="secondary-button" @click="modal = null">取消</button><button class="primary-button inline" @click="confirmAction('保存智能体设置', '确认更新智能体运行模式和分析参数？', persistAgentSettings)"><Save :size="16" />保存设置</button></footer>
       </section>
 

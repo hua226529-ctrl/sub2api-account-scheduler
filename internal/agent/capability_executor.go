@@ -77,6 +77,30 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		// injected or legacy administrator actor receives ordinary agent rules.
 		invocation.Actor = "agent:v2"
 	}
+	if spec.Mutating && invocation.AdministratorGrant == nil {
+		if !spec.ExecutionPolicy.SupportsAutonomous {
+			return CapabilityExecution{}, errors.New("该写能力不支持自主执行")
+		}
+		if spec.ExecutionPolicy.RequiresEvidence && len(invocation.EvidenceRefs) == 0 {
+			return CapabilityExecution{}, errors.New("自主写能力缺少 EvidenceRefs")
+		}
+		if spec.ExecutionPolicy.RequiresFreshSnapshot && strings.TrimSpace(invocation.SnapshotVersion) == "" {
+			return CapabilityExecution{}, errors.New("自主写能力缺少 SnapshotVersion")
+		}
+		if spec.ExecutionPolicy.MaxTTLSeconds > 0 {
+			if invocation.ExpiresAt == nil {
+				return CapabilityExecution{}, errors.New("自主写能力缺少 TTL")
+			}
+			createdAt := invocation.CreatedAt.UTC()
+			if createdAt.IsZero() {
+				return CapabilityExecution{}, errors.New("自主写能力缺少创建时间")
+			}
+			ttl := invocation.ExpiresAt.Sub(createdAt)
+			if ttl <= 0 || ttl > time.Duration(spec.ExecutionPolicy.MaxTTLSeconds)*time.Second {
+				return CapabilityExecution{}, errors.New("自主写能力 TTL 超出执行策略")
+			}
+		}
+	}
 	if spec.Mutating && !invocation.DryRun {
 		// Every model-driven write, including one performed on behalf of an
 		// administrator, shares the same barrier as global freeze publication.
@@ -112,11 +136,6 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		ctx = withAccountControlContext(ctx, invocation)
 	}
 	before := m.capabilityState(ctx, invocation)
-	call := model.AgentToolCall{RunID: invocation.RunID, Tool: invocation.Name, Arguments: invocation.Arguments,
-		Status: "pending", BeforeState: string(before)}
-	if err := m.store.AddAgentToolCall(ctx, &call); err != nil {
-		return CapabilityExecution{}, fmt.Errorf("工具审计写入失败，已拒绝执行: %w", err)
-	}
 	output, retryable, err := m.executeCapabilityBody(ctx, invocation)
 	after := m.capabilityState(ctx, invocation)
 	execution := CapabilityExecution{Capability: invocation.Name, DryRun: invocation.DryRun, BeforeState: before,
@@ -126,30 +145,14 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 			_ = m.store.RecordAgentObservation(ctx, 1, 0, 0, 0)
 		}
 		execution.Status, execution.Message = "failed", err.Error()
-		call.Status, call.Result, call.AfterState = "failed", err.Error(), string(after)
-		_ = m.store.UpdateAgentToolCall(ctx, call)
 		m.recordEvent(ctx, "agent_capability_failed", "error", capabilityAccountID(invocation.Arguments), invocation.Name+" 执行失败: "+err.Error(), invocation.RunID)
 		return execution, err
 	}
 	if invocation.DryRun && spec.Mutating {
 		_ = m.store.RecordAgentObservation(ctx, 1, 1, 0, 0)
 		execution.Status, execution.Message = "proposed", "观察模式：前置检查通过，未执行写入"
-		call.Status, call.Result = "proposed", execution.Message
 	} else {
 		execution.Status, execution.Message = "completed", "已执行并回读确认"
-		call.Status, call.Result = "completed", execution.Message
-	}
-	call.AfterState = string(after)
-	if err := m.store.UpdateAgentToolCall(ctx, call); err != nil {
-		// The business mutation and readback are already confirmed. Reporting a
-		// capability failure here could make the planner repeat a successful
-		// external write. The enclosing durable step remains a second audit
-		// record and will either persist completion or reconcile after restart.
-		execution.Message += "；工具审计完成状态暂未写入，禁止因此重放动作"
-		if m.logger != nil {
-			m.logger.Error("agent_tool_audit_completion_failed", "tool_call_id", call.ID, "capability", invocation.Name, "error", err)
-		}
-		return execution, nil
 	}
 	return execution, nil
 }
@@ -262,7 +265,7 @@ func (m *Manager) executeCapabilityBody(ctx context.Context, invocation Capabili
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil {
 			return nil, false, err
 		}
-		items, err := m.store.ListPolicyVersions(ctx, boundedLimit(args.Limit, 50, 200))
+		items, err := m.store.ListPolicyLifecycle(ctx, boundedLimit(args.Limit, 50, 200))
 		if err != nil {
 			return nil, true, err
 		}
@@ -343,7 +346,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 	actor := invocation.Actor
 	switch invocation.Name {
 	case "pause_account":
-		var args accountReasonArgs
+		var args temporaryAccountReasonArgs
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil || args.AccountID <= 0 {
 			return nil, false, firstError(err, errors.New("账号编号无效"))
 		}
@@ -356,7 +359,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		err := m.engine.AgentPause(ctx, args.AccountID, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "schedulable": false}, retryableExternal(err), err
 	case "resume_account":
-		var args accountReasonArgs
+		var args temporaryAccountReasonArgs
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil || args.AccountID <= 0 {
 			return nil, false, firstError(err, errors.New("账号编号无效"))
 		}
@@ -368,6 +371,23 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		}
 		err := m.engine.AgentResume(ctx, args.AccountID, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "schedulable": true}, retryableExternal(err), err
+	case "manual_hold_account":
+		var args accountReasonArgs
+		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil || args.AccountID <= 0 {
+			return nil, false, firstError(err, errors.New("账号编号无效"))
+		}
+		if _, ok := findBinding(m.engine.Snapshot(), args.AccountID); !ok {
+			return nil, false, errors.New("账号不在当前调度快照中")
+		}
+		if !administratorGrantedInvocation(invocation) {
+			return nil, false, errors.New("永久人工保持需要管理员精确授权和一次性确认")
+		}
+		if invocation.DryRun {
+			return map[string]any{"would_manual_hold": args.AccountID}, false, nil
+		}
+		command := accountcontrol.CommandContextFrom(ctx)
+		result, err := m.engine.ManualPauseCommand(ctx, args.AccountID, "administrator", command.CommandID)
+		return map[string]any{"account_id": args.AccountID, "schedulable": false, "manual_hold": true, "result": result}, retryableExternal(err), err
 	case "set_load_factor":
 		var args struct {
 			AccountID  int64  `json:"account_id"`
@@ -568,10 +588,12 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		}
 		transition, err := m.balances.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{SourceID: args.SourceID,
 			KeyID: args.KeyID, TargetTier: args.TargetTier, IdempotencyKey: nonEmptyIdempotency(invocation), Actor: actor,
-			Reason: args.Reason, Trigger: "agent_v2", Manual: administratorGrantedInvocation(invocation), RunID: invocation.RunID,
+			Producer: groupCapabilityProducer(invocation), Authority: groupCapabilityAuthority(invocation), Reason: args.Reason,
+			Evidence: strings.Join(invocation.EvidenceRefs, ","), SnapshotVersion: invocation.SnapshotVersion,
+			Trigger: "agent_v2", Manual: administratorGrantedInvocation(invocation), RunID: invocation.RunID,
 			ExpectedPool: expectedPool, ExpectedFromTier: expectedTier, EvidenceCutoffAt: evidenceCutoff, AutomationLeaseHeld: true})
 		return transition, retryableExternal(err), err
-	case "update_dispatch_policy":
+	case "update_dispatch_policy", "propose_dispatch_policy":
 		var args struct {
 			ScopeType string          `json:"scope_type"`
 			ScopeID   string          `json:"scope_id"`
@@ -581,22 +603,16 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil {
 			return nil, false, err
 		}
-		if err := validateDispatchPolicyPatch(args.ScopeType, args.Config); err != nil {
-			return nil, false, err
-		}
 		if invocation.DryRun {
-			return map[string]any{"would_publish": args}, false, nil
+			if _, _, err := decodeDispatchPolicyPatch(args.ScopeType, args.Config); err != nil {
+				return nil, false, err
+			}
+			return map[string]any{"would_propose": args}, false, nil
 		}
-		runID := invocation.RunID
-		version := model.ScorePolicyVersion{ScopeType: args.ScopeType, ScopeID: strings.TrimSpace(args.ScopeID), Config: args.Config,
-			Reason: args.Reason, AgentRunID: optionalPositiveInt64(runID), CreatedBy: actor}
-		if err := m.store.CreatePolicyVersion(ctx, &version, false); err != nil {
-			return nil, false, err
-		}
-		if err := m.publishPolicyVersion(ctx, version, actor); err != nil {
-			return nil, retryableExternal(err), err
-		}
-		return version, false, nil
+		version, err := m.ProposeDispatchPolicy(ctx, PolicyProposalInput{ScopeType: args.ScopeType, ScopeID: args.ScopeID,
+			Patch: args.Config, Reason: args.Reason, Actor: actor, RunID: invocation.RunID, GoalID: invocation.GoalID,
+			IdempotencyKey: nonEmptyIdempotency(invocation)})
+		return version, false, err
 	case "activate_policy_version":
 		var args struct {
 			PolicyID int64  `json:"policy_id"`
@@ -605,7 +621,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil || args.PolicyID <= 0 {
 			return nil, false, firstError(err, errors.New("策略版本编号无效"))
 		}
-		version, err := m.store.GetPolicyVersion(ctx, args.PolicyID)
+		version, err := m.store.GetPolicyLifecycle(ctx, args.PolicyID)
 		if err != nil {
 			return nil, false, errors.New("策略版本不存在")
 		}
@@ -615,7 +631,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_activate": version}, false, nil
 		}
-		err = m.activatePolicyVersion(ctx, args.PolicyID, actor)
+		err = m.ActivatePolicyProposal(ctx, args.PolicyID, actor, false)
 		return version, retryableExternal(err), err
 	case "trigger_reconcile":
 		var args struct {
@@ -630,18 +646,19 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		return map[string]any{"queued": !invocation.DryRun}, false, nil
 	case "schedule_command":
 		var args struct {
-			Capability string          `json:"capability"`
-			Arguments  json.RawMessage `json:"arguments"`
-			ExecuteAt  time.Time       `json:"execute_at"`
-			Timezone   string          `json:"timezone"`
-			ExpiresAt  *time.Time      `json:"expires_at"`
-			Reason     string          `json:"reason"`
+			Capability   string          `json:"capability"`
+			Arguments    json.RawMessage `json:"arguments"`
+			ExecuteAt    time.Time       `json:"execute_at"`
+			Timezone     string          `json:"timezone"`
+			ExpiresAt    *time.Time      `json:"expires_at"`
+			MissedPolicy string          `json:"missed_policy"`
+			Reason       string          `json:"reason"`
 		}
 		if err := decodeCapabilityArguments(invocation.Arguments, &args); err != nil || args.ExecuteAt.IsZero() {
 			return nil, false, firstError(err, errors.New("定时命令参数无效"))
 		}
 		target, ok := capabilitySpec(args.Capability)
-		if !ok || !target.Mutating || args.Capability == "schedule_command" || args.Capability == "cancel_scheduled_command" {
+		if !ok || !target.Mutating || !target.ExecutionPolicy.SupportsScheduling || args.Capability == "schedule_command" || args.Capability == "cancel_scheduled_command" {
 			return nil, false, errors.New("定时命令目标能力无效")
 		}
 		targetArguments, err := normalizedArguments(args.Arguments)
@@ -651,6 +668,15 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		args.Arguments = targetArguments
 		if args.Timezone == "" {
 			args.Timezone = model.AgentDefaultTimezone
+		}
+		if args.MissedPolicy == "" {
+			args.MissedPolicy = "catch_up_once"
+		}
+		if args.MissedPolicy != "skip" && args.MissedPolicy != "catch_up_once" {
+			return nil, false, errors.New("定时命令 missed_policy 只能是 skip 或 catch_up_once")
+		}
+		if args.MissedPolicy == "skip" && args.ExpiresAt == nil {
+			return nil, false, errors.New("skip 定时命令必须设置 expires_at")
 		}
 		var targetGrant *AdministratorGrant
 		if administratorGrantedInvocation(invocation) {
@@ -669,9 +695,16 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if targetGrant != nil {
 			conditions["administrator_grant"] = targetGrant
 		}
+		resourceType, resourceIDs, operation, desiredState, err := scheduledCommandMetadata(args.Capability, args.Arguments)
+		if err != nil {
+			return nil, false, err
+		}
+		occurrenceID := scheduledOccurrenceID(nonEmptyIdempotency(invocation), args.Capability, args.Arguments, args.ExecuteAt.UTC(), args.Timezone)
 		command := model.ScheduledCommand{GoalID: optionalPositiveInt64(invocation.GoalID), StepID: optionalPositiveInt64(invocation.StepID),
 			Capability: args.Capability, Arguments: args.Arguments, Status: model.AgentCommandStatusPending, Timezone: args.Timezone,
-			ExecuteAt: args.ExecuteAt.UTC(), ExpiresAt: args.ExpiresAt, IdempotencyKey: nonEmptyIdempotency(invocation), MaxAttempts: 100,
+			ExecuteAt: args.ExecuteAt.UTC(), ExpiresAt: args.ExpiresAt, IdempotencyKey: occurrenceID, OccurrenceID: occurrenceID,
+			MissedPolicy: args.MissedPolicy, Authority: scheduledCommandAuthority(invocation), IntentType: "scheduled_action",
+			ResourceType: resourceType, ResourceIDs: resourceIDs, Operation: operation, DesiredState: desiredState, MaxAttempts: 100,
 			Conditions: marshalRaw(conditions), CreatedBy: actor}
 		if invocation.DryRun {
 			return map[string]any{"would_schedule": command}, false, nil
@@ -702,6 +735,12 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 type accountReasonArgs struct {
 	AccountID int64  `json:"account_id"`
 	Reason    string `json:"reason"`
+}
+
+type temporaryAccountReasonArgs struct {
+	AccountID int64      `json:"account_id"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Reason    string     `json:"reason"`
 }
 
 func decodeCapabilityArguments(payload json.RawMessage, target any) error {
@@ -738,6 +777,76 @@ func normalizedArguments(payload json.RawMessage) (json.RawMessage, error) {
 func administratorGrantedInvocation(invocation CapabilityInvocation) bool {
 	return invocation.AdministratorGrant != nil &&
 		validateAdministratorGrant(invocation.AdministratorGrant, invocation.Name, invocation.Arguments) == nil
+}
+
+func groupCapabilityProducer(invocation CapabilityInvocation) string {
+	if administratorGrantedInvocation(invocation) {
+		return "agent_operator"
+	}
+	return "autonomous_agent"
+}
+
+func groupCapabilityAuthority(invocation CapabilityInvocation) string {
+	if administratorGrantedInvocation(invocation) {
+		return "administrator_command"
+	}
+	return "autonomous_agent"
+}
+
+func scheduledCommandAuthority(invocation CapabilityInvocation) string {
+	if administratorGrantedInvocation(invocation) {
+		return "administrator_command"
+	}
+	return "autonomous_agent"
+}
+
+func scheduledOccurrenceID(baseKey, capability string, arguments json.RawMessage, executeAt time.Time, timezone string) string {
+	hash := sha256.Sum256([]byte(strings.Join([]string{strings.TrimSpace(baseKey), capability, string(arguments), executeAt.UTC().Format(time.RFC3339Nano), strings.TrimSpace(timezone)}, "\x00")))
+	return "occ-" + hex.EncodeToString(hash[:16])
+}
+
+func scheduledCommandMetadata(capability string, arguments json.RawMessage) (string, json.RawMessage, string, json.RawMessage, error) {
+	var values map[string]any
+	if err := json.Unmarshal(arguments, &values); err != nil {
+		return "", nil, "", nil, errors.New("定时命令目标参数必须是对象")
+	}
+	delete(values, "reason")
+	resourceType := "scheduler"
+	resourceIDs := []any{}
+	if accountID, ok := numericID(values["account_id"]); ok {
+		resourceType, resourceIDs = "account", []any{accountID}
+	} else if sourceID, ok := numericID(values["source_id"]); ok {
+		resourceType = "upstream"
+		resourceIDs = []any{sourceID}
+		if keyID, exists := values["key_id"].(string); exists && strings.TrimSpace(keyID) != "" {
+			resourceType = "upstream_key"
+			resourceIDs = append(resourceIDs, strings.TrimSpace(keyID))
+		}
+	} else if policyID, ok := numericID(values["policy_id"]); ok {
+		resourceType, resourceIDs = "policy_version", []any{policyID}
+	}
+	encodedResources, err := json.Marshal(resourceIDs)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+	desiredState, err := json.Marshal(values)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+	return resourceType, encodedResources, capability, desiredState, nil
+}
+
+func numericID(value any) (int64, bool) {
+	switch number := value.(type) {
+	case float64:
+		if number > 0 && number == float64(int64(number)) {
+			return int64(number), true
+		}
+	case json.Number:
+		value, err := number.Int64()
+		return value, err == nil && value > 0
+	}
+	return 0, false
 }
 
 func withAccountControlContext(ctx context.Context, invocation CapabilityInvocation) context.Context {

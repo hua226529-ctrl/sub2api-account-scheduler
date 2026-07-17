@@ -253,6 +253,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			key_name TEXT NOT NULL DEFAULT '',
 			key_hint TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL DEFAULT 1,
+			main_enabled INTEGER NOT NULL DEFAULT 1,
+			backup_enabled INTEGER NOT NULL DEFAULT 1,
+			emergency_enabled INTEGER NOT NULL DEFAULT 1,
 			main_group_id TEXT NOT NULL,
 			backup_group_id TEXT NOT NULL,
 			emergency_group_id TEXT NOT NULL,
@@ -297,6 +300,28 @@ func (s *Store) migrate(ctx context.Context) error {
 			healthy_since TEXT,
 			recovery_healthy_count INTEGER NOT NULL DEFAULT 0,
 			last_confirmed_at TEXT,
+			validation_status TEXT NOT NULL DEFAULT 'unknown',
+			validation_mode TEXT NOT NULL DEFAULT 'passive',
+			validation_transition_id INTEGER NOT NULL DEFAULT 0,
+			validation_from_tier TEXT NOT NULL DEFAULT '',
+			validation_target_tier TEXT NOT NULL DEFAULT '',
+			validation_from_group_id TEXT NOT NULL DEFAULT '',
+			validation_target_group_id TEXT NOT NULL DEFAULT '',
+			switch_requested_at TEXT,
+			switch_verified_at TEXT,
+			validation_not_before TEXT,
+			evidence_deadline TEXT,
+			monitor_watermark INTEGER NOT NULL DEFAULT 0,
+			traffic_watermark INTEGER NOT NULL DEFAULT 0,
+			monitor_evidence_cursor INTEGER NOT NULL DEFAULT 0,
+			traffic_evidence_cursor INTEGER NOT NULL DEFAULT 0,
+			active_probe_attempts INTEGER NOT NULL DEFAULT 0,
+			successful_evidence_count INTEGER NOT NULL DEFAULT 0,
+			failed_evidence_count INTEGER NOT NULL DEFAULT 0,
+			last_evidence_id TEXT NOT NULL DEFAULT '',
+			last_evidence_source TEXT NOT NULL DEFAULT '',
+			last_evidence_reason TEXT NOT NULL DEFAULT '',
+			last_evidence_at TEXT,
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY(source_id,key_id),
 			FOREIGN KEY(source_id,key_id) REFERENCES upstream_group_failover_policies(source_id,key_id) ON DELETE CASCADE
@@ -312,13 +337,20 @@ func (s *Store) migrate(ctx context.Context) error {
 			to_group_id TEXT NOT NULL,
 			status TEXT NOT NULL,
 			actor TEXT NOT NULL,
+			producer TEXT NOT NULL DEFAULT '',
+			authority TEXT NOT NULL DEFAULT '',
 			reason TEXT NOT NULL DEFAULT '',
 			evidence TEXT NOT NULL DEFAULT '',
+			snapshot_version TEXT NOT NULL DEFAULT '',
 			trigger TEXT NOT NULL DEFAULT '',
 			packet_id INTEGER NOT NULL DEFAULT 0,
 			run_id INTEGER NOT NULL DEFAULT 0,
 			dry_run INTEGER NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT '',
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			before_state TEXT NOT NULL DEFAULT '',
+			verified_after_state TEXT NOT NULL DEFAULT '',
+			uncertain INTEGER NOT NULL DEFAULT 0,
 			manual INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			completed_at TEXT,
@@ -467,6 +499,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"upstream_sources", "credential_mode", "TEXT NOT NULL DEFAULT 'unknown'"},
 		{"upstream_sources", "credential_migration_required", "INTEGER NOT NULL DEFAULT 0"},
 		{"upstream_group_failover_policies", "pool", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_policies", "main_enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"upstream_group_failover_policies", "backup_enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"upstream_group_failover_policies", "emergency_enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"upstream_group_failover_states", "previous_stable_tier", "TEXT NOT NULL DEFAULT ''"},
 		{"upstream_group_failover_states", "last_error", "TEXT NOT NULL DEFAULT ''"},
 		{"upstream_group_failover_states", "manual_override_until", "TEXT"},
@@ -474,10 +509,39 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"upstream_group_failover_states", "verification_started_at", "TEXT"},
 		{"upstream_group_failover_states", "healthy_since", "TEXT"},
 		{"upstream_group_failover_states", "recovery_healthy_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "validation_status", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"upstream_group_failover_states", "validation_mode", "TEXT NOT NULL DEFAULT 'passive'"},
+		{"upstream_group_failover_states", "validation_transition_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "validation_from_tier", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "validation_target_tier", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "validation_from_group_id", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "validation_target_group_id", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "switch_requested_at", "TEXT"},
+		{"upstream_group_failover_states", "switch_verified_at", "TEXT"},
+		{"upstream_group_failover_states", "validation_not_before", "TEXT"},
+		{"upstream_group_failover_states", "evidence_deadline", "TEXT"},
+		{"upstream_group_failover_states", "monitor_watermark", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "traffic_watermark", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "monitor_evidence_cursor", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "traffic_evidence_cursor", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "active_probe_attempts", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "successful_evidence_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "failed_evidence_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_failover_states", "last_evidence_id", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "last_evidence_source", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "last_evidence_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_failover_states", "last_evidence_at", "TEXT"},
 		{"upstream_group_transitions", "trigger", "TEXT NOT NULL DEFAULT ''"},
 		{"upstream_group_transitions", "packet_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"upstream_group_transitions", "run_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"upstream_group_transitions", "dry_run", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_transitions", "producer", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_transitions", "authority", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_transitions", "snapshot_version", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_transitions", "attempt_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_transitions", "before_state", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_transitions", "verified_after_state", "TEXT NOT NULL DEFAULT ''"},
+		{"upstream_group_transitions", "uncertain", "INTEGER NOT NULL DEFAULT 0"},
 		{"upstream_key_rates", "group_id", "TEXT NOT NULL DEFAULT ''"},
 		{"account_policies", "healthy_score_threshold", "INTEGER"},
 		{"account_policies", "watch_score_threshold", "INTEGER"},
@@ -505,6 +569,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE account_controls SET manual_locked=1 WHERE owns_pause=1 AND owner='operator' AND manual_locked=0`); err != nil {
 		return fmt.Errorf("migrate manual locks: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE upstream_group_failover_states
+		SET validation_status='uncertain'
+		WHERE validation_status='unknown' AND last_transition_at IS NOT NULL`); err != nil {
+		return fmt.Errorf("migrate group failover validation status: %w", err)
 	}
 	if err := s.migrateLegacyAccountOverrides(ctx); err != nil {
 		return err
@@ -557,8 +626,12 @@ func (s *Store) seedSettings(ctx context.Context, defaults model.Settings) error
 	}
 	applyHealthSettingDefaults(&defaults)
 	applyFailoverSettingDefaults(&defaults)
+	applyControlModeDefaults(&defaults)
 	values := map[string]string{
 		"dry_run":                                   strconv.FormatBool(defaults.DryRun),
+		"scheduler_mode":                            defaults.SchedulerMode,
+		"failover_mode":                             defaults.FailoverMode,
+		"group_failover_mutation_budget":            strconv.Itoa(defaults.FailoverMutationBudget),
 		"failure_threshold":                         strconv.Itoa(defaults.FailureThreshold),
 		"recovery_threshold":                        strconv.Itoa(defaults.RecoveryThreshold),
 		"manual_hold_minutes":                       strconv.Itoa(defaults.ManualHoldMinutes),
@@ -636,6 +709,9 @@ func (s *Store) GetSettings(ctx context.Context) (model.Settings, error) {
 	}
 	settings := model.Settings{
 		DryRun:                           parseBool(values["dry_run"], true),
+		SchedulerMode:                    parseSchedulerMode(values["scheduler_mode"], parseBool(values["dry_run"], true)),
+		FailoverMode:                     parseFailoverMode(values["failover_mode"]),
+		FailoverMutationBudget:           parseInt(values["group_failover_mutation_budget"], 1),
 		FailureThreshold:                 parseInt(values["failure_threshold"], 3),
 		RecoveryThreshold:                parseInt(values["recovery_threshold"], 3),
 		ManualHoldMinutes:                parseInt(values["manual_hold_minutes"], 10),
@@ -689,15 +765,20 @@ func (s *Store) GetSettings(ctx context.Context) (model.Settings, error) {
 		FailoverReturnRetryMinutes:       parseInt(values["group_failover_return_retry_minutes"], 120),
 	}
 	applyFailoverSettingDefaults(&settings)
+	applyControlModeDefaults(&settings)
 	return settings, rows.Err()
 }
 
 func settingsValues(settings model.Settings) (map[string]string, error) {
-	if settings.FailureThreshold < 1 || settings.RecoveryThreshold < 1 || settings.ManualHoldMinutes < 1 || settings.FlapWindowMinutes < 1 || settings.FlapPauseThreshold < 1 || settings.FlapRecoveryThreshold < 1 || !validHealthSettings(settings) || !validFailoverSettings(settings) {
+	applyControlModeDefaults(&settings)
+	if settings.FailureThreshold < 1 || settings.RecoveryThreshold < 1 || settings.ManualHoldMinutes < 1 || settings.FlapWindowMinutes < 1 || settings.FlapPauseThreshold < 1 || settings.FlapRecoveryThreshold < 1 || !validControlModes(settings) || !validHealthSettings(settings) || !validFailoverSettings(settings) {
 		return nil, errors.New("settings values must be positive")
 	}
 	values := map[string]string{
 		"dry_run":                                   strconv.FormatBool(settings.DryRun),
+		"scheduler_mode":                            settings.SchedulerMode,
+		"failover_mode":                             settings.FailoverMode,
+		"group_failover_mutation_budget":            strconv.Itoa(settings.FailoverMutationBudget),
 		"failure_threshold":                         strconv.Itoa(settings.FailureThreshold),
 		"recovery_threshold":                        strconv.Itoa(settings.RecoveryThreshold),
 		"manual_hold_minutes":                       strconv.Itoa(settings.ManualHoldMinutes),
@@ -1872,6 +1953,46 @@ func applyFailoverSettingDefaults(settings *model.Settings) {
 			*field = fallback
 		}
 	}
+}
+
+func applyControlModeDefaults(settings *model.Settings) {
+	settings.SchedulerMode = parseSchedulerMode(settings.SchedulerMode, settings.DryRun)
+	settings.FailoverMode = parseFailoverMode(settings.FailoverMode)
+	if settings.FailoverMutationBudget < 1 {
+		settings.FailoverMutationBudget = 1
+	}
+	settings.DryRun = settings.SchedulerMode != model.SchedulerModeControl
+}
+
+func parseSchedulerMode(value string, dryRun bool) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case model.SchedulerModeObserve:
+		return model.SchedulerModeObserve
+	case model.SchedulerModeControl:
+		return model.SchedulerModeControl
+	default:
+		if dryRun {
+			return model.SchedulerModeObserve
+		}
+		return model.SchedulerModeControl
+	}
+}
+
+func parseFailoverMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case model.FailoverModeDisabled:
+		return model.FailoverModeDisabled
+	case model.FailoverModeControl:
+		return model.FailoverModeControl
+	default:
+		return model.FailoverModeObserve
+	}
+}
+
+func validControlModes(settings model.Settings) bool {
+	return (settings.SchedulerMode == model.SchedulerModeObserve || settings.SchedulerMode == model.SchedulerModeControl) &&
+		(settings.FailoverMode == model.FailoverModeDisabled || settings.FailoverMode == model.FailoverModeObserve || settings.FailoverMode == model.FailoverModeControl) &&
+		settings.FailoverMutationBudget > 0
 }
 
 func validHealthSettings(settings model.Settings) bool {

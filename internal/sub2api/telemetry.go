@@ -109,28 +109,30 @@ type monitorHistoryWire struct {
 }
 
 type successWire struct {
-	AccountID     int64   `json:"account_id"`
-	RequestID     string  `json:"request_id"`
-	Model         string  `json:"model"`
-	UpstreamModel string  `json:"upstream_model"`
-	DurationMS    int64   `json:"duration_ms"`
-	Kind          string  `json:"kind"`
-	RequestKind   string  `json:"request_kind"`
-	CreatedAt     apiTime `json:"created_at"`
+	AccountID        int64   `json:"account_id"`
+	RequestID        string  `json:"request_id"`
+	Model            string  `json:"model"`
+	UpstreamModel    string  `json:"upstream_model"`
+	DurationMS       int64   `json:"duration_ms"`
+	Kind             string  `json:"kind"`
+	RequestKind      string  `json:"request_kind"`
+	RequestStartedAt apiTime `json:"request_started_at"`
+	CreatedAt        apiTime `json:"created_at"`
 }
 
 type errorWire struct {
-	AccountID  int64   `json:"account_id"`
-	RequestID  string  `json:"request_id"`
-	Model      string  `json:"model"`
-	Requested  string  `json:"requested_model"`
-	Upstream   string  `json:"upstream_model"`
-	Phase      string  `json:"phase"`
-	Type       string  `json:"type"`
-	Severity   string  `json:"severity"`
-	StatusCode int     `json:"status_code"`
-	Message    string  `json:"message"`
-	CreatedAt  apiTime `json:"created_at"`
+	AccountID        int64   `json:"account_id"`
+	RequestID        string  `json:"request_id"`
+	Model            string  `json:"model"`
+	Requested        string  `json:"requested_model"`
+	Upstream         string  `json:"upstream_model"`
+	Phase            string  `json:"phase"`
+	Type             string  `json:"type"`
+	Severity         string  `json:"severity"`
+	StatusCode       int     `json:"status_code"`
+	Message          string  `json:"message"`
+	RequestStartedAt apiTime `json:"request_started_at"`
+	CreatedAt        apiTime `json:"created_at"`
 }
 
 func (c *Client) ListMonitorHistory(ctx context.Context, monitorID int64, query TelemetryQuery) ([]model.MonitorHistoryRecord, error) {
@@ -207,7 +209,7 @@ func (c *Client) ListSuccessfulRequests(ctx context.Context, query TelemetryQuer
 		items = append(items, model.TrafficSuccess{
 			EventKey:  eventFingerprint("success", wire.RequestID, wire.AccountID, wire.Model, wire.CreatedAt.Time),
 			AccountID: wire.AccountID, Model: strings.TrimSpace(wire.Model), UpstreamModel: strings.TrimSpace(wire.UpstreamModel),
-			DurationMS: wire.DurationMS, Kind: requestKind, CreatedAt: wire.CreatedAt.Time,
+			DurationMS: wire.DurationMS, Kind: requestKind, RequestStartedAt: optionalAPITime(wire.RequestStartedAt), CreatedAt: wire.CreatedAt.Time,
 		})
 	}
 	return items, nil
@@ -236,10 +238,18 @@ func (c *Client) ListRequestErrors(ctx context.Context, query TelemetryQuery) ([
 			AccountID: wire.AccountID, Model: modelName, RequestedModel: strings.TrimSpace(wire.Requested),
 			UpstreamModel: strings.TrimSpace(wire.Upstream), Phase: safeToken(wire.Phase), Type: safeToken(wire.Type),
 			Severity: safeToken(wire.Severity), StatusCode: wire.StatusCode, ErrorClass: class, ReasonCode: reason,
-			ReasonFingerprint: diagnosticFingerprint(wire.Message), CreatedAt: wire.CreatedAt.Time,
+			ReasonFingerprint: diagnosticFingerprint(wire.Message), RequestStartedAt: optionalAPITime(wire.RequestStartedAt), CreatedAt: wire.CreatedAt.Time,
 		})
 	}
 	return items, nil
+}
+
+func optionalAPITime(value apiTime) *time.Time {
+	if value.Time.IsZero() {
+		return nil
+	}
+	result := value.Time.UTC()
+	return &result
 }
 
 func listTelemetry[T any](ctx context.Context, client *Client, path string, query TelemetryQuery) ([]T, error) {

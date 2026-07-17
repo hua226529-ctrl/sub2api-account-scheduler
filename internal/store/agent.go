@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -98,6 +97,48 @@ func (s *Store) migrateAgent(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "agent_daily_reports", "attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"base_version_id", "INTEGER"}, {"source_goal_id", "INTEGER"},
+		{"patch_json", "TEXT NOT NULL DEFAULT '{}'"}, {"diff_json", "TEXT NOT NULL DEFAULT '{}'"},
+		{"simulation_json", "TEXT NOT NULL DEFAULT '{}'"}, {"risk_level", "TEXT NOT NULL DEFAULT 'high'"},
+		{"affected_accounts_json", "TEXT NOT NULL DEFAULT '[]'"}, {"approved_by", "TEXT NOT NULL DEFAULT ''"},
+		{"previous_active_version_id", "INTEGER"}, {"rollback_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"outcome_summary", "TEXT NOT NULL DEFAULT ''"}, {"idempotency_key", "TEXT NOT NULL DEFAULT ''"},
+		{"semantic_hash", "TEXT NOT NULL DEFAULT ''"}, {"auto_rollback_count", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "score_policy_versions", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"optimizer_mode", "TEXT NOT NULL DEFAULT 'disabled'"},
+		{"operator_mode", "TEXT NOT NULL DEFAULT 'disabled'"},
+		{"daily_policy_change_budget", "INTEGER NOT NULL DEFAULT 2"},
+	} {
+		if err := s.ensureColumn(ctx, "agent_settings", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE agent_settings SET
+		optimizer_mode=CASE WHEN mode='control' THEN 'auto' ELSE 'propose' END,
+		operator_mode=CASE WHEN mode='control' THEN 'direct' ELSE 'confirm' END
+		WHERE enabled=1 AND optimizer_mode='disabled' AND operator_mode='disabled'`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_score_policy_idempotency
+		ON score_policy_versions(idempotency_key) WHERE idempotency_key!=''`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE score_policy_versions SET patch_json=config_json
+		WHERE patch_json='{}' AND config_json!='{}'`); err != nil {
+		return err
+	}
 	for _, column := range []string{"observation_proposed_actions", "observation_executable_actions", "observation_violations", "observation_structure_errors"} {
 		if err := s.ensureColumn(ctx, "agent_settings", column, "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
@@ -113,18 +154,22 @@ func (s *Store) GetAgentSettings(ctx context.Context) (model.AgentSettings, erro
 	var enabled int
 	var observation, lastScheduled, lastEmergency sql.NullString
 	var updated string
-	err := s.db.QueryRowContext(ctx, `SELECT enabled,mode,analysis_interval_minutes,emergency_cooldown_minutes,context_token_budget,
+	err := s.db.QueryRowContext(ctx, `SELECT enabled,mode,optimizer_mode,operator_mode,daily_policy_change_budget,
+		analysis_interval_minutes,emergency_cooldown_minutes,context_token_budget,
 		max_anomalies,max_drilldowns,retention_days,observation_started_at,successful_observation_runs,
 		observation_proposed_actions,observation_executable_actions,observation_violations,observation_structure_errors,
 		last_scheduled_at,last_emergency_at,updated_at
-		FROM agent_settings WHERE id=1`).Scan(&enabled, &item.Mode, &item.AnalysisIntervalMinutes, &item.EmergencyCooldownMinutes,
+		FROM agent_settings WHERE id=1`).Scan(&enabled, &item.Mode, &item.OptimizerMode, &item.OperatorMode,
+		&item.DailyPolicyChangeBudget, &item.AnalysisIntervalMinutes, &item.EmergencyCooldownMinutes,
 		&item.ContextTokenBudget, &item.MaxAnomalies, &item.MaxDrilldowns, &item.RetentionDays, &observation,
 		&item.SuccessfulObservationRuns, &item.ObservationProposedActions, &item.ObservationExecutableActions,
 		&item.ObservationViolations, &item.ObservationStructureErrors, &lastScheduled, &lastEmergency, &updated)
 	if err != nil {
 		return item, err
 	}
-	item.Enabled = enabled == 1
+	_ = enabled
+	item.Enabled = item.OptimizerMode != model.AgentOptimizerDisabled || item.OperatorMode != model.AgentOperatorDisabled
+	item.Mode = derivedLegacyAgentMode(item.OptimizerMode, item.OperatorMode)
 	item.ObservationStartedAt = parseNullableTime(observation)
 	item.LastScheduledAt = parseNullableTime(lastScheduled)
 	item.LastEmergencyAt = parseNullableTime(lastEmergency)
@@ -133,22 +178,44 @@ func (s *Store) GetAgentSettings(ctx context.Context) (model.AgentSettings, erro
 }
 
 func (s *Store) UpdateAgentSettings(ctx context.Context, item model.AgentSettings) error {
-	if item.Mode != model.AgentModeObserve && item.Mode != model.AgentModeControl {
-		return errors.New("invalid agent mode")
+	if item.DailyPolicyChangeBudget == 0 {
+		item.DailyPolicyChangeBudget = 2
 	}
 	if item.AnalysisIntervalMinutes < 5 || item.EmergencyCooldownMinutes < 1 || item.ContextTokenBudget < 2000 || item.MaxAnomalies < 1 || item.MaxDrilldowns < 0 || item.RetentionDays < 7 {
 		return errors.New("invalid agent settings")
 	}
+	if !validOptimizerMode(item.OptimizerMode) || !validOperatorMode(item.OperatorMode) || item.DailyPolicyChangeBudget < 1 || item.DailyPolicyChangeBudget > 20 {
+		return errors.New("invalid agent operating modes")
+	}
+	item.Enabled = item.OptimizerMode != model.AgentOptimizerDisabled || item.OperatorMode != model.AgentOperatorDisabled
+	item.Mode = derivedLegacyAgentMode(item.OptimizerMode, item.OperatorMode)
 	item.UpdatedAt = time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE agent_settings SET enabled=?,mode=?,analysis_interval_minutes=?,emergency_cooldown_minutes=?,
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_settings SET enabled=?,mode=?,optimizer_mode=?,operator_mode=?,daily_policy_change_budget=?,
+		analysis_interval_minutes=?,emergency_cooldown_minutes=?,
 		context_token_budget=?,max_anomalies=?,max_drilldowns=?,retention_days=?,observation_started_at=?,successful_observation_runs=?,
 		observation_proposed_actions=?,observation_executable_actions=?,observation_violations=?,observation_structure_errors=?,
 		last_scheduled_at=?,last_emergency_at=?,updated_at=? WHERE id=1`, boolInt(item.Enabled), item.Mode,
+		item.OptimizerMode, item.OperatorMode, item.DailyPolicyChangeBudget,
 		item.AnalysisIntervalMinutes, item.EmergencyCooldownMinutes, item.ContextTokenBudget, item.MaxAnomalies, item.MaxDrilldowns,
 		item.RetentionDays, formatOptionalTime(item.ObservationStartedAt), item.SuccessfulObservationRuns,
 		item.ObservationProposedActions, item.ObservationExecutableActions, item.ObservationViolations, item.ObservationStructureErrors,
 		formatOptionalTime(item.LastScheduledAt), formatOptionalTime(item.LastEmergencyAt), formatTime(item.UpdatedAt))
 	return err
+}
+
+func derivedLegacyAgentMode(optimizerMode, operatorMode string) string {
+	if optimizerMode == model.AgentOptimizerAuto || operatorMode == model.AgentOperatorDirect {
+		return model.AgentModeControl
+	}
+	return model.AgentModeObserve
+}
+
+func validOptimizerMode(value string) bool {
+	return value == model.AgentOptimizerDisabled || value == model.AgentOptimizerObserve || value == model.AgentOptimizerPropose || value == model.AgentOptimizerAuto
+}
+
+func validOperatorMode(value string) bool {
+	return value == model.AgentOperatorDisabled || value == model.AgentOperatorConfirm || value == model.AgentOperatorDirect
 }
 
 func (s *Store) GetAgentProvider(ctx context.Context, slot string) (model.AgentProvider, error) {
@@ -239,7 +306,6 @@ func (s *Store) RecordAgentObservation(ctx context.Context, proposed, executable
 }
 
 func (s *Store) AdvanceAgentSchedule(ctx context.Context, kind string, completed time.Time) (model.AgentSettings, bool, error) {
-	activated := false
 	if kind == model.AgentRunEmergency {
 		_, err := s.db.ExecContext(ctx, `UPDATE agent_settings SET last_emergency_at=?,updated_at=? WHERE id=1`,
 			formatTime(completed), formatTime(time.Now().UTC()))
@@ -258,32 +324,20 @@ func (s *Store) AdvanceAgentSchedule(ctx context.Context, kind string, completed
 		return model.AgentSettings{}, false, err
 	}
 	defer tx.Rollback()
-	var mode string
-	var observation sql.NullString
-	var runs, proposed, executable, violations, structureErrors int
-	if err := tx.QueryRowContext(ctx, `SELECT mode,observation_started_at,successful_observation_runs,
-		observation_proposed_actions,observation_executable_actions,observation_violations,observation_structure_errors
-		FROM agent_settings WHERE id=1`).Scan(&mode, &observation, &runs, &proposed, &executable, &violations, &structureErrors); err != nil {
+	var runs int
+	if err := tx.QueryRowContext(ctx, `SELECT successful_observation_runs FROM agent_settings WHERE id=1`).Scan(&runs); err != nil {
 		return model.AgentSettings{}, false, err
 	}
 	runs++
-	if mode == model.AgentModeObserve && observation.Valid {
-		started := parseTime(observation.String)
-		actionPass := proposed == 0 || float64(executable)/float64(proposed) >= .95
-		if !started.IsZero() && completed.Sub(started) >= 24*time.Hour && runs >= 40 && actionPass && violations == 0 && structureErrors == 0 {
-			mode = model.AgentModeControl
-			activated = true
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agent_settings SET mode=?,successful_observation_runs=?,last_scheduled_at=?,updated_at=? WHERE id=1`,
-		mode, runs, formatTime(completed), formatTime(time.Now().UTC())); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_settings SET successful_observation_runs=?,last_scheduled_at=?,updated_at=? WHERE id=1`,
+		runs, formatTime(completed), formatTime(time.Now().UTC())); err != nil {
 		return model.AgentSettings{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return model.AgentSettings{}, false, err
 	}
 	settings, err := s.GetAgentSettings(ctx)
-	return settings, activated, err
+	return settings, false, err
 }
 
 func (s *Store) SaveAnalysisPacket(ctx context.Context, packet *model.AnalysisPacket) error {
@@ -450,35 +504,6 @@ func (s *Store) ListLatestAvailabilityAssessments(ctx context.Context) ([]model.
 	return items, rows.Err()
 }
 
-func (s *Store) CreateAgentRun(ctx context.Context, run *model.AgentRun) error {
-	if run == nil {
-		return errors.New("run is required")
-	}
-	if run.StartedAt.IsZero() {
-		run.StartedAt = time.Now().UTC()
-	}
-	if len(run.ActionsJSON) == 0 {
-		run.ActionsJSON = json.RawMessage("[]")
-	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_runs(kind,trigger_reason,status,provider_slot,model,packet_id,
-		conversation_id,summary,conclusion,confidence,actions_json,error,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		run.Kind, run.Trigger, run.Status, run.ProviderSlot, run.Model, run.PacketID, run.ConversationID, run.Summary,
-		run.Conclusion, run.Confidence, string(run.ActionsJSON), run.Error, formatTime(run.StartedAt), formatOptionalTime(run.CompletedAt))
-	if err != nil {
-		return err
-	}
-	run.ID, err = result.LastInsertId()
-	return err
-}
-
-func (s *Store) UpdateAgentRun(ctx context.Context, run model.AgentRun) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE agent_runs SET status=?,provider_slot=?,model=?,packet_id=?,conversation_id=?,summary=?,
-		conclusion=?,confidence=?,actions_json=?,error=?,completed_at=? WHERE id=?`, run.Status, run.ProviderSlot, run.Model,
-		run.PacketID, run.ConversationID, run.Summary, run.Conclusion, run.Confidence, string(run.ActionsJSON), run.Error,
-		formatOptionalTime(run.CompletedAt), run.ID)
-	return err
-}
-
 func (s *Store) ListAgentRuns(ctx context.Context, limit int) ([]model.AgentRun, error) {
 	if limit < 1 || limit > 200 {
 		limit = 40
@@ -510,37 +535,6 @@ func (s *Store) ListAgentRuns(ctx context.Context, limit int) ([]model.AgentRun,
 	return items, rows.Err()
 }
 
-func (s *Store) AddAgentToolCall(ctx context.Context, item *model.AgentToolCall) error {
-	if item.CreatedAt.IsZero() {
-		item.CreatedAt = time.Now().UTC()
-	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_tool_calls(run_id,tool,arguments_json,status,before_state,after_state,
-		result,created_at) VALUES(?,?,?,?,?,?,?,?)`, item.RunID, item.Tool, string(item.Arguments), item.Status,
-		item.BeforeState, item.AfterState, item.Result, formatTime(item.CreatedAt))
-	if err != nil {
-		return err
-	}
-	item.ID, err = result.LastInsertId()
-	return err
-}
-
-func (s *Store) UpdateAgentToolCall(ctx context.Context, item model.AgentToolCall) error {
-	if item.ID <= 0 {
-		return errors.New("invalid agent tool call")
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE agent_tool_calls SET status=?,before_state=?,after_state=?,result=? WHERE id=?`,
-		item.Status, item.BeforeState, item.AfterState, item.Result, item.ID)
-	return err
-}
-
-func (s *Store) FailPendingAgentToolCalls(ctx context.Context, reason string) error {
-	if strings.TrimSpace(reason) == "" {
-		reason = "服务重启前动作未完成，已停止补偿执行"
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE agent_tool_calls SET status='interrupted',result=? WHERE status='pending'`, reason)
-	return err
-}
-
 func (s *Store) ListAgentToolCalls(ctx context.Context, runID int64) ([]model.AgentToolCall, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id,run_id,tool,arguments_json,status,before_state,after_state,result,created_at
 		FROM agent_tool_calls WHERE run_id=? ORDER BY id`, runID)
@@ -561,126 +555,6 @@ func (s *Store) ListAgentToolCalls(ctx context.Context, runID int64) ([]model.Ag
 		items = append(items, item)
 	}
 	return items, rows.Err()
-}
-
-func (s *Store) CreatePolicyVersion(ctx context.Context, item *model.ScorePolicyVersion, activate bool) error {
-	if item.ScopeType == "" || len(item.Config) == 0 {
-		return errors.New("invalid score policy")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM score_policy_versions WHERE scope_type=? AND scope_id=?`,
-		item.ScopeType, item.ScopeID).Scan(&item.Version); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	item.CreatedAt = now
-	if activate {
-		if _, err := tx.ExecContext(ctx, `UPDATE score_policy_versions SET status='superseded' WHERE scope_type=? AND scope_id=? AND status='active'`, item.ScopeType, item.ScopeID); err != nil {
-			return err
-		}
-		item.Status = "active"
-		item.ActivatedAt = &now
-	} else {
-		item.Status = "draft"
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO score_policy_versions(scope_type,scope_id,version,status,config_json,reason,
-		agent_run_id,created_by,activated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, item.ScopeType, item.ScopeID,
-		item.Version, item.Status, string(item.Config), item.Reason, item.AgentRunID, item.CreatedBy,
-		formatOptionalTime(item.ActivatedAt), formatTime(item.CreatedAt))
-	if err != nil {
-		return err
-	}
-	item.ID, err = result.LastInsertId()
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) ActivatePolicyVersion(ctx context.Context, id int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := activatePolicyVersionTx(ctx, tx, id, time.Now().UTC()); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func activatePolicyVersionTx(ctx context.Context, tx *sql.Tx, id int64, activatedAt time.Time) error {
-	var scopeType, scopeID string
-	if err := tx.QueryRowContext(ctx, `SELECT scope_type,scope_id FROM score_policy_versions WHERE id=?`, id).Scan(&scopeType, &scopeID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE score_policy_versions SET status='superseded' WHERE scope_type=? AND scope_id=? AND status='active'`, scopeType, scopeID); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE score_policy_versions SET status='active',activated_at=? WHERE id=?`, formatTime(activatedAt), id)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed != 1 {
-		return errors.New("score policy version was not activated")
-	}
-	return nil
-}
-
-// PublishPolicyVersion commits the materialized policy and its active-version
-// pointer together. Exactly one projection kind is accepted per version.
-func (s *Store) PublishPolicyVersion(ctx context.Context, id int64, settings *model.Settings, policies []model.Policy) error {
-	if id <= 0 || (settings == nil) == (len(policies) == 0) {
-		return errors.New("policy publication requires exactly one projection")
-	}
-	var values map[string]string
-	var err error
-	if settings != nil {
-		values, err = settingsValues(*settings)
-		if err != nil {
-			return err
-		}
-	}
-	seen := make(map[int64]struct{}, len(policies))
-	for _, policy := range policies {
-		if err := validatePolicy(policy); err != nil {
-			return err
-		}
-		if _, exists := seen[policy.AccountID]; exists {
-			return fmt.Errorf("duplicate account policy %d", policy.AccountID)
-		}
-		seen[policy.AccountID] = struct{}{}
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	now := time.Now().UTC()
-	if settings != nil {
-		if err := writeSettings(ctx, tx, values, now); err != nil {
-			return err
-		}
-	} else {
-		for _, policy := range policies {
-			if err := upsertPolicy(ctx, tx, policy, now); err != nil {
-				return err
-			}
-		}
-	}
-	if err := activatePolicyVersionTx(ctx, tx, id, now); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (s *Store) GetPolicyVersion(ctx context.Context, id int64) (model.ScorePolicyVersion, error) {
@@ -964,7 +838,8 @@ func (s *Store) AddAgentMessage(ctx context.Context, item *model.AgentMessage) e
 // EnqueueChatGoal commits the conversation (when new), user message and
 // interactive goal in one SQLite transaction. The caller wakes the worker
 // only after this method returns successfully.
-func (s *Store) EnqueueChatGoal(ctx context.Context, conversationID int64, message string, goal *model.AgentGoal) (int64, error) {
+func (s *Store) EnqueueChatGoal(ctx context.Context, conversationID int64, message string, goal *model.AgentGoal,
+	confirmation *model.ActionConfirmation) (int64, error) {
 	if goal == nil || strings.TrimSpace(message) == "" {
 		return 0, errors.New("chat goal is required")
 	}
@@ -1022,10 +897,98 @@ func (s *Store) EnqueueChatGoal(ctx context.Context, conversationID int64, messa
 	if err != nil {
 		return 0, err
 	}
+	if confirmation != nil {
+		if confirmation.TokenHash == "" || confirmation.PayloadHash == "" || confirmation.ExpiresAt.IsZero() ||
+			confirmation.Status != "pending" {
+			return 0, errors.New("invalid action confirmation")
+		}
+		confirmation.GoalID = goal.ID
+		confirmation.CreatedAt = now
+		resources, err := normalizedJSON(confirmation.Resources)
+		if err != nil {
+			return 0, err
+		}
+		desiredState, err := normalizedJSON(confirmation.DesiredState)
+		if err != nil {
+			return 0, err
+		}
+		result, err := tx.ExecContext(ctx, `INSERT INTO action_confirmations(goal_id,administrator,token_hash,payload_hash,
+			resources_json,operation,desired_state_json,proposal_id,status,expires_at,created_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, confirmation.GoalID, confirmation.Administrator, confirmation.TokenHash,
+			confirmation.PayloadHash, string(resources), confirmation.Operation, string(desiredState), confirmation.ProposalID,
+			confirmation.Status, formatTime(confirmation.ExpiresAt), formatTime(now))
+		if err != nil {
+			return 0, err
+		}
+		confirmation.ID, err = result.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return conversationID, nil
+}
+
+// ConfirmAgentGoal consumes one exact confirmation and makes its waiting goal
+// runnable in the same transaction. A token can never authorize a changed
+// intent payload or be reused by a second request.
+func (s *Store) ConfirmAgentGoal(ctx context.Context, goalID int64, administrator, tokenHash, payloadHash string,
+	confirmedContext json.RawMessage, now time.Time) (model.AgentGoal, error) {
+	var goal model.AgentGoal
+	if goalID <= 0 || strings.TrimSpace(administrator) == "" || tokenHash == "" || payloadHash == "" || !json.Valid(confirmedContext) {
+		return goal, errors.New("invalid confirmation request")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return goal, err
+	}
+	defer tx.Rollback()
+	var confirmationID int64
+	var storedPayload, status, expiresAt string
+	err = tx.QueryRowContext(ctx, `SELECT id,payload_hash,status,expires_at FROM action_confirmations
+		WHERE goal_id=? AND administrator=? AND token_hash=?`, goalID, administrator, tokenHash).
+		Scan(&confirmationID, &storedPayload, &status, &expiresAt)
+	if err != nil {
+		return goal, errors.New("confirmation token is invalid")
+	}
+	if status != "pending" {
+		return goal, errors.New("confirmation token was already consumed")
+	}
+	if storedPayload != payloadHash {
+		return goal, errors.New("confirmation payload changed")
+	}
+	if expiry := parseTime(expiresAt); expiry.IsZero() || !now.UTC().Before(expiry) {
+		_, _ = tx.ExecContext(ctx, `UPDATE action_confirmations SET status='expired' WHERE id=? AND status='pending'`, confirmationID)
+		if err := tx.Commit(); err != nil {
+			return goal, err
+		}
+		return goal, errors.New("confirmation token expired")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE action_confirmations SET status='consumed',consumed_at=?
+		WHERE id=? AND status='pending'`, formatTime(now.UTC()), confirmationID)
+	if err != nil {
+		return goal, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return goal, errors.New("confirmation token was already consumed")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE agent_goals SET context_json=?,status=?,last_error='',next_runnable_at=NULL,
+		updated_at=? WHERE id=? AND status=?`, string(confirmedContext), model.AgentGoalStatusPlanned, formatTime(now.UTC()), goalID,
+		model.AgentGoalStatusWaiting)
+	if err != nil {
+		return goal, err
+	}
+	changed, err = result.RowsAffected()
+	if err != nil || changed != 1 {
+		return goal, errors.New("confirmation goal is no longer waiting")
+	}
+	if err := tx.Commit(); err != nil {
+		return goal, err
+	}
+	return s.GetAgentGoal(ctx, goalID)
 }
 
 func (s *Store) ListAgentMessages(ctx context.Context, conversationID int64, limit int) ([]model.AgentMessage, error) {
@@ -1147,8 +1110,6 @@ func (s *Store) CleanupAgentData(ctx context.Context, before time.Time) error {
 	statements := []string{
 		`DELETE FROM agent_messages WHERE created_at<?`,
 		`DELETE FROM agent_conversations WHERE updated_at<?`,
-		`DELETE FROM agent_tool_calls WHERE created_at<?`,
-		`DELETE FROM agent_runs WHERE started_at<?`,
 		`DELETE FROM availability_assessments WHERE created_at<?`,
 		`DELETE FROM analysis_packets WHERE created_at<?`,
 		`DELETE FROM decision_outcomes WHERE created_at<?`,

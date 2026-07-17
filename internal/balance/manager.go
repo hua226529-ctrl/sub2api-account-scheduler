@@ -32,6 +32,10 @@ type sourcedAccountRequester interface {
 	RequestAccountsFrom(string, ...int64)
 }
 
+type validationSnapshotProvider interface {
+	Snapshot() model.Snapshot
+}
+
 type automationBoundary interface {
 	AutomationBarrier() *automation.Barrier
 	FreezeState(context.Context) (model.FreezeState, error)
@@ -52,16 +56,17 @@ type SourceInput struct {
 }
 
 type Manager struct {
-	store    *store.Store
-	api      AccountAPI
-	trigger  Trigger
-	fetcher  *Fetcher
-	box      *SecretBox
-	interval time.Duration
-	logger   *slog.Logger
-	runMu    sync.Mutex
-	barrier  *automation.Barrier
-	freeze   interface {
+	store      *store.Store
+	api        AccountAPI
+	trigger    Trigger
+	fetcher    *Fetcher
+	box        *SecretBox
+	interval   time.Duration
+	logger     *slog.Logger
+	runMu      sync.Mutex
+	groupLocks *groupKeyLocks
+	barrier    *automation.Barrier
+	freeze     interface {
 		FreezeState(context.Context) (model.FreezeState, error)
 	}
 	routeMu    sync.Mutex
@@ -74,7 +79,7 @@ type Manager struct {
 }
 
 func NewManager(database *store.Store, api AccountAPI, trigger Trigger, fetcher *Fetcher, box *SecretBox, interval time.Duration, logger *slog.Logger) *Manager {
-	manager := &Manager{store: database, api: api, trigger: trigger, fetcher: fetcher, box: box, interval: interval, logger: logger, sourceRuns: map[int64]bool{}, manualRuns: map[int64]time.Time{}}
+	manager := &Manager{store: database, api: api, trigger: trigger, fetcher: fetcher, box: box, interval: interval, logger: logger, groupLocks: newGroupKeyLocks(), sourceRuns: map[int64]bool{}, manualRuns: map[int64]time.Time{}}
 	if boundary, ok := trigger.(automationBoundary); ok {
 		manager.barrier = boundary.AutomationBarrier()
 		manager.freeze = boundary
@@ -333,51 +338,6 @@ func (m *Manager) RefreshManual(ctx context.Context, id int64) error {
 	m.manualRuns[id] = now
 	m.manualMu.Unlock()
 	return m.Refresh(ctx, id)
-}
-
-func (m *Manager) SwitchGroup(ctx context.Context, id int64, keyID, groupID, actor string) (model.UpstreamSource, error) {
-	m.runMu.Lock()
-	defer m.runMu.Unlock()
-
-	source, err := m.store.GetUpstreamSource(ctx, id)
-	if err != nil {
-		return model.UpstreamSource{}, err
-	}
-	if !source.Enabled {
-		return model.UpstreamSource{}, errors.New("该上游配置已停用")
-	}
-	credentials, err := m.decrypt(source)
-	if err != nil {
-		return model.UpstreamSource{}, err
-	}
-	result, err := m.fetcher.SwitchGroup(ctx, source.Provider, source.BaseURL, credentials, keyID, groupID)
-	if err != nil {
-		m.record(ctx, model.Event{Type: "upstream_key_group_change_failed", Severity: "error", Message: source.Name + " 令牌分组切换失败: " + err.Error(), Actor: actor, Details: fmt.Sprintf(`{"source_id":%d,"key_id":%q,"group_id":%q}`, source.ID, keyID, groupID)})
-		return model.UpstreamSource{}, err
-	}
-	before := ""
-	currentRates, _ := m.store.ListUpstreamKeyRates(ctx, source.ID)
-	for _, item := range currentRates {
-		if item.ExternalID == keyID {
-			before = item.GroupID
-			break
-		}
-	}
-	if err := m.applySuccess(ctx, &source, result); err != nil {
-		return model.UpstreamSource{}, err
-	}
-	// The unrestricted legacy endpoint is an explicit operator action. Re-read
-	// the policy projection immediately so automation cannot overwrite it before
-	// the next ten-minute refresh establishes the manual protection window.
-	if err := m.reconcileGroupFailoverStatesForSourcesLocked(ctx, map[int64]bool{id: true}); err != nil {
-		return model.UpstreamSource{}, fmt.Errorf("分组已切换，但建立人工保护失败: %w", err)
-	}
-	m.record(ctx, model.Event{Type: "upstream_key_group_changed", Severity: "info", Message: source.Name + " 令牌分组已切换并确认", BeforeState: before, AfterState: groupID, Actor: actor, Details: fmt.Sprintf(`{"source_id":%d,"key_id":%q}`, source.ID, keyID)})
-	m.trigger.Trigger()
-	if err := m.reconcileCostRouting(ctx); err != nil {
-		return model.UpstreamSource{}, err
-	}
-	return m.Get(ctx, id)
 }
 
 func (m *Manager) Get(ctx context.Context, id int64) (model.UpstreamSource, error) {

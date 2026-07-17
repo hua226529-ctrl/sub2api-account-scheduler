@@ -29,6 +29,9 @@ func main() {
 		logger.Error("config_invalid", "error", err)
 		os.Exit(1)
 	}
+	if warning := cfg.LegacyAdminLoginWarning(); warning != "" {
+		logger.Warn("legacy_admin_key_login_enabled", "warning", warning)
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
 		logger.Error("data_directory_failed", "error", err)
 		os.Exit(1)
@@ -67,11 +70,15 @@ func main() {
 	engine.Start(ctx)
 	telemetryManager := telemetry.NewManager(client, database, cfg.TelemetryPollInterval, logger,
 		telemetry.WithReconcileRequester(engine), telemetry.WithMonitorAccountResolver(engine))
-	telemetryManager.Start(ctx)
 	balanceManager := balance.NewManager(database, client, engine, balance.NewFetcher(cfg.RequestTimeout, cfg.AllowInsecureUpstream), secretBox, cfg.BalancePollInterval, logger)
+	if err := balanceManager.RecoverGroupTransitions(ctx); err != nil {
+		logger.Warn("group_transition_recovery_incomplete", "error", err)
+	}
 	balanceManager.Start(ctx)
 	failoverController := failover.NewController(database, engine, balanceManager, telemetryManager, cfg.PollInterval, logger)
+	telemetryManager.SetFailoverEvidenceProcessor(failoverController)
 	failoverController.Start(ctx)
+	telemetryManager.Start(ctx)
 	var agentSecretBox *balance.SecretBox
 	if len(cfg.AgentCredentialKey) > 0 {
 		agentSecretBox, err = balance.NewSecretBox(cfg.AgentCredentialKey)

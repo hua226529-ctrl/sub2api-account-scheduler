@@ -3,11 +3,13 @@ package failover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
@@ -16,11 +18,48 @@ import (
 type Store interface {
 	ListGroupFailoverPolicies(context.Context, int64) ([]model.GroupFailoverPolicy, error)
 	SaveGroupFailoverState(context.Context, model.GroupFailoverState) error
+	CompareAndSaveGroupFailoverState(context.Context, model.GroupFailoverState, model.GroupFailoverState) (bool, error)
 	CountCompletedGroupTierTransitions(context.Context, int64, string, time.Time) (int, error)
 	GetAgentWindowStats(context.Context, int64, time.Time, time.Time, string) (model.AgentWindowStats, error)
-	GetAgentSettings(context.Context) (model.AgentSettings, error)
 	GetSettings(context.Context) (model.Settings, error)
 	AddEvent(context.Context, model.Event) error
+}
+
+type evidenceStore interface {
+	ListGroupValidationEvidence(context.Context, []int64, []int64, int64, int64) ([]model.GroupValidationEvidence, error)
+}
+
+type PostSwitchProbe interface {
+	Probe(context.Context, PostSwitchProbeRequest) (PostSwitchProbeResult, error)
+}
+
+type PostSwitchProbeRequest struct {
+	Policy           model.GroupFailoverPolicy
+	TransitionID     int64
+	SourceID         int64
+	KeyID            string
+	TargetTier       string
+	TargetGroupID    string
+	RequestStartedAt time.Time
+}
+
+type PostSwitchProbeResult struct {
+	TransitionID     int64
+	SourceID         int64
+	KeyID            string
+	TargetTier       string
+	TargetGroupID    string
+	RequestStartedAt time.Time
+	Status           string
+	EvidenceID       string
+	ObservedAt       time.Time
+	ReasonCode       string
+}
+
+type Option func(*Controller)
+
+func WithPostSwitchProbe(probe PostSwitchProbe) Option {
+	return func(controller *Controller) { controller.probe = probe }
 }
 
 type SnapshotProvider interface {
@@ -43,34 +82,32 @@ type Controller struct {
 	telemetry TelemetryStatus
 	interval  time.Duration
 	logger    *slog.Logger
+	probe     PostSwitchProbe
+	wake      chan struct{}
 
-	mu           sync.Mutex
-	lastRunAt    time.Time
-	lastError    string
-	outageSince  map[string]time.Time
-	verification map[string]*verificationTracker
-	now          func() time.Time
+	mu          sync.Mutex
+	running     atomic.Bool
+	evidenceRun atomic.Bool
+	lastRunAt   time.Time
+	lastError   string
+	outageSince map[string]time.Time
+	now         func() time.Time
 }
 
-// verificationTracker deliberately records monitor results observed after a
-// group switch. The snapshot only exposes the latest monitor result, so a
-// persisted streak cannot prove that two results happened after the switch.
-// After a restart the tracker starts again, which is conservative: automation
-// waits for two more results instead of escalating on evidence it cannot prove.
-type verificationTracker struct {
-	startedAt      time.Time
-	monitorTimes   map[int64]time.Time
-	monitorResults int
-}
-
-func NewController(store Store, snapshots SnapshotProvider, upstreams UpstreamManager, telemetry TelemetryStatus, interval time.Duration, logger *slog.Logger) *Controller {
+func NewController(store Store, snapshots SnapshotProvider, upstreams UpstreamManager, telemetry TelemetryStatus, interval time.Duration, logger *slog.Logger, options ...Option) *Controller {
 	if interval < 10*time.Second {
 		interval = 50 * time.Second
 	}
-	return &Controller{
+	controller := &Controller{
 		store: store, snapshots: snapshots, upstreams: upstreams, telemetry: telemetry,
-		interval: interval, logger: logger, outageSince: make(map[string]time.Time), verification: make(map[string]*verificationTracker), now: func() time.Time { return time.Now().UTC() },
+		interval: interval, logger: logger, outageSince: make(map[string]time.Time), wake: make(chan struct{}, 1), now: func() time.Time { return time.Now().UTC() },
 	}
+	for _, option := range options {
+		if option != nil {
+			option(controller)
+		}
+	}
+	return controller
 }
 
 func (c *Controller) Start(ctx context.Context) {
@@ -82,11 +119,20 @@ func (c *Controller) Start(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-c.wake:
+				c.runLogged(ctx)
 			case <-ticker.C:
 				c.runLogged(ctx)
 			}
 		}
 	}()
+}
+
+func (c *Controller) Wake() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (c *Controller) Status() (*time.Time, string) {
@@ -101,28 +147,38 @@ func (c *Controller) Status() (*time.Time, string) {
 }
 
 func (c *Controller) RunOnce(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if !c.running.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer c.running.Store(false)
 
+	if _, ok := c.store.(evidenceStore); ok {
+		if err := c.ProcessFailoverEvidence(ctx); err != nil {
+			return fmt.Errorf("处理切换后证据: %w", err)
+		}
+	}
 	now := c.now().UTC()
 	snapshot := c.snapshots.Snapshot()
 	if snapshot.Freeze.AllAutomation {
-		c.lastRunAt = now
-		c.lastError = ""
+		c.setLastRunAt(now)
 		return nil
 	}
 	settings, err := c.store.GetSettings(ctx)
 	if err != nil {
 		return fmt.Errorf("读取救灾策略: %w", err)
 	}
+	if settings.FailoverMode == model.FailoverModeDisabled {
+		c.setLastRunAt(now)
+		return nil
+	}
 	accountSnapshotMaxAge := time.Duration(settings.FailoverAccountFreshMinutes) * time.Minute
 	telemetryMaxAge := time.Duration(settings.FailoverTelemetryFreshMinutes) * time.Minute
 	if snapshot.LastSyncAt == nil || now.Sub(snapshot.LastSyncAt.UTC()) > accountSnapshotMaxAge || snapshot.LastSyncError != "" {
-		return fmt.Errorf("账号与监控快照不新鲜")
+		return fmt.Errorf("data_stale: 账号与监控快照不新鲜")
 	}
 	telemetryAt, telemetryError := c.telemetry.Status()
 	if telemetryAt == nil || now.Sub(telemetryAt.UTC()) > telemetryMaxAge || telemetryError != "" {
-		return fmt.Errorf("真实流量数据不新鲜")
+		return fmt.Errorf("data_stale: 真实流量数据不新鲜")
 	}
 
 	sources, err := c.upstreams.List(ctx)
@@ -134,14 +190,16 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("读取三级分组策略: %w", err)
 	}
 	if len(policies) == 0 {
-		c.lastRunAt = now
+		c.setLastRunAt(now)
 		return nil
 	}
-	agentSettings, err := c.store.GetAgentSettings(ctx)
-	if err != nil {
-		return fmt.Errorf("读取智能体控制模式: %w", err)
+	dryRun := settings.FailoverMode != model.FailoverModeControl
+	mutationBudget := settings.FailoverMutationBudget
+	if mutationBudget < 1 {
+		mutationBudget = 1
 	}
-	dryRun := agentSettings.Mode != model.AgentModeControl
+	mutations := 0
+	var cycleErrors []error
 
 	sourceByID := make(map[int64]model.UpstreamSource, len(sources))
 	sourcePoolByURL := make(map[string]string, len(sources))
@@ -169,10 +227,15 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 		bindings := bindingsForPool(snapshot.Bindings, pool, poolPolicies[pool], sourcePoolByURL)
 		assessment, assessErr := c.assessPool(ctx, bindings, now, settings)
 		if assessErr != nil {
-			return fmt.Errorf("评估倍率池 %s: %w", pool, assessErr)
+			cycleErrors = append(cycleErrors, fmt.Errorf("评估倍率池 %s: %w", pool, assessErr))
+			c.record(ctx, model.Event{Type: "group_failover_pool_assessment_failed", Severity: "error", Message: "调度池救灾评估失败，已继续处理其他池", Actor: "system", Details: fmt.Sprintf(`{"pool":%q,"reason_code":"pool_assessment_failed"}`, pool)})
+			continue
 		}
-		if assessment.Outage {
-			if c.outageSince[pool].IsZero() {
+		confirmedFailure := hasConfirmedGroupFailure(poolPolicies[pool])
+		if assessment.Outage || confirmedFailure {
+			if confirmedFailure {
+				delete(c.outageSince, pool)
+			} else if c.outageSince[pool].IsZero() {
 				c.outageSince[pool] = now
 				c.record(ctx, model.Event{Type: "group_failover_outage_confirmed", Severity: "critical", Message: "调度池 " + pool + " 已确认没有可用渠道", Actor: "system", Details: assessment.Evidence})
 				continue
@@ -180,33 +243,48 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 			// Give the minute-level emergency agent enough time to start and
 			// finish one bounded model call. A late agent action is also rejected
 			// by the pool transition lease in the deterministic executor.
-			if now.Sub(c.outageSince[pool]) < maxDuration(2*c.interval, time.Duration(settings.FailoverAgentGraceSeconds)*time.Second) {
+			if !confirmedFailure && now.Sub(c.outageSince[pool]) < maxDuration(2*c.interval, time.Duration(settings.FailoverAgentGraceSeconds)*time.Second) {
 				continue
 			}
-			acted, handleErr := c.handleOutage(ctx, pool, poolPolicies[pool], sourceByID, bindings, assessment, now, dryRun, settings)
+			budgetAvailable := mutations < mutationBudget
+			acted, handleErr := c.handleOutage(ctx, pool, poolPolicies[pool], sourceByID, assessment, now, dryRun || !budgetAvailable, settings)
 			if handleErr != nil {
-				return handleErr
+				cycleErrors = append(cycleErrors, fmt.Errorf("处理倍率池 %s 断流: %w", pool, handleErr))
+				continue
 			}
 			if acted {
-				break
+				if budgetAvailable && !dryRun {
+					mutations++
+				} else if !dryRun {
+					c.record(ctx, model.Event{Type: "group_failover_mutation_deferred", Severity: "warning", Message: "本轮分组写入预算已用尽，候选动作已延后", Actor: "system", Details: fmt.Sprintf(`{"pool":%q,"reason_code":"mutation_budget_exhausted","budget":%d}`, pool, mutationBudget)})
+				}
 			}
 			continue
 		}
 		delete(c.outageSince, pool)
-		acted, recoverErr := c.handleRecovery(ctx, poolPolicies[pool], sourceByID, bindings, now, dryRun, settings)
-		if recoverErr != nil {
-			return recoverErr
-		}
-		if acted {
-			break
+	}
+	c.setLastRunAt(now)
+	return errors.Join(cycleErrors...)
+}
+
+func hasConfirmedGroupFailure(policies []model.GroupFailoverPolicy) bool {
+	for _, policy := range policies {
+		if policy.State.ValidationStatus == model.GroupValidationConfirmedFailed {
+			return true
 		}
 	}
-	c.lastRunAt = now
-	return nil
+	return false
+}
+
+func (c *Controller) setLastRunAt(value time.Time) {
+	c.mu.Lock()
+	c.lastRunAt = value
+	c.mu.Unlock()
 }
 
 type poolAssessment struct {
 	Outage     bool
+	ReasonCode string
 	Evidence   string
 	Samples    int
 	Eligible   int
@@ -217,12 +295,17 @@ type poolAssessment struct {
 func (c *Controller) assessPool(ctx context.Context, bindings []model.ResolvedBinding, now time.Time, settings model.Settings) (poolAssessment, error) {
 	result := poolAssessment{}
 	if len(bindings) == 0 {
+		result.ReasonCode = "group_empty"
 		return result, nil
 	}
-	hardThree, hardFive, allStopped := true, true, true
+	hardThree, hardFive, allStopped, allDisabled := true, true, true, true
 	for _, binding := range bindings {
-		if binding.Account.Schedulable && binding.Account.Status == "active" {
+		channelActive := strings.EqualFold(strings.TrimSpace(binding.Account.Status), "active")
+		if binding.Account.Schedulable && channelActive {
 			allStopped = false
+		}
+		if channelActive {
+			allDisabled = false
 		}
 		hardThree = hardThree && hasDistinctMonitorHardStreak(binding, now, settings.FailoverMonitorFailures, time.Duration(settings.FailoverAccountFreshMinutes)*time.Minute)
 		hardFive = hardFive && hasDistinctMonitorHardStreak(binding, now, settings.FailoverNoTrafficFailures, time.Duration(settings.FailoverAccountFreshMinutes)*time.Minute)
@@ -237,7 +320,18 @@ func (c *Controller) assessPool(ctx context.Context, bindings []model.ResolvedBi
 		result.Success += window.SuccessCount
 		result.HardErrors += allowedHardErrors(binding, window)
 	}
+	if allDisabled {
+		result.Outage = true
+		result.ReasonCode = "all_channels_disabled"
+		return result, nil
+	}
 	if !hardThree {
+		if allStopped {
+			result.Outage = true
+			result.ReasonCode = "no_schedulable_channels"
+		} else {
+			result.ReasonCode = "evidence_insufficient"
+		}
 		return result, nil
 	}
 	successRate := 0.0
@@ -255,7 +349,14 @@ func (c *Controller) assessPool(ctx context.Context, bindings []model.ResolvedBi
 	}
 	trafficHard := allStopped && (rateHard || consecutiveHard)
 	noTrafficFallback := result.Samples == 0 && hardFive && allStopped
-	result.Outage = trafficHard || noTrafficFallback
+	result.Outage = trafficHard || allStopped
+	if trafficHard {
+		result.ReasonCode = "all_channels_failed"
+	} else if allStopped {
+		result.ReasonCode = "no_schedulable_channels"
+	} else {
+		result.ReasonCode = "evidence_insufficient"
+	}
 	if result.Outage {
 		evidence, _ := json.Marshal(map[string]any{
 			"bindings": len(bindings), "traffic_window_minutes": settings.FailoverTrafficWindowMinutes,
@@ -323,13 +424,13 @@ func (c *Controller) hasConsecutiveHardTraffic(ctx context.Context, bindings []m
 	low, high := start, now
 	for range 12 {
 		mid := low.Add(high.Sub(low) / 2)
-		candidate, queryErr := c.aggregateTraffic(ctx, bindings, mid, now.Add(time.Nanosecond), "hard_tail")
+		tail, queryErr := c.aggregateTraffic(ctx, bindings, mid, now.Add(time.Nanosecond), "hard_tail")
 		if queryErr != nil {
 			return false, queryErr
 		}
-		if candidate.samples >= required {
+		if tail.samples >= required {
 			low = mid
-			best = candidate
+			best = tail
 		} else {
 			high = mid
 		}
@@ -355,17 +456,8 @@ func (c *Controller) aggregateTraffic(ctx context.Context, bindings []model.Reso
 	return result, nil
 }
 
-type transitionCandidate struct {
-	policy   model.GroupFailoverPolicy
-	source   model.UpstreamSource
-	target   string
-	rate     float64
-	rollback bool
-}
-
-func (c *Controller) handleOutage(ctx context.Context, pool string, policies []model.GroupFailoverPolicy, sources map[int64]model.UpstreamSource, bindings []model.ResolvedBinding, assessment poolAssessment, now time.Time, dryRun bool, settings model.Settings) (bool, error) {
-	candidates := make([]transitionCandidate, 0)
-	activePolicy := activeOutagePolicy(policies, sources, now, time.Duration(settings.FailoverMainVerifyMinutes)*time.Minute)
+func (c *Controller) handleOutage(ctx context.Context, pool string, policies []model.GroupFailoverPolicy, sources map[int64]model.UpstreamSource, assessment poolAssessment, now time.Time, dryRun bool, settings model.Settings) (bool, error) {
+	activePolicy := activeFixedPolicy(policies, sources)
 	for _, policy := range policies {
 		if activePolicy != "" && failoverPolicyKey(policy) != activePolicy {
 			continue
@@ -382,48 +474,34 @@ func (c *Controller) handleOutage(ctx context.Context, pool string, policies []m
 			continue
 		}
 		current := effectiveTier(policy, source)
-		target, rollback := "", false
-		if current == model.GroupTierMain && state.PreviousStableTier != "" && state.LastTransitionAt != nil && now.Sub(state.LastTransitionAt.UTC()) <= time.Duration(settings.FailoverMainVerifyMinutes)*time.Minute {
-			target, rollback = state.PreviousStableTier, true
-		} else {
-			switch current {
-			case model.GroupTierMain:
-				target = model.GroupTierBackup
-			case model.GroupTierBackup:
-				started := firstTime(state.VerificationStartedAt, state.LastTransitionAt, state.LastSwitchAt)
-				ready, verifyErr := c.postSwitchEvidenceReady(ctx, policy, bindings, started, now, settings)
-				if verifyErr != nil {
-					return false, verifyErr
-				}
-				if !ready {
-					continue
-				}
-				target = model.GroupTierEmergency
-			case model.GroupTierEmergency:
-				started := firstTime(state.VerificationStartedAt, state.LastTransitionAt, state.LastSwitchAt)
-				ready, verifyErr := c.postSwitchEvidenceReady(ctx, policy, bindings, started, now, settings)
-				if verifyErr != nil {
-					return false, verifyErr
-				}
-				if ready {
-					state.Frozen = true
-					state.FreezeReason = "主、备用和紧急分组均未恢复可用渠道"
-					state.LastError = state.FreezeReason
-					if err := c.store.SaveGroupFailoverState(ctx, state); err != nil {
-						return false, err
-					}
-					delete(c.verification, failoverPolicyKey(policy))
-					c.record(ctx, model.Event{Type: "group_failover_exhausted", Severity: "critical", Message: source.Name + " 的三级分组均未恢复服务，已冻结自动切换", Actor: "system", Details: assessment.Evidence})
-				}
-				continue
-			default:
-				state.Frozen = true
-				state.FreezeReason = "当前令牌分组不属于已确认的三级策略"
-				_ = c.store.SaveGroupFailoverState(ctx, state)
+		switch state.ValidationStatus {
+		case model.GroupValidationTransitioning, model.GroupValidationAwaitingEvidence, model.GroupValidationProbing, model.GroupValidationUncertain, model.GroupValidationExhausted:
+			continue
+		}
+		if state.ValidationStatus != model.GroupValidationConfirmedFailed {
+			if !assessment.Outage {
 				continue
 			}
+			state.ValidationStatus = model.GroupValidationConfirmedFailed
+			state.LastError = firstNonEmpty(assessment.ReasonCode, "current_level_confirmed_failed")
+			if err := c.store.SaveGroupFailoverState(ctx, state); err != nil {
+				return false, err
+			}
 		}
-		if !rollback && before(state.CooldownUntil, now) && !(current == model.GroupTierBackup && target == model.GroupTierEmergency) {
+		target, skipped := nextEnabledTier(policy, current)
+		if target == "" {
+			state.ValidationStatus = model.GroupValidationExhausted
+			state.Frozen = true
+			state.FreezeReason = "fixed_failover_levels_exhausted"
+			state.LastError = state.FreezeReason
+			if err := c.store.SaveGroupFailoverState(ctx, state); err != nil {
+				return false, err
+			}
+			details, _ := json.Marshal(map[string]any{"source_id": policy.SourceID, "key_id": policy.KeyID, "current_level": current, "reason_code": "fixed_failover_levels_exhausted", "skipped_levels": skipped})
+			c.record(ctx, model.Event{Type: "group_failover_exhausted", Severity: "critical", Message: source.Name + " 的已配置固定救灾层级均已确认失败", Actor: "system", Details: string(details)})
+			return false, nil
+		}
+		if before(state.CooldownUntil, now) && !(current == model.GroupTierBackup && target == model.GroupTierEmergency) {
 			continue
 		}
 		count30, err := c.store.CountCompletedGroupTierTransitions(ctx, policy.SourceID, policy.KeyID, now.Add(-time.Duration(settings.FailoverShortLimitWindowMinutes)*time.Minute))
@@ -434,7 +512,7 @@ func (c *Controller) handleOutage(ctx context.Context, pool string, policies []m
 		if err != nil {
 			return false, err
 		}
-		if !rollback && (count30 >= settings.FailoverShortLimitCount || count6h >= settings.FailoverLongLimitCount) {
+		if count30 >= settings.FailoverShortLimitCount || count6h >= settings.FailoverLongLimitCount {
 			state.Frozen = true
 			state.FreezeReason = "自动切换次数超过安全上限"
 			_ = c.store.SaveGroupFailoverState(ctx, state)
@@ -442,48 +520,23 @@ func (c *Controller) handleOutage(ctx context.Context, pool string, policies []m
 		}
 		groupID := groupForTier(policy, target)
 		if groupID == "" || !sourceHasGroup(source, groupID) || !sourceHasKey(source, policy.KeyID) {
-			continue
+			state.ValidationStatus = model.GroupValidationUncertain
+			state.LastError = "configuration_invalid"
+			_ = c.store.SaveGroupFailoverState(ctx, state)
+			return false, errors.New("固定下一级分组配置无效")
 		}
-		candidates = append(candidates, transitionCandidate{policy: policy, source: source, target: target, rate: groupRate(source, groupID), rollback: rollback})
+		details, _ := json.Marshal(map[string]any{"assessment": assessment.Evidence, "reason_code": "fixed_next_level", "skipped_levels": skipped})
+		_, err = c.upstreams.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
+			SourceID: policy.SourceID, KeyID: policy.KeyID, TargetTier: target,
+			IdempotencyKey: fmt.Sprintf("fallback-%s-%d-%s-%s-%d", safeID(pool), policy.SourceID, safeID(policy.KeyID), target, now.Unix()/int64(c.interval.Seconds())),
+			Actor:          "system:failover", Producer: "deterministic_failover", Authority: "deterministic_safety", Reason: "当前固定层级已确认失败，切换到" + tierLabel(target), Evidence: string(details), Trigger: "fixed_next_level", DryRun: dryRun,
+		})
+		return true, err
 	}
-	if len(candidates) == 0 {
-		return false, nil
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].rollback != candidates[j].rollback {
-			return candidates[i].rollback
-		}
-		if candidates[i].policy.State.CurrentTier != candidates[j].policy.State.CurrentTier {
-			return candidates[i].policy.State.CurrentTier == model.GroupTierBackup
-		}
-		if candidates[i].rate != candidates[j].rate {
-			return candidates[i].rate < candidates[j].rate
-		}
-		return candidates[i].source.ID < candidates[j].source.ID
-	})
-	candidate := candidates[0]
-	reason := "全局断流，切换到" + tierLabel(candidate.target)
-	trigger := "global_outage"
-	if candidate.rollback {
-		reason, trigger = "回主组试运行失败，恢复上一个稳定分组", "main_trial_rollback"
-	}
-	_, err := c.upstreams.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
-		SourceID: candidate.policy.SourceID, KeyID: candidate.policy.KeyID, TargetTier: candidate.target,
-		IdempotencyKey: fmt.Sprintf("fallback-%s-%d-%s-%s-%d", safeID(pool), candidate.policy.SourceID, safeID(candidate.policy.KeyID), candidate.target, now.Unix()/int64(c.interval.Seconds())),
-		Actor:          "system:failover", Reason: reason, Evidence: assessment.Evidence, Trigger: trigger, DryRun: dryRun,
-	})
-	return true, err
+	return false, nil
 }
 
-// activeOutagePolicy locks one pool to its current rescue chain. A token in a
-// backup/emergency verification stage (or a main trial awaiting rollback) must
-// finish or freeze before another token can start at main -> backup.
-func activeOutagePolicy(policies []model.GroupFailoverPolicy, sources map[int64]model.UpstreamSource, now time.Time, mainVerifyWindow time.Duration) string {
-	type active struct {
-		key string
-		at  time.Time
-	}
-	items := make([]active, 0)
+func activeFixedPolicy(policies []model.GroupFailoverPolicy, sources map[int64]model.UpstreamSource) string {
 	for _, policy := range policies {
 		if policy.State.Frozen || !policy.Enabled || !policy.Confirmed || policy.ConfirmedVersion != policy.Version {
 			continue
@@ -494,166 +547,375 @@ func activeOutagePolicy(policies []model.GroupFailoverPolicy, sources map[int64]
 				tier = observedTier
 			}
 		}
-		isActive := tier == model.GroupTierBackup || tier == model.GroupTierEmergency
-		if tier == model.GroupTierMain && policy.State.PreviousStableTier != "" && policy.State.LastTransitionAt != nil && now.Sub(policy.State.LastTransitionAt.UTC()) <= mainVerifyWindow {
-			isActive = true
-		}
+		isActive := tier == model.GroupTierBackup || tier == model.GroupTierEmergency || policy.State.ValidationStatus == model.GroupValidationConfirmedFailed || policy.State.ValidationStatus == model.GroupValidationAwaitingEvidence || policy.State.ValidationStatus == model.GroupValidationTransitioning || policy.State.ValidationStatus == model.GroupValidationProbing || policy.State.ValidationStatus == model.GroupValidationUncertain
 		if !isActive {
 			continue
 		}
-		at := time.Time{}
-		if value := firstTime(policy.State.LastTransitionAt, policy.State.VerificationStartedAt, policy.State.LastSwitchAt); value != nil {
-			at = value.UTC()
-		}
-		items = append(items, active{key: failoverPolicyKey(policy), at: at})
+		return failoverPolicyKey(policy)
 	}
-	if len(items) == 0 {
-		return ""
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if !items[i].at.Equal(items[j].at) {
-			return items[i].at.After(items[j].at)
-		}
-		return items[i].key < items[j].key
-	})
-	return items[0].key
+	return ""
 }
 
-func (c *Controller) postSwitchEvidenceReady(ctx context.Context, policy model.GroupFailoverPolicy, bindings []model.ResolvedBinding, started *time.Time, now time.Time, settings model.Settings) (bool, error) {
-	if started == nil || started.After(now) {
-		return false, nil
+func nextEnabledTier(policy model.GroupFailoverPolicy, current string) (string, []string) {
+	tiers := []string{model.GroupTierMain, model.GroupTierBackup, model.GroupTierEmergency}
+	currentIndex := -1
+	for index, tier := range tiers {
+		if tier == current {
+			currentIndex = index
+			break
+		}
 	}
-	key := failoverPolicyKey(policy)
-	tracker := c.verification[key]
-	if tracker == nil || !tracker.startedAt.Equal(started.UTC()) {
-		tracker = &verificationTracker{startedAt: started.UTC(), monitorTimes: make(map[int64]time.Time)}
-		c.verification[key] = tracker
+	if currentIndex < 0 {
+		return "", nil
 	}
-	accountIDs := make(map[int64]bool, len(policy.AccountIDs))
-	for _, accountID := range policy.AccountIDs {
-		accountIDs[accountID] = true
+	skipped := make([]string, 0, 2)
+	for _, tier := range tiers[currentIndex+1:] {
+		if groupTierEnabled(policy, tier) && strings.TrimSpace(groupForTier(policy, tier)) != "" {
+			return tier, skipped
+		}
+		skipped = append(skipped, tier)
 	}
-	trafficSamples := 0
-	for _, binding := range bindings {
-		if !accountIDs[binding.Account.ID] {
+	return "", skipped
+}
+
+func groupTierEnabled(policy model.GroupFailoverPolicy, tier string) bool {
+	if !policy.MainEnabled && !policy.BackupEnabled && !policy.EmergencyEnabled {
+		return strings.TrimSpace(groupForTier(policy, tier)) != ""
+	}
+	switch tier {
+	case model.GroupTierMain:
+		return policy.MainEnabled
+	case model.GroupTierBackup:
+		return policy.BackupEnabled
+	case model.GroupTierEmergency:
+		return policy.EmergencyEnabled
+	default:
+		return false
+	}
+}
+
+// ProcessFailoverEvidence consumes only committed telemetry rows beyond the
+// transition's persisted watermarks. It never performs a group mutation.
+func (c *Controller) ProcessFailoverEvidence(ctx context.Context) error {
+	if !c.evidenceRun.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer c.evidenceRun.Store(false)
+
+	evidenceReader, ok := c.store.(evidenceStore)
+	if !ok {
+		return errors.New("failover evidence store is unavailable")
+	}
+	settings, err := c.store.GetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	policies, err := c.store.ListGroupFailoverPolicies(ctx, 0)
+	if err != nil {
+		return err
+	}
+	snapshot := c.snapshots.Snapshot()
+	now := c.now().UTC()
+	var processErrors []error
+	for _, policy := range policies {
+		expected := policy.State
+		state := expected
+		if state.SwitchVerifiedAt == nil || state.ValidationNotBefore == nil {
 			continue
 		}
-		checkedAt := binding.MonitorState.LastCheckedAt
-		if checkedAt == nil && binding.Monitor != nil {
-			checkedAt = binding.Monitor.LastCheckedAt
+		switch state.ValidationStatus {
+		case model.GroupValidationAwaitingEvidence, model.GroupValidationProbing, model.GroupValidationUncertain:
+		default:
+			continue
 		}
-		if binding.Monitor != nil && checkedAt != nil {
-			value := checkedAt.UTC()
-			previous := tracker.monitorTimes[binding.Monitor.ID]
-			if value.After(tracker.startedAt) && (previous.IsZero() || value.After(previous)) {
-				tracker.monitorTimes[binding.Monitor.ID] = value
-				tracker.monitorResults++
+		monitorIDs := monitorIDsForAccounts(snapshot.Bindings, policy.AccountIDs)
+		items, readErr := evidenceReader.ListGroupValidationEvidence(ctx, monitorIDs, policy.AccountIDs, state.MonitorEvidenceCursor, state.TrafficEvidenceCursor)
+		if readErr != nil {
+			processErrors = append(processErrors, fmt.Errorf("读取 %s 切换后证据: %w", failoverPolicyKey(policy), readErr))
+			continue
+		}
+		changed := false
+		for _, item := range items {
+			if item.Source == "monitor" && item.ID > state.MonitorEvidenceCursor {
+				state.MonitorEvidenceCursor = item.ID
+				changed = true
+			}
+			if item.Source == "traffic" && item.ID > state.TrafficEvidenceCursor {
+				state.TrafficEvidenceCursor = item.ID
+				changed = true
+			}
+			if !evidenceMatchesValidation(item, state) || item.ObservedAt.IsZero() || item.ObservedAt.After(now) || now.Sub(item.ObservedAt) > time.Duration(settings.FailoverAccountFreshMinutes)*time.Minute {
+				continue
+			}
+			occurrenceAt, attributable := evidenceOccurrenceAt(item, state)
+			if !attributable || occurrenceAt.Before(state.ValidationNotBefore.UTC()) || occurrenceAt.After(now) {
+				continue
+			}
+			result := classifyPostSwitchEvidence(item)
+			if result == "" {
+				continue
+			}
+			state.LastEvidenceID = fmt.Sprintf("%s:%d", item.Source, item.ID)
+			state.LastEvidenceSource = item.Source
+			state.LastEvidenceReason = firstNonEmpty(item.ReasonCode, item.ErrorClass, item.Status)
+			observedAt := item.ObservedAt.UTC()
+			state.LastEvidenceAt = &observedAt
+			changed = true
+			if result == "success" {
+				state.SuccessfulEvidenceCount++
+				if state.SuccessfulEvidenceCount >= model.GroupValidationMinimumSuccesses {
+					state.ValidationStatus = model.GroupValidationConfirmedHealthy
+					state.LastConfirmedAt = &observedAt
+					state.LastError = ""
+				}
+				continue
+			}
+			state.FailedEvidenceCount++
+			if state.FailedEvidenceCount >= settings.FailoverMonitorFailures {
+				state.ValidationStatus = model.GroupValidationConfirmedFailed
+				state.LastError = "post_switch_failure_threshold"
 			}
 		}
-		window, err := c.store.GetAgentWindowStats(ctx, binding.Account.ID, tracker.startedAt, now.Add(time.Nanosecond), "post_group_switch")
-		if err != nil {
-			return false, err
+		if state.ValidationStatus != model.GroupValidationConfirmedHealthy && state.ValidationStatus != model.GroupValidationConfirmedFailed && state.EvidenceDeadline != nil && !now.Before(state.EvidenceDeadline.UTC()) {
+			state.ValidationStatus = model.GroupValidationUncertain
+			state.LastError = "evidence_timeout"
+			changed = true
 		}
-		trafficSamples += window.SampleCount
+		if !changed {
+			continue
+		}
+		saved, saveErr := c.store.CompareAndSaveGroupFailoverState(ctx, expected, state)
+		if saveErr != nil {
+			processErrors = append(processErrors, fmt.Errorf("保存 %s 验证状态: %w", failoverPolicyKey(policy), saveErr))
+			continue
+		}
+		if !saved {
+			continue
+		}
+		switch state.ValidationStatus {
+		case model.GroupValidationConfirmedHealthy:
+			c.record(ctx, model.Event{Type: "group_failover_validation_healthy", Severity: "info", Message: "固定层级已由切换后新证据确认可用", Actor: "system:telemetry", Details: validationDetails(state)})
+		case model.GroupValidationConfirmedFailed:
+			c.record(ctx, model.Event{Type: "group_failover_validation_failed", Severity: "critical", Message: "固定层级已由切换后新证据确认失败", Actor: "system:telemetry", Details: validationDetails(state)})
+			c.Wake()
+		case model.GroupValidationUncertain:
+			c.record(ctx, model.Event{Type: "group_failover_validation_uncertain", Severity: "warning", Message: "切换后证据超时或归属不明确，未自动推进", Actor: "system:telemetry", Details: validationDetails(state)})
+		}
 	}
-	return now.Sub(tracker.startedAt) >= time.Duration(settings.FailoverBackupVerifyMinutes)*time.Minute &&
-		tracker.monitorResults >= settings.FailoverPostSwitchMonitors && trafficSamples >= settings.FailoverPostSwitchRequests, nil
+	return errors.Join(processErrors...)
+}
+
+func evidenceMatchesValidation(item model.GroupValidationEvidence, state model.GroupFailoverState) bool {
+	if item.TransitionID > 0 && item.TransitionID != state.ValidationTransitionID {
+		return false
+	}
+	if item.SourceID > 0 && item.SourceID != state.SourceID {
+		return false
+	}
+	if keyID := strings.TrimSpace(item.KeyID); keyID != "" && keyID != strings.TrimSpace(state.KeyID) {
+		return false
+	}
+	if tier := strings.TrimSpace(item.TargetTier); tier != "" && tier != state.ValidationTargetTier {
+		return false
+	}
+	if groupID := strings.TrimSpace(item.TargetGroupID); groupID != "" && groupID != state.ValidationTargetGroupID {
+		return false
+	}
+	return true
+}
+
+func evidenceOccurrenceAt(item model.GroupValidationEvidence, state model.GroupFailoverState) (time.Time, bool) {
+	if item.RequestStartedAt != nil && !item.RequestStartedAt.IsZero() {
+		return item.RequestStartedAt.UTC(), true
+	}
+	switch item.TimeBasis {
+	case model.EvidenceTimeBasisMonitorRequestStart, model.EvidenceTimeBasisRequestStart:
+		if item.ObservedAt.IsZero() {
+			return time.Time{}, false
+		}
+		return item.ObservedAt.UTC(), true
+	case model.EvidenceTimeBasisCompletion:
+		if item.Source != "monitor" || state.SwitchVerifiedAt == nil || item.ObservedAt.IsZero() {
+			return time.Time{}, false
+		}
+		safeBoundary := state.SwitchVerifiedAt.UTC().Add(model.GroupValidationPropagationDelay + model.GroupValidationMonitorRequestTimeout)
+		if item.ObservedAt.Before(safeBoundary) {
+			return time.Time{}, false
+		}
+		return item.ObservedAt.UTC(), true
+	default:
+		return time.Time{}, false
+	}
+}
+
+func monitorIDsForAccounts(bindings []model.ResolvedBinding, accountIDs []int64) []int64 {
+	accounts := make(map[int64]bool, len(accountIDs))
+	for _, accountID := range accountIDs {
+		accounts[accountID] = true
+	}
+	seen := make(map[int64]bool)
+	result := make([]int64, 0)
+	for _, binding := range bindings {
+		if !accounts[binding.Account.ID] || binding.Monitor == nil || binding.Monitor.ID <= 0 || seen[binding.Monitor.ID] {
+			continue
+		}
+		seen[binding.Monitor.ID] = true
+		result = append(result, binding.Monitor.ID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func classifyPostSwitchEvidence(item model.GroupValidationEvidence) string {
+	if item.Source == "monitor" {
+		switch strings.ToLower(strings.TrimSpace(item.Status)) {
+		case model.StatusOperational:
+			return "success"
+		case model.StatusFailed, model.StatusError:
+			return "failed"
+		default:
+			return ""
+		}
+	}
+	if strings.EqualFold(item.Status, "success") {
+		return "success"
+	}
+	if !strings.EqualFold(item.Status, "error") {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(item.ErrorClass)) {
+	case model.ErrorClassInfrastructure, model.ErrorClassCapacity:
+		return "failed"
+	default:
+		return ""
+	}
+}
+
+func validationDetails(state model.GroupFailoverState) string {
+	details, _ := json.Marshal(map[string]any{
+		"transition_id": state.ValidationTransitionID, "source_id": state.SourceID, "key_id": state.KeyID,
+		"target_level": state.ValidationTargetTier, "target_group_id": state.ValidationTargetGroupID,
+		"validation_status": state.ValidationStatus, "successful_evidence": state.SuccessfulEvidenceCount,
+		"failed_evidence": state.FailedEvidenceCount, "last_evidence_id": state.LastEvidenceID,
+		"last_evidence_source": state.LastEvidenceSource, "reason_code": state.LastError,
+	})
+	return string(details)
+}
+
+// RunPostSwitchProbe runs an optional, bounded probe only after readback has
+// confirmed the target group. Production defaults to passive validation.
+func (c *Controller) RunPostSwitchProbe(ctx context.Context, sourceID int64, keyID string) error {
+	if c.probe == nil {
+		return errors.New("post-switch active probe is not configured")
+	}
+	policies, err := c.store.ListGroupFailoverPolicies(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	settings, err := c.store.GetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	failureThreshold := settings.FailoverMonitorFailures
+	if failureThreshold < 2 {
+		failureThreshold = 2
+	}
+	for _, policy := range policies {
+		if policy.KeyID != strings.TrimSpace(keyID) {
+			continue
+		}
+		expected := policy.State
+		state := expected
+		if state.SwitchVerifiedAt == nil || state.ValidationStatus != model.GroupValidationAwaitingEvidence {
+			return errors.New("active probe requires an applied transition awaiting evidence")
+		}
+		requestStartedAt := c.now().UTC()
+		if !requestStartedAt.After(state.SwitchVerifiedAt.UTC()) || state.ValidationNotBefore == nil || requestStartedAt.Before(state.ValidationNotBefore.UTC()) {
+			return errors.New("active probe cannot start before the post-switch validation boundary")
+		}
+		state.ValidationStatus = model.GroupValidationProbing
+		state.ValidationMode = model.GroupValidationModeActive
+		state.ActiveProbeAttempts++
+		saved, err := c.store.CompareAndSaveGroupFailoverState(ctx, expected, state)
+		if err != nil {
+			return err
+		}
+		if !saved {
+			return errors.New("active probe transition was superseded before start")
+		}
+		request := PostSwitchProbeRequest{
+			Policy: policy, TransitionID: state.ValidationTransitionID, SourceID: state.SourceID, KeyID: strings.TrimSpace(state.KeyID),
+			TargetTier: state.ValidationTargetTier, TargetGroupID: state.ValidationTargetGroupID, RequestStartedAt: requestStartedAt,
+		}
+		result, probeErr := c.probe.Probe(ctx, request)
+		now := c.now().UTC()
+		if result.ObservedAt.IsZero() {
+			result.ObservedAt = now
+		}
+		if probeErr == nil && !postSwitchProbeResultMatches(request, result) {
+			return c.rejectActiveProbeResult(ctx, state, "active_probe_binding_mismatch")
+		}
+		if result.ObservedAt.Before(requestStartedAt) {
+			return c.rejectActiveProbeResult(ctx, state, "active_probe_time_invalid")
+		}
+		expected = state
+		state.LastEvidenceID = fmt.Sprintf("active_probe:%d:%s", request.TransitionID, strings.TrimSpace(result.EvidenceID))
+		state.LastEvidenceSource = "active_probe"
+		state.LastEvidenceReason = result.ReasonCode
+		state.LastEvidenceAt = &result.ObservedAt
+		if probeErr != nil || strings.EqualFold(result.Status, model.GroupValidationUncertain) {
+			state.ValidationStatus = model.GroupValidationUncertain
+			state.LastError = "active_probe_uncertain"
+		} else if strings.EqualFold(result.Status, "success") || strings.EqualFold(result.Status, model.StatusOperational) {
+			state.SuccessfulEvidenceCount++
+			state.ValidationStatus = model.GroupValidationConfirmedHealthy
+			state.LastConfirmedAt = &result.ObservedAt
+			state.LastError = ""
+		} else {
+			state.FailedEvidenceCount++
+			if state.FailedEvidenceCount >= failureThreshold {
+				state.ValidationStatus = model.GroupValidationConfirmedFailed
+				c.Wake()
+			} else {
+				state.ValidationStatus = model.GroupValidationAwaitingEvidence
+			}
+			state.LastError = "active_probe_failed"
+		}
+		saved, err = c.store.CompareAndSaveGroupFailoverState(ctx, expected, state)
+		if err != nil {
+			return err
+		}
+		if !saved {
+			return errors.New("active probe result belongs to a superseded transition")
+		}
+		return nil
+	}
+	return errors.New("fixed failover policy not found")
+}
+
+func (c *Controller) rejectActiveProbeResult(ctx context.Context, probing model.GroupFailoverState, reason string) error {
+	next := probing
+	next.ValidationStatus = model.GroupValidationUncertain
+	next.LastError = reason
+	saved, err := c.store.CompareAndSaveGroupFailoverState(ctx, probing, next)
+	if err != nil {
+		return err
+	}
+	if !saved {
+		return errors.New("active probe result belongs to a superseded transition")
+	}
+	return errors.New(reason)
+}
+
+func postSwitchProbeResultMatches(request PostSwitchProbeRequest, result PostSwitchProbeResult) bool {
+	return result.TransitionID == request.TransitionID && result.SourceID == request.SourceID &&
+		strings.TrimSpace(result.KeyID) == request.KeyID && result.TargetTier == request.TargetTier &&
+		result.TargetGroupID == request.TargetGroupID && !result.RequestStartedAt.IsZero() &&
+		result.RequestStartedAt.UTC().Equal(request.RequestStartedAt)
 }
 
 func failoverPolicyKey(policy model.GroupFailoverPolicy) string {
 	return fmt.Sprintf("%d:%s", policy.SourceID, strings.TrimSpace(policy.KeyID))
-}
-
-func (c *Controller) handleRecovery(ctx context.Context, policies []model.GroupFailoverPolicy, sources map[int64]model.UpstreamSource, bindings []model.ResolvedBinding, now time.Time, dryRun bool, settings model.Settings) (bool, error) {
-	bindingsByAccount := make(map[int64]model.ResolvedBinding, len(bindings))
-	for _, binding := range bindings {
-		bindingsByAccount[binding.Account.ID] = binding
-	}
-	for _, policy := range policies {
-		source, ok := sources[policy.SourceID]
-		if !ok || !policy.Enabled || !policy.Confirmed || policy.State.Frozen {
-			continue
-		}
-		state := policy.State
-		current := effectiveTier(policy, source)
-		if current == model.GroupTierMain {
-			delete(c.verification, failoverPolicyKey(policy))
-			if state.PreviousStableTier != "" && state.LastTransitionAt != nil && now.Sub(state.LastTransitionAt.UTC()) > time.Duration(settings.FailoverMainVerifyMinutes)*time.Minute {
-				state.PreviousStableTier = ""
-				state.PreviousTier = ""
-				state.PreviousGroupID = ""
-				state.VerificationStartedAt = nil
-				state.LastError = ""
-				_ = c.store.SaveGroupFailoverState(ctx, state)
-			}
-			continue
-		}
-		if current != model.GroupTierBackup && current != model.GroupTierEmergency {
-			continue
-		}
-		if before(state.ManualHoldUntil, now) || before(state.ManualOverrideUntil, now) || before(state.ReturnBlockedUntil, now) {
-			continue
-		}
-		healthy, minStreak := true, int(^uint(0)>>1)
-		eligible, success := 0, 0
-		for _, accountID := range policy.AccountIDs {
-			binding, exists := bindingsByAccount[accountID]
-			if !exists || binding.Monitor == nil || binding.Monitor.LastCheckedAt == nil || now.Sub(binding.Monitor.LastCheckedAt.UTC()) > time.Duration(settings.FailoverAccountFreshMinutes)*time.Minute ||
-				!strings.EqualFold(binding.Monitor.PrimaryStatus, model.StatusOperational) || binding.MonitorState.HealthyStreak < settings.FailoverRecoveryMonitorSuccesses {
-				healthy = false
-				break
-			}
-			if binding.MonitorState.HealthyStreak < minStreak {
-				minStreak = binding.MonitorState.HealthyStreak
-			}
-			windowLabel := fmt.Sprintf("%dm", settings.FailoverRecoveryWindowMinutes)
-			window, err := c.store.GetAgentWindowStats(ctx, accountID, now.Add(-time.Duration(settings.FailoverRecoveryWindowMinutes)*time.Minute), now.Add(time.Nanosecond), windowLabel)
-			if err != nil {
-				return false, err
-			}
-			eligible += window.EligibleCount
-			success += window.SuccessCount
-		}
-		successRate := 0.0
-		if eligible > 0 {
-			successRate = float64(success) * 100 / float64(eligible)
-		}
-		healthy = healthy && eligible >= settings.FailoverRecoveryMinSamples && successRate >= float64(settings.FailoverRecoverySuccessAt)
-		if !healthy {
-			if state.HealthySince != nil || state.RecoveryHealthyCount != 0 {
-				state.HealthySince = nil
-				state.RecoveryHealthyCount = 0
-				_ = c.store.SaveGroupFailoverState(ctx, state)
-			}
-			continue
-		}
-		if state.HealthySince == nil {
-			state.HealthySince = timePtr(now)
-			state.RecoveryHealthyCount = minStreak
-			if err := c.store.SaveGroupFailoverState(ctx, state); err != nil {
-				return false, err
-			}
-			continue
-		}
-		state.RecoveryHealthyCount = minStreak
-		if now.Sub(state.HealthySince.UTC()) < time.Duration(settings.FailoverRecoveryStableMinutes)*time.Minute {
-			_ = c.store.SaveGroupFailoverState(ctx, state)
-			continue
-		}
-		evidence, _ := json.Marshal(map[string]any{"recovery_window_minutes": settings.FailoverRecoveryWindowMinutes, "eligible_requests": eligible, "success_rate": successRate, "healthy_monitor_streak": minStreak})
-		_, err := c.upstreams.TransitionGroupTier(ctx, model.GroupTierTransitionRequest{
-			SourceID: policy.SourceID, KeyID: policy.KeyID, TargetTier: model.GroupTierMain,
-			IdempotencyKey: fmt.Sprintf("recover-%d-%s-%d", policy.SourceID, safeID(policy.KeyID), now.Unix()/int64(c.interval.Seconds())),
-			Actor:          "system:failover", Reason: fmt.Sprintf("系统稳定%d分钟，直接试回主分组", settings.FailoverRecoveryStableMinutes), Evidence: string(evidence), Trigger: "stable_return_main", DryRun: dryRun,
-		})
-		if err != nil {
-			state.ReturnBlockedUntil = timePtr(now.Add(time.Duration(settings.FailoverReturnRetryMinutes) * time.Minute))
-			state.LastError = err.Error()
-			_ = c.store.SaveGroupFailoverState(ctx, state)
-		}
-		return true, err
-	}
-	return false, nil
 }
 
 func bindingsForPool(bindings []model.ResolvedBinding, pool string, policies []model.GroupFailoverPolicy, sourcePoolByURL map[string]string) []model.ResolvedBinding {
@@ -724,15 +986,6 @@ func sourceHasGroup(source model.UpstreamSource, groupID string) bool {
 	return false
 }
 
-func groupRate(source model.UpstreamSource, groupID string) float64 {
-	for _, group := range source.Groups {
-		if group.ExternalID == groupID {
-			return group.RateMultiplier
-		}
-	}
-	return 1e9
-}
-
 func keyRateActive(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "1", "active", "enabled", "normal":
@@ -757,15 +1010,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func firstTime(values ...*time.Time) *time.Time {
-	for _, value := range values {
-		if value != nil {
-			return value
-		}
-	}
-	return nil
 }
 
 func before(value *time.Time, now time.Time) bool {
@@ -815,19 +1059,23 @@ func (c *Controller) record(ctx context.Context, event model.Event) {
 func (c *Controller) runLogged(ctx context.Context) {
 	err := c.RunOnce(ctx)
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err != nil {
 		message := err.Error()
 		changed := message != c.lastError
 		c.lastError = message
+		c.mu.Unlock()
 		if changed {
 			c.logger.Error("group_failover_cycle_failed", "error", err)
 			_ = c.store.AddEvent(context.Background(), model.Event{Type: "group_failover_cycle_failed", Severity: "error", Message: message, Actor: "system", CreatedAt: c.now().UTC()})
 		}
 		return
 	}
-	if c.lastError != "" {
+	recovered := c.lastError != ""
+	if recovered {
 		c.lastError = ""
+	}
+	c.mu.Unlock()
+	if recovered {
 		_ = c.store.AddEvent(context.Background(), model.Event{Type: "group_failover_cycle_recovered", Severity: "info", Message: "三级分组救灾判定已恢复", Actor: "system", CreatedAt: c.now().UTC()})
 	}
 }

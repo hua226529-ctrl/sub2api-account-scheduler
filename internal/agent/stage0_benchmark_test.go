@@ -15,7 +15,7 @@ func BenchmarkChatAsyncEnqueueCurrentBehavior(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		if _, _, _, _, err := manager.ChatAsync(context.Background(), 0, "分析当前账号状态"); err != nil {
+		if _, err := manager.ChatAsync(context.Background(), 0, "分析最近整体调度效果。"); err != nil {
 			b.Fatal(err)
 		}
 	}

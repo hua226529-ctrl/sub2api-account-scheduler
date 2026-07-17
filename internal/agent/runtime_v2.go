@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"time"
@@ -24,11 +26,22 @@ type runtimeGoalContext struct {
 	Trigger     string              `json:"trigger"`
 	UserMessage string              `json:"user_message,omitempty"`
 	AdminIntent AdministratorIntent `json:"administrator_intent,omitempty"`
+	ChatIntent  ChatIntent          `json:"chat_intent,omitempty"`
 	// LegacyAdministratorDirect is decoded only so older rows remain readable.
 	// It is intentionally ignored: a bare boolean can never grant privilege.
 	LegacyAdministratorDirect bool       `json:"administrator_direct,omitempty"`
 	Cutoff                    *time.Time `json:"cutoff,omitempty"`
 	ReportDate                string     `json:"report_date,omitempty"`
+}
+
+type ChatReceipt struct {
+	ConversationID        int64      `json:"conversation_id"`
+	GoalID                int64      `json:"goal_id"`
+	RunID                 int64      `json:"run_id"`
+	Status                string     `json:"status"`
+	Intent                ChatIntent `json:"intent"`
+	ConfirmationToken     string     `json:"confirmation_token,omitempty"`
+	ConfirmationExpiresAt *time.Time `json:"confirmation_expires_at,omitempty"`
 }
 
 type runtimeCheckpoint struct {
@@ -41,27 +54,98 @@ type runtimeCheckpoint struct {
 // ChatAsync persists the administrator message and returns immediately. The
 // cognitive worker owns all subsequent model calls, so HTTP timeouts cannot
 // interrupt a goal or lose its execution checkpoint.
-func (m *Manager) ChatAsync(ctx context.Context, conversationID int64, message string) (int64, int64, int64, string, error) {
+func (m *Manager) ChatAsync(ctx context.Context, conversationID int64, message string) (ChatReceipt, error) {
+	receipt := ChatReceipt{ConversationID: conversationID}
 	message = strings.TrimSpace(message)
 	if message == "" || len([]rune(message)) > 4000 {
-		return conversationID, 0, 0, "", errors.New("对话内容为空或过长")
+		return receipt, errors.New("对话内容为空或过长")
 	}
 	message = redactAgentText(message)
+	now := time.Now().UTC()
+	chatIntent := m.classifyChatIntent(ctx, message, now)
+	if err := chatIntent.Validate(); err != nil {
+		return receipt, fmt.Errorf("聊天意图无效: %w", err)
+	}
 	adminIntent := m.parseAdministratorIntent(ctx, message)
+	adminIntent = m.bindChatIntentAdministratorGrants(adminIntent, chatIntent)
 	contextPayload, _ := json.Marshal(runtimeGoalContext{Kind: model.AgentRunChat, Trigger: "管理员对话命令",
-		UserMessage: message, AdminIntent: adminIntent})
+		UserMessage: message, AdminIntent: adminIntent, ChatIntent: chatIntent})
+	status := model.AgentGoalStatusPlanned
+	var confirmation *model.ActionConfirmation
+	var confirmationToken string
+	var confirmationExpiresAt *time.Time
+	if chatIntent.RequiresConfirmation {
+		status = model.AgentGoalStatusWaiting
+		token, err := randomURLToken(m.randomReader, 24)
+		if err != nil {
+			return receipt, errors.New("无法生成安全确认令牌")
+		}
+		expiresAt := now.Add(5 * time.Minute)
+		resources, _ := json.Marshal(chatIntent.ResourceIDs)
+		desired, _ := json.Marshal(chatIntent.DesiredState)
+		confirmation = &model.ActionConfirmation{Administrator: "administrator", TokenHash: hashOpaqueToken(token),
+			PayloadHash: chatIntentConfirmationHash(chatIntent), Resources: resources, Operation: chatIntent.Operation,
+			DesiredState: desired, Status: "pending", ExpiresAt: expiresAt}
+		confirmationToken, confirmationExpiresAt = token, &expiresAt
+	}
 	goal := model.AgentGoal{ConversationID: &conversationID, Title: truncateRunes(message, 80), Objective: message,
-		Status: model.AgentGoalStatusPlanned, Lane: model.AgentLaneInteractive, Priority: 100, RiskLevel: model.AgentRiskHigh, Source: "administrator",
+		Status: status, Lane: model.AgentLaneInteractive, Priority: 100, RiskLevel: chatIntent.RiskLevel, Source: "administrator",
 		Context: contextPayload, CreatedBy: "administrator"}
-	committedConversationID, err := m.store.EnqueueChatGoal(ctx, conversationID, message, &goal)
+	committedConversationID, err := m.store.EnqueueChatGoal(ctx, conversationID, message, &goal, confirmation)
 	if err != nil {
-		return conversationID, 0, 0, "", err
+		return receipt, err
 	}
 	conversationID = committedConversationID
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, "administrator_goal_created", "info", "administrator",
-		map[string]any{"conversation_id": conversationID, "lane": goal.Lane})
+		map[string]any{"conversation_id": conversationID, "lane": goal.Lane, "intent_type": chatIntent.IntentType,
+			"read_only": chatIntent.ReadOnly, "requires_confirmation": chatIntent.RequiresConfirmation})
+	if goal.Status == model.AgentGoalStatusPlanned {
+		m.wakeLane(model.AgentLaneInteractive)
+	}
+	return ChatReceipt{ConversationID: conversationID, GoalID: goal.ID, Status: goal.Status, Intent: chatIntent,
+		ConfirmationToken: confirmationToken, ConfirmationExpiresAt: confirmationExpiresAt}, nil
+}
+
+func (m *Manager) ConfirmChatGoal(ctx context.Context, goalID int64, token string) (ChatReceipt, error) {
+	goal, err := m.store.GetAgentGoal(ctx, goalID)
+	if err != nil {
+		return ChatReceipt{}, errors.New("待确认任务不存在")
+	}
+	var goalContext runtimeGoalContext
+	if err := json.Unmarshal(goal.Context, &goalContext); err != nil || !goalContext.ChatIntent.RequiresConfirmation || goalContext.ChatIntent.Confirmed {
+		return ChatReceipt{}, errors.New("任务不处于待确认状态")
+	}
+	goalContext.ChatIntent.Confirmed = true
+	confirmedContext, err := json.Marshal(goalContext)
+	if err != nil {
+		return ChatReceipt{}, err
+	}
+	confirmed, err := m.store.ConfirmAgentGoal(ctx, goalID, "administrator", hashOpaqueToken(strings.TrimSpace(token)),
+		chatIntentConfirmationHash(goalContext.ChatIntent), confirmedContext, time.Now().UTC())
+	if err != nil {
+		return ChatReceipt{}, err
+	}
+	m.appendRuntimeEvent(ctx, &goalID, nil, "administrator_confirmation_consumed", "warning", "administrator",
+		map[string]any{"intent_type": goalContext.ChatIntent.IntentType, "operation": goalContext.ChatIntent.Operation})
 	m.wakeLane(model.AgentLaneInteractive)
-	return conversationID, goal.ID, 0, goal.Status, nil
+	return ChatReceipt{ConversationID: derefInt64(confirmed.ConversationID), GoalID: goalID, Status: confirmed.Status,
+		Intent: goalContext.ChatIntent}, nil
+}
+
+func randomURLToken(reader io.Reader, size int) (string, error) {
+	if reader == nil {
+		reader = rand.Reader
+	}
+	buffer := make([]byte, size)
+	if _, err := io.ReadFull(reader, buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+func hashOpaqueToken(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(hash[:])
 }
 
 func (m *Manager) EnqueueAnalysisGoal(ctx context.Context, kind, trigger string, priority int) (model.AgentGoal, error) {
@@ -307,8 +391,19 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 	packetID := packet.ID
 	run := model.AgentRun{Kind: goalContext.Kind, Trigger: goalContext.Trigger, Status: "running", PacketID: &packetID,
 		ConversationID: goal.ConversationID, StartedAt: time.Now().UTC(), ActionsJSON: json.RawMessage("[]")}
-	if err := m.store.CreateAgentRun(leaseCtx, &run); err != nil {
-		return m.waitGoal(parent, &goal, err)
+	if goalContext.ChatIntent.IntentType == ChatIntentAmbiguous {
+		decision := ModelDecision{
+			Summary:    "需要管理员澄清请求",
+			Conclusion: goalContext.ChatIntent.Clarification,
+			Confidence: 1,
+			NoChange:   true,
+			Actions:    []AgentAction{},
+		}
+		m.appendRuntimeEvent(leaseCtx, &goal.ID, nil, "chat_intent_clarification_required", "info", "system", map[string]any{
+			"intent_type":   goalContext.ChatIntent.IntentType,
+			"clarification": goalContext.ChatIntent.Clarification,
+		})
+		return m.completeRuntimeGoal(parent, &goal, &run, packet, settings, goalContext, decision)
 	}
 	messages, sequence, lastFailure, failureCount, err := m.runtimeMessages(leaseCtx, goal, goalContext, packet, settings)
 	if err != nil {
@@ -348,7 +443,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 		if len(turn.ToolCalls) == 0 && turn.Decision != nil && len(turn.Decision.Actions) > 0 {
 			call, mapErr := decisionActionToolCall(turn.Decision.Actions[0], turn.Decision.Confidence)
 			if mapErr != nil {
-				if settings.Mode == model.AgentModeObserve {
+				if settings.OptimizerMode == model.AgentOptimizerObserve {
 					_ = m.store.RecordAgentObservation(parent, 1, 0, 1, 1)
 				}
 				messages = append(messages, RuntimeMessage{Role: "user", Content: "动作结构无效：" + mapErr.Error() + "。请重新规划或给出最终结论。"})
@@ -423,6 +518,28 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
+			if intentErr := enforceChatIntentCapability(goalContext.ChatIntent, call.Function.Name, arguments, spec.Mutating); intentErr != nil {
+				execution := CapabilityExecution{Capability: call.Function.Name, Status: "blocked", Message: "聊天意图约束拒绝执行：" + intentErr.Error()}
+				step := model.AgentStep{GoalID: goal.ID, Sequence: sequence, Capability: call.Function.Name, Arguments: arguments,
+					Status: model.AgentStepStatusFailed, RiskLevel: spec.RiskLevel,
+					IdempotencyKey: runtimeIdempotency(goal.ID, sequence, call.Function.Name, arguments), MaxAttempts: 1,
+					Preconditions: json.RawMessage("{}"), Compensation: json.RawMessage("{}"), BeforeState: json.RawMessage("{}"),
+					AfterState: json.RawMessage("{}"), Result: marshalRaw(execution), LastError: execution.Message}
+				if err := m.store.CreateAgentStep(leaseCtx, &step); err != nil {
+					m.finishRuntimeRun(parent, &run, "waiting", err)
+					return m.waitGoal(parent, &goal, err)
+				}
+				attempted := 0
+				if spec.Mutating {
+					attempted = 1
+				}
+				m.recordRuntimeObservation(parent, settings, attempted, 0, attempted, 1)
+				payload, _ := json.Marshal(execution)
+				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
+				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "chat_intent_capability_blocked", "error", "system", execution)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
+				continue
+			}
 			step := model.AgentStep{GoalID: goal.ID, Sequence: sequence, Capability: call.Function.Name, Arguments: arguments,
 				Status: model.AgentStepStatusRunning, RiskLevel: spec.RiskLevel, IdempotencyKey: runtimeIdempotency(goal.ID, sequence, call.Function.Name, arguments),
 				MaxAttempts: 1, Preconditions: json.RawMessage("{}"), Compensation: json.RawMessage("{}"), BeforeState: json.RawMessage("{}"),
@@ -460,7 +577,6 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				m.recordRuntimeObservation(parent, settings, 1, 0, 1, 1)
 				continue
 			}
-			dryRun := settings.Mode != model.AgentModeControl && spec.Mutating
 			adminGrant, grantErr := m.administratorGrantForInvocation(goalContext.AdminIntent, call.Function.Name, arguments)
 			if grantErr != nil {
 				execution := CapabilityExecution{Capability: call.Function.Name, Status: "blocked", Message: "管理员精确授权校验失败：" + grantErr.Error()}
@@ -471,13 +587,28 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "administrator_grant_blocked", "error", "system", execution)
 				continue
 			}
+			dryRun, modeErr := capabilityExecutionMode(settings, goalContext, call.Function.Name, spec, adminGrant)
+			if modeErr != nil {
+				execution := CapabilityExecution{Capability: call.Function.Name, Status: "blocked", Message: modeErr.Error()}
+				step.Status, step.LastError, step.Result = model.AgentStepStatusFailed, execution.Message, marshalRaw(execution)
+				_ = m.store.UpdateAgentStep(parent, step)
+				payload, _ := json.Marshal(execution)
+				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
+				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "capability_mode_blocked", "error", "system", execution)
+				continue
+			}
 			actor := "agent:v2"
 			if adminGrant != nil {
 				actor = "administrator:agent"
 			}
+			expiresAt := step.ExpiresAt
+			if goalContext.ChatIntent.ExpiresAt != nil {
+				value := goalContext.ChatIntent.ExpiresAt.UTC()
+				expiresAt = &value
+			}
 			invocation := CapabilityInvocation{Name: call.Function.Name, Arguments: arguments,
 				RunID: run.ID, GoalID: goal.ID, StepID: step.ID, Actor: actor, IdempotencyKey: step.IdempotencyKey,
-				AdministratorGrant: adminGrant, DryRun: dryRun, CreatedAt: step.CreatedAt, ExpiresAt: step.ExpiresAt,
+				AdministratorGrant: adminGrant, DryRun: dryRun, CreatedAt: step.CreatedAt, ExpiresAt: expiresAt,
 				SnapshotVersion: fmt.Sprintf("analysis_packet:%d:%s", packet.ID, packet.Hash),
 				EvidenceRefs:    []string{fmt.Sprintf("analysis_packet:%d:%s", packet.ID, packet.Hash)}}
 			if spec.Mutating && !dryRun {
@@ -542,6 +673,37 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			}
 		}
 		messages = compactRuntimeMessages(messages, settings.ContextTokenBudget, goal.Objective)
+	}
+}
+
+func capabilityExecutionMode(settings model.AgentSettings, goalContext runtimeGoalContext, capability string,
+	spec CapabilitySpec, grant *AdministratorGrant) (bool, error) {
+	if !spec.Mutating {
+		return false, nil
+	}
+	if grant != nil {
+		if settings.OperatorMode == model.AgentOperatorDisabled {
+			return false, errors.New("Agent Operator 已禁用，管理员写命令未执行")
+		}
+		return false, nil
+	}
+	switch capability {
+	case "propose_dispatch_policy", "update_dispatch_policy":
+		switch settings.OptimizerMode {
+		case model.AgentOptimizerObserve:
+			return true, nil
+		case model.AgentOptimizerPropose, model.AgentOptimizerAuto:
+			return false, nil
+		default:
+			return false, errors.New("Agent Optimizer 已禁用，策略提案未创建")
+		}
+	case "activate_policy_version":
+		return false, errors.New("模型不能直接激活策略；仅管理员确认或确定性低风险 auto gate 可以激活")
+	default:
+		if settings.OperatorMode != model.AgentOperatorDirect {
+			return false, errors.New("自主直接动作仅在 agent_operator_mode=direct 时允许")
+		}
+		return false, nil
 	}
 }
 
@@ -769,16 +931,13 @@ func (m *Manager) completeRuntimeGoal(ctx context.Context, goal *model.AgentGoal
 	run.Summary, run.Conclusion, run.Confidence = decision.Summary, decision.Conclusion, decision.Confidence
 	run.ActionsJSON, _ = json.Marshal(decision.Actions)
 	run.Status, run.CompletedAt = "completed", &now
-	if err := m.store.UpdateAgentRun(ctx, *run); err != nil {
-		return err
-	}
 	goal.Status, goal.CompletedAt, goal.LastError = model.AgentGoalStatusCompleted, &now, ""
 	if err := m.store.UpdateAgentGoal(ctx, *goal); err != nil {
 		return err
 	}
 	if goal.ConversationID != nil {
 		content := strings.TrimSpace(decision.Summary + "\n\n" + decision.Conclusion)
-		_ = m.store.AddAgentMessage(ctx, &model.AgentMessage{ConversationID: *goal.ConversationID, Role: "assistant", Content: content, RunID: &run.ID})
+		_ = m.store.AddAgentMessage(ctx, &model.AgentMessage{ConversationID: *goal.ConversationID, Role: "assistant", Content: content})
 	}
 	if goalContext.Kind == model.AgentRunDaily {
 		m.saveDailyReport(ctx, *run, packet, decision, goalContext.ReportDate)
@@ -786,9 +945,9 @@ func (m *Manager) completeRuntimeGoal(ctx context.Context, goal *model.AgentGoal
 	m.advanceSchedule(ctx, settings, goalContext.Kind, now)
 	memory := model.AgentMemory{ScopeType: "goal", ScopeID: fmt.Sprint(goal.ID), Kind: model.AgentMemoryEpisodic,
 		Key: "outcome", Summary: truncateRunes(decision.Summary, 300), Content: marshalRaw(map[string]any{"conclusion": decision.Conclusion,
-			"confidence": decision.Confidence, "run_id": run.ID}), Importance: .6}
+			"confidence": decision.Confidence, "goal_id": goal.ID}), Importance: .6}
 	_ = m.store.UpsertAgentMemory(ctx, &memory)
-	m.appendRuntimeEvent(ctx, &goal.ID, nil, "goal_completed", "info", "agent", map[string]any{"run_id": run.ID, "summary": decision.Summary})
+	m.appendRuntimeEvent(ctx, &goal.ID, nil, "goal_completed", "info", "agent", map[string]any{"summary": decision.Summary})
 	return nil
 }
 
@@ -821,7 +980,7 @@ func (m *Manager) runtimeFreezeError(ctx context.Context) error {
 }
 
 func (m *Manager) finishRuntimeRun(ctx context.Context, run *model.AgentRun, status string, cause error) {
-	if run == nil || run.ID <= 0 {
+	if run == nil {
 		return
 	}
 	now := time.Now().UTC()
@@ -829,7 +988,6 @@ func (m *Manager) finishRuntimeRun(ctx context.Context, run *model.AgentRun, sta
 	if cause != nil {
 		run.Error = truncateRunes(cause.Error(), 1000)
 	}
-	_ = m.store.UpdateAgentRun(ctx, *run)
 }
 
 func (m *Manager) checkpointRuntimeYield(ctx context.Context, goal *model.AgentGoal, run *model.AgentRun,
@@ -855,7 +1013,7 @@ func (m *Manager) checkpointRuntimeYield(ctx context.Context, goal *model.AgentG
 
 func (m *Manager) recordRuntimeObservation(ctx context.Context, settings model.AgentSettings,
 	proposed, executable, violations, structureErrors int) {
-	if settings.Mode != model.AgentModeObserve {
+	if settings.OptimizerMode != model.AgentOptimizerObserve {
 		return
 	}
 	_ = m.store.RecordAgentObservation(ctx, proposed, executable, violations, structureErrors)
@@ -963,10 +1121,6 @@ func (m *Manager) executeScheduledCommand(ctx context.Context, command model.Sch
 	}
 	run := model.AgentRun{Kind: model.AgentRunManual, Trigger: fmt.Sprintf("持久定时命令 #%d", command.ID), Status: "acting",
 		StartedAt: time.Now().UTC(), ActionsJSON: json.RawMessage("[]")}
-	if err := m.store.CreateAgentRun(ctx, &run); err != nil {
-		_, _ = m.store.FailScheduledCommand(ctx, command.ID, m.workerID, err.Error(), nil)
-		return
-	}
 	invocation := CapabilityInvocation{Name: command.Capability, Arguments: command.Arguments,
 		RunID: run.ID, GoalID: derefInt64(command.GoalID), StepID: derefInt64(command.StepID), Actor: command.CreatedBy,
 		IdempotencyKey: command.IdempotencyKey, AdministratorGrant: conditions.AdministratorGrant,
@@ -978,7 +1132,6 @@ func (m *Manager) executeScheduledCommand(ctx context.Context, command model.Sch
 		_, _ = m.store.FailScheduledCommand(ctx, command.ID, m.workerID, "写入动作基线保存失败，已拒绝执行: "+err.Error(), nil)
 		now := time.Now().UTC()
 		run.Status, run.Error, run.CompletedAt = "failed", err.Error(), &now
-		_ = m.store.UpdateAgentRun(ctx, run)
 		return
 	}
 	execution, execErr := m.ExecuteCapability(ctx, invocation)
@@ -993,7 +1146,6 @@ func (m *Manager) executeScheduledCommand(ctx context.Context, command model.Sch
 				"能力执行前检测到自动化冻结，未发生外部写入", now.Add(30*time.Second))
 			run.Status, run.Error, run.CompletedAt = "waiting", execErr.Error(), &now
 			m.appendRuntimeEvent(ctx, command.GoalID, command.StepID, "scheduled_command_deferred_by_freeze", "warning", "system", execution)
-			_ = m.store.UpdateAgentRun(ctx, run)
 			return
 		} else if execution.Retryable {
 			uncertainAt := now
@@ -1007,7 +1159,6 @@ func (m *Manager) executeScheduledCommand(ctx context.Context, command model.Sch
 		run.Status, run.Error, run.CompletedAt = "failed", execErr.Error(), &now
 		m.appendRuntimeEvent(ctx, command.GoalID, command.StepID, "scheduled_command_failed", "error", "agent", execution)
 	}
-	_ = m.store.UpdateAgentRun(ctx, run)
 }
 
 func isAutomationFreezeError(err error) bool {
@@ -1058,7 +1209,7 @@ func severityForExecution(execution CapabilityExecution) string {
 }
 
 func (m *Manager) recordObservationModelError(ctx context.Context, settings model.AgentSettings, err error) {
-	if settings.Mode != model.AgentModeObserve || err == nil {
+	if settings.OptimizerMode != model.AgentOptimizerObserve || err == nil {
 		return
 	}
 	message := strings.ToLower(err.Error())

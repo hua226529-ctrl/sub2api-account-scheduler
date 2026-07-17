@@ -51,6 +51,81 @@ func TestTelemetryMigrationHistoryAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestTrafficRequestStartMigrationAndRestartAttribution(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "scheduler.db")
+	database, err := Open(path, testSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Date(2026, 7, 18, 8, 0, 0, 0, time.UTC)
+	createdAt := startedAt.Add(20 * time.Second)
+	inserted, err := database.InsertTrafficBatch(ctx,
+		[]model.TrafficSuccess{{EventKey: "with-start", AccountID: 225, RequestStartedAt: &startedAt, CreatedAt: createdAt}},
+		[]model.TrafficError{{EventKey: "without-start", AccountID: 225, ErrorClass: model.ErrorClassInfrastructure, CreatedAt: createdAt.Add(time.Second)}})
+	if err != nil || inserted != 2 {
+		t.Fatalf("inserted=%d err=%v", inserted, err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = Open(path, testSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	items, err := database.ListGroupValidationEvidence(ctx, nil, []int64{225}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].RequestStartedAt == nil || !items[0].RequestStartedAt.Equal(startedAt) || items[0].TimeBasis != model.EvidenceTimeBasisRequestStart {
+		t.Fatalf("request start was not preserved across restart: %+v", items)
+	}
+	if items[1].RequestStartedAt != nil || items[1].TimeBasis != model.EvidenceTimeBasisCompletion {
+		t.Fatalf("missing request start was invented: %+v", items[1])
+	}
+}
+
+func TestTrafficRequestStartColumnMigratesFromStageCPreHardeningSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scheduler.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE traffic_events (
+		event_key TEXT PRIMARY KEY, account_id INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '',
+		requested_model TEXT NOT NULL DEFAULT '', upstream_model TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+		duration_ms INTEGER NOT NULL DEFAULT 0, request_kind TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT '',
+		error_type TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '', status_code INTEGER NOT NULL DEFAULT 0,
+		error_class TEXT NOT NULL DEFAULT '', reason_code TEXT NOT NULL DEFAULT '', reason_fingerprint TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL, ingested_at TEXT NOT NULL)`)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 1; pass <= 2; pass++ {
+		database, err := Open(path, testSettings())
+		if err != nil {
+			t.Fatalf("migration pass %d: %v", pass, err)
+		}
+		var count int
+		if err := database.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('traffic_events') WHERE name='request_started_at'`).Scan(&count); err != nil {
+			database.Close()
+			t.Fatal(err)
+		}
+		if count != 1 {
+			database.Close()
+			t.Fatalf("migration pass %d request_started_at columns=%d", pass, count)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestTrafficIdempotencyAggregationAndRetention(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(filepath.Join(t.TempDir(), "scheduler.db"), testSettings())

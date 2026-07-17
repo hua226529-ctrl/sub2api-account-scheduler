@@ -79,7 +79,7 @@ func TestFakeSub2APIGroupTransitionSupportsIdempotencyAndReadback(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ID != second.ID || second.Status != model.GroupTransitionCompleted {
+	if first.ID != second.ID || second.Status != model.GroupTransitionApplied {
 		t.Fatalf("idempotent transitions differ: first=%+v second=%+v", first, second)
 	}
 	tier, err := api.ReadGroupTier(context.Background(), 9, "token-1")
@@ -102,6 +102,7 @@ func TestTempDatabaseCountsRealSQLOperationsAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings.DryRun = true
+	settings.SchedulerMode = model.SchedulerModeObserve
 	if err := database.Store.UpdateSettings(ctx, settings); err != nil {
 		t.Fatal(err)
 	}

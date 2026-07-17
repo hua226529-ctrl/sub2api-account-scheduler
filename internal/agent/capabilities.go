@@ -3,25 +3,43 @@ package agent
 import (
 	"encoding/json"
 	"sort"
+	"time"
+
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
 
 // CapabilitySpec is the complete surface visible to the model. There is no
 // generic HTTP, SQL, filesystem or command capability by design.
 type CapabilitySpec struct {
-	Name                 string         `json:"name"`
-	Version              int            `json:"-"`
-	VersionLabel         string         `json:"version"`
-	Title                string         `json:"title"`
-	Description          string         `json:"description"`
-	RiskLevel            string         `json:"risk_level"`
-	Mutating             bool           `json:"mutating"`
-	AdministratorDirect  bool           `json:"administrator_direct"`
-	Parameters           map[string]any `json:"input_schema"`
-	Scopes               []string       `json:"scopes"`
-	AutoExecutable       bool           `json:"auto_executable"`
-	ApprovalRequired     bool           `json:"approval_required"`
-	SupportsSchedule     bool           `json:"supports_schedule"`
-	SupportsCompensation bool           `json:"supports_compensation"`
+	Name                 string          `json:"name"`
+	Version              int             `json:"-"`
+	VersionLabel         string          `json:"version"`
+	Title                string          `json:"title"`
+	Description          string          `json:"description"`
+	RiskLevel            string          `json:"risk_level"`
+	Mutating             bool            `json:"mutating"`
+	AdministratorDirect  bool            `json:"administrator_direct"`
+	Parameters           map[string]any  `json:"input_schema"`
+	Scopes               []string        `json:"scopes"`
+	AutoExecutable       bool            `json:"auto_executable"`
+	ApprovalRequired     bool            `json:"approval_required"`
+	SupportsSchedule     bool            `json:"supports_schedule"`
+	SupportsCompensation bool            `json:"supports_compensation"`
+	ExecutionPolicy      ExecutionPolicy `json:"execution_policy"`
+}
+
+type ExecutionPolicy struct {
+	Risk                  string `json:"risk"`
+	ReadOnly              bool   `json:"read_only"`
+	SupportsAutonomous    bool   `json:"supports_autonomous"`
+	RequiresExactGrant    bool   `json:"requires_exact_grant"`
+	RequiresConfirmation  bool   `json:"requires_confirmation"`
+	RequiresFreshSnapshot bool   `json:"requires_fresh_snapshot"`
+	RequiresEvidence      bool   `json:"requires_evidence"`
+	SupportsScheduling    bool   `json:"supports_scheduling"`
+	MaxScope              int    `json:"max_scope"`
+	DefaultTTLSeconds     int64  `json:"default_ttl_seconds"`
+	MaxTTLSeconds         int64  `json:"max_ttl_seconds"`
 }
 
 var capabilityRegistry = map[string]CapabilitySpec{}
@@ -47,9 +65,11 @@ func init() {
 	registerCapability("search_memory", "查询最近90天的智能体记忆", "read_only", false, false,
 		objectSchema(map[string]any{"query": stringSchema(), "limit": integerSchema(1)}, []string{"query"}))
 
-	registerCapability("pause_account", "暂停一个 Sub2API 账号并回读确认", "high", true, true,
-		objectSchema(map[string]any{"account_id": integerSchema(1), "reason": stringSchema()}, []string{"account_id", "reason"}))
-	registerCapability("resume_account", "恢复一个 Sub2API 账号并回读确认", "high", true, true,
+	registerCapability("pause_account", "临时暂停一个 Sub2API 账号并回读确认", "high", true, true,
+		objectSchema(map[string]any{"account_id": integerSchema(1), "expires_at": dateTimeSchema(), "reason": stringSchema()}, []string{"account_id", "reason"}))
+	registerCapability("resume_account", "临时恢复一个 Sub2API 账号并回读确认", "high", true, true,
+		objectSchema(map[string]any{"account_id": integerSchema(1), "expires_at": dateTimeSchema(), "reason": stringSchema()}, []string{"account_id", "reason"}))
+	registerCapability("manual_hold_account", "永久暂停一个账号，直到管理员显式解除", "critical", true, true,
 		objectSchema(map[string]any{"account_id": integerSchema(1), "reason": stringSchema()}, []string{"account_id", "reason"}))
 	registerCapability("set_load_factor", "设置账号负载系数，空值表示恢复上游默认", "medium", true, true,
 		objectSchema(map[string]any{"account_id": integerSchema(1), "load_factor": nullableIntegerSchema(1, 100), "reason": stringSchema()}, []string{"account_id", "reason"}))
@@ -69,19 +89,22 @@ func init() {
 		objectSchema(map[string]any{"source_id": integerSchema(1), "reason": stringSchema()}, []string{"source_id", "reason"}))
 	registerCapability("transition_token_group_tier", "在已确认策略内切换令牌主、备用或紧急分组", "critical", true, true,
 		objectSchema(map[string]any{"source_id": integerSchema(1), "key_id": stringSchema(), "target_tier": enumSchema("main", "backup", "emergency"), "confidence": numberRangeSchema(0, 1), "reason": stringSchema()}, []string{"source_id", "key_id", "target_tier", "reason"}))
-	registerCapability("update_dispatch_policy", "创建并立即激活结构化调度策略版本", "critical", true, true,
+	registerCapability("propose_dispatch_policy", "创建、验证并模拟类型化调度策略提案，不立即激活", "medium", true, true,
+		objectSchema(map[string]any{"scope_type": enumSchema("global", "pool", "account"), "scope_id": stringSchema(), "config": map[string]any{"type": "object"}, "reason": stringSchema()}, []string{"scope_type", "config", "reason"}))
+	registerCapability("update_dispatch_policy", "兼容别名：创建策略提案，不立即激活", "medium", true, true,
 		objectSchema(map[string]any{"scope_type": enumSchema("global", "pool", "account"), "scope_id": stringSchema(), "config": map[string]any{"type": "object"}, "reason": stringSchema()}, []string{"scope_type", "config", "reason"}))
 	registerCapability("activate_policy_version", "激活一个已有调度策略版本", "critical", true, true,
 		objectSchema(map[string]any{"policy_id": integerSchema(1), "reason": stringSchema()}, []string{"policy_id", "reason"}))
 	registerCapability("trigger_reconcile", "立即触发一次确定性协调", "low", true, true,
 		objectSchema(map[string]any{"reason": stringSchema()}, []string{"reason"}))
 	registerCapability("schedule_command", "创建北京时间持久化定时业务命令", "high", true, true,
-		objectSchema(map[string]any{"capability": stringSchema(), "arguments": map[string]any{"type": "object"}, "execute_at": dateTimeSchema(), "timezone": stringSchema(), "expires_at": map[string]any{"type": []string{"string", "null"}, "format": "date-time"}, "reason": stringSchema()}, []string{"capability", "arguments", "execute_at", "reason"}))
+		objectSchema(map[string]any{"capability": stringSchema(), "arguments": map[string]any{"type": "object"}, "execute_at": dateTimeSchema(), "timezone": stringSchema(), "expires_at": map[string]any{"type": []string{"string", "null"}, "format": "date-time"}, "missed_policy": enumSchema("skip", "catch_up_once"), "reason": stringSchema()}, []string{"capability", "arguments", "execute_at", "missed_policy", "reason"}))
 	registerCapability("cancel_scheduled_command", "取消尚未完成的定时命令", "medium", true, true,
 		objectSchema(map[string]any{"command_id": integerSchema(1), "reason": stringSchema()}, []string{"command_id", "reason"}))
 }
 
-func registerCapability(name, description, risk string, mutating, administratorDirect bool, parameters map[string]any) {
+func registerCapability(name, description, _ string, mutating, administratorDirect bool, parameters map[string]any) {
+	policy := executionPolicyFor(name, mutating, administratorDirect)
 	scopes := []string{"scheduler"}
 	if mutating {
 		scopes = append(scopes, "write")
@@ -89,9 +112,41 @@ func registerCapability(name, description, risk string, mutating, administratorD
 		scopes = append(scopes, "read")
 	}
 	capabilityRegistry[name] = CapabilitySpec{Name: name, Version: 1, VersionLabel: "v1", Title: name,
-		Description: description, RiskLevel: risk, Mutating: mutating, AdministratorDirect: administratorDirect,
-		Parameters: parameters, Scopes: scopes, AutoExecutable: true, ApprovalRequired: false,
-		SupportsSchedule: mutating, SupportsCompensation: mutating}
+		Description: description, RiskLevel: policy.Risk, Mutating: mutating, AdministratorDirect: administratorDirect,
+		Parameters: parameters, Scopes: scopes, AutoExecutable: policy.ReadOnly || (policy.SupportsAutonomous && !policy.RequiresConfirmation),
+		ApprovalRequired: policy.RequiresConfirmation, SupportsSchedule: policy.SupportsScheduling,
+		SupportsCompensation: mutating, ExecutionPolicy: policy}
+}
+
+func executionPolicyFor(name string, mutating, administratorDirect bool) ExecutionPolicy {
+	if !mutating {
+		return ExecutionPolicy{Risk: "read_only", ReadOnly: true, SupportsAutonomous: true, MaxScope: 100}
+	}
+	policy := ExecutionPolicy{Risk: model.AgentRiskHigh, RequiresExactGrant: administratorDirect,
+		RequiresFreshSnapshot: true, SupportsScheduling: true, MaxScope: 1}
+	switch name {
+	case "pause_account", "resume_account", "set_load_factor", "pin_load_until":
+		policy.SupportsAutonomous, policy.RequiresEvidence = true, true
+		policy.DefaultTTLSeconds, policy.MaxTTLSeconds = int64((15*time.Minute)/time.Second), int64((2*time.Hour)/time.Second)
+	case "manual_hold_account", "clear_manual_override", "clear_load_pin":
+		policy.Risk, policy.RequiresConfirmation = model.AgentRiskCritical, true
+	case "propose_dispatch_policy", "update_dispatch_policy":
+		policy.Risk, policy.SupportsAutonomous, policy.RequiresEvidence = model.AgentRiskMedium, true, true
+		policy.RequiresExactGrant, policy.SupportsScheduling, policy.MaxScope = false, false, 100
+	case "activate_policy_version":
+		policy.Risk, policy.SupportsAutonomous, policy.RequiresConfirmation = model.AgentRiskCritical, false, true
+		policy.SupportsScheduling = false
+	case "transition_token_group_tier":
+		policy.Risk, policy.SupportsAutonomous, policy.RequiresEvidence, policy.RequiresConfirmation = model.AgentRiskCritical, true, true, true
+		policy.DefaultTTLSeconds, policy.MaxTTLSeconds = int64((15*time.Minute)/time.Second), int64((2*time.Hour)/time.Second)
+	case "schedule_command":
+		policy.Risk, policy.RequiresConfirmation, policy.SupportsScheduling = model.AgentRiskCritical, true, false
+	case "trigger_reconcile":
+		policy.Risk, policy.SupportsAutonomous, policy.RequiresFreshSnapshot = model.AgentRiskLow, true, false
+	case "refresh_upstream":
+		policy.Risk, policy.SupportsAutonomous = model.AgentRiskMedium, true
+	}
+	return policy
 }
 
 func CapabilitySpecs() []CapabilitySpec {

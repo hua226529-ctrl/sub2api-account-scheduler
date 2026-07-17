@@ -13,7 +13,10 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
 
-var ErrAdministratorGrantAlreadyConsumed = errors.New("administrator grant was already consumed by another step")
+var (
+	ErrAdministratorGrantAlreadyConsumed   = errors.New("administrator grant was already consumed by another step")
+	ErrScheduledCommandIdempotencyConflict = errors.New("scheduled command idempotency conflict")
+)
 
 func (s *Store) migrateAgentV2(ctx context.Context) error {
 	statements := []string{
@@ -126,11 +129,19 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			capability TEXT NOT NULL,
 			arguments_json TEXT NOT NULL DEFAULT '{}',
 			conditions_json TEXT NOT NULL DEFAULT '{}',
+			intent_type TEXT NOT NULL DEFAULT 'scheduled_action',
+			resource_type TEXT NOT NULL DEFAULT '',
+			resource_ids_json TEXT NOT NULL DEFAULT '[]',
+			operation TEXT NOT NULL DEFAULT '',
+			desired_state_json TEXT NOT NULL DEFAULT '{}',
 			status TEXT NOT NULL,
 			timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
 			execute_at TEXT NOT NULL,
 			expires_at TEXT,
 			idempotency_key TEXT NOT NULL UNIQUE,
+			occurrence_id TEXT NOT NULL DEFAULT '',
+			missed_policy TEXT NOT NULL DEFAULT 'catch_up_once',
+			authority TEXT NOT NULL DEFAULT '',
 			lease_owner TEXT NOT NULL DEFAULT '',
 			lease_until TEXT,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -168,6 +179,23 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			consumed_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_admin_grants_consumed_at ON agent_administrator_grant_consumptions(consumed_at)`,
+		`CREATE TABLE IF NOT EXISTS action_confirmations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			goal_id INTEGER NOT NULL,
+			administrator TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			payload_hash TEXT NOT NULL,
+			resources_json TEXT NOT NULL DEFAULT '[]',
+			operation TEXT NOT NULL,
+			desired_state_json TEXT NOT NULL DEFAULT '{}',
+			proposal_id INTEGER,
+			status TEXT NOT NULL DEFAULT 'pending',
+			expires_at TEXT NOT NULL,
+			consumed_at TEXT,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(goal_id) REFERENCES agent_goals(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_action_confirmations_goal_status ON action_confirmations(goal_id,status,expires_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -184,6 +212,14 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 		{table: "agent_goals", name: "lease_owner"},
 		{table: "agent_goals", name: "lease_until"},
 		{table: "agent_goals", name: "next_runnable_at"},
+		{table: "agent_scheduled_commands", name: "intent_type"},
+		{table: "agent_scheduled_commands", name: "resource_type"},
+		{table: "agent_scheduled_commands", name: "resource_ids_json"},
+		{table: "agent_scheduled_commands", name: "operation"},
+		{table: "agent_scheduled_commands", name: "desired_state_json"},
+		{table: "agent_scheduled_commands", name: "occurrence_id"},
+		{table: "agent_scheduled_commands", name: "missed_policy"},
+		{table: "agent_scheduled_commands", name: "authority"},
 	} {
 		definition := "TEXT"
 		if column.table == "agent_goals" && column.name == "lane" {
@@ -191,6 +227,18 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 		}
 		if column.table == "agent_goals" && column.name == "lease_owner" {
 			definition = "TEXT NOT NULL DEFAULT ''"
+		}
+		switch column.name {
+		case "intent_type":
+			definition = "TEXT NOT NULL DEFAULT 'scheduled_action'"
+		case "resource_type", "operation", "occurrence_id", "authority":
+			definition = "TEXT NOT NULL DEFAULT ''"
+		case "resource_ids_json":
+			definition = "TEXT NOT NULL DEFAULT '[]'"
+		case "desired_state_json":
+			definition = "TEXT NOT NULL DEFAULT '{}'"
+		case "missed_policy":
+			definition = "TEXT NOT NULL DEFAULT 'catch_up_once'"
 		}
 		if err := s.ensureColumn(ctx, column.table, column.name, definition); err != nil {
 			return err
@@ -204,6 +252,12 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 	}
 	if err := s.backfillAgentV2MutationAttempts(ctx); err != nil {
 		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE agent_scheduled_commands SET occurrence_id=idempotency_key WHERE occurrence_id=''`); err != nil {
+		return fmt.Errorf("backfill scheduled occurrence identity: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_commands_occurrence ON agent_scheduled_commands(occurrence_id) WHERE occurrence_id<>''`); err != nil {
+		return fmt.Errorf("create scheduled occurrence index: %w", err)
 	}
 	now := formatTime(time.Now().UTC())
 	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_freeze_states(scope_type,scope_id,mode,reason,actor,created_at,updated_at)
@@ -1131,6 +1185,27 @@ func (s *Store) CreateScheduledCommand(ctx context.Context, item *model.Schedule
 	if item.MaxAttempts < 1 || item.MaxAttempts > 100 {
 		return errors.New("scheduled command max attempts must be between 1 and 100")
 	}
+	if item.IntentType == "" {
+		item.IntentType = "scheduled_action"
+	}
+	if item.IntentType != "scheduled_action" {
+		return errors.New("invalid scheduled command intent type")
+	}
+	if item.MissedPolicy == "" {
+		item.MissedPolicy = "catch_up_once"
+	}
+	if item.MissedPolicy != "skip" && item.MissedPolicy != "catch_up_once" {
+		return errors.New("invalid scheduled command missed policy")
+	}
+	if item.MissedPolicy == "skip" && item.ExpiresAt == nil {
+		return errors.New("skip missed policy requires an expiry window")
+	}
+	if item.OccurrenceID == "" {
+		item.OccurrenceID = item.IdempotencyKey
+	}
+	if item.Authority == "" {
+		item.Authority = "autonomous_agent"
+	}
 	item.Arguments, err = normalizedJSON(item.Arguments)
 	if err != nil {
 		return fmt.Errorf("arguments: %w", err)
@@ -1143,6 +1218,14 @@ func (s *Store) CreateScheduledCommand(ctx context.Context, item *model.Schedule
 	if err != nil {
 		return fmt.Errorf("result: %w", err)
 	}
+	item.ResourceIDs, err = normalizedJSONArray(item.ResourceIDs)
+	if err != nil {
+		return fmt.Errorf("resource ids: %w", err)
+	}
+	item.DesiredState, err = normalizedJSON(item.DesiredState)
+	if err != nil {
+		return fmt.Errorf("desired state: %w", err)
+	}
 	if item.CreatedBy == "" {
 		item.CreatedBy = "system"
 	}
@@ -1152,11 +1235,11 @@ func (s *Store) CreateScheduledCommand(ctx context.Context, item *model.Schedule
 	}
 	item.UpdatedAt = now
 	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_scheduled_commands(goal_id,step_id,capability,
-		arguments_json,conditions_json,status,timezone,execute_at,expires_at,idempotency_key,lease_owner,lease_until,
+		arguments_json,conditions_json,intent_type,resource_type,resource_ids_json,operation,desired_state_json,status,timezone,execute_at,expires_at,idempotency_key,occurrence_id,missed_policy,authority,lease_owner,lease_until,
 		attempt_count,max_attempts,mutation_attempted_at,result_json,last_error,created_by,created_at,updated_at,completed_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.GoalID, item.StepID, item.Capability, string(item.Arguments),
-		string(item.Conditions), item.Status, item.Timezone, formatTime(item.ExecuteAt), formatOptionalTime(item.ExpiresAt),
-		item.IdempotencyKey, "", nil, 0, item.MaxAttempts, formatOptionalTime(item.MutationAttemptedAt), string(item.Result), item.LastError, item.CreatedBy,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.GoalID, item.StepID, item.Capability, string(item.Arguments),
+		string(item.Conditions), item.IntentType, item.ResourceType, string(item.ResourceIDs), item.Operation, string(item.DesiredState), item.Status, item.Timezone, formatTime(item.ExecuteAt), formatOptionalTime(item.ExpiresAt),
+		item.IdempotencyKey, item.OccurrenceID, item.MissedPolicy, item.Authority, "", nil, 0, item.MaxAttempts, formatOptionalTime(item.MutationAttemptedAt), string(item.Result), item.LastError, item.CreatedBy,
 		formatTime(item.CreatedAt), formatTime(item.UpdatedAt), nil)
 	if err != nil {
 		return err
@@ -1172,6 +1255,9 @@ func (s *Store) CreateScheduledCommand(ctx context.Context, item *model.Schedule
 	existing, err := s.GetScheduledCommandByIdempotencyKey(ctx, item.IdempotencyKey)
 	if err != nil {
 		return err
+	}
+	if !sameScheduledCommandSemantics(existing, *item) {
+		return ErrScheduledCommandIdempotencyConflict
 	}
 	*item = existing
 	return nil
@@ -1578,8 +1664,8 @@ func (s *Store) CancelScheduledCommand(ctx context.Context, id int64, actor, rea
 	return nil
 }
 
-const scheduledCommandSelect = `SELECT id,goal_id,step_id,capability,arguments_json,conditions_json,status,timezone,
-	execute_at,expires_at,idempotency_key,lease_owner,lease_until,attempt_count,max_attempts,mutation_attempted_at,result_json,last_error,
+const scheduledCommandSelect = `SELECT id,goal_id,step_id,capability,arguments_json,conditions_json,intent_type,resource_type,resource_ids_json,operation,desired_state_json,status,timezone,
+	execute_at,expires_at,idempotency_key,occurrence_id,missed_policy,authority,lease_owner,lease_until,attempt_count,max_attempts,mutation_attempted_at,result_json,last_error,
 	created_by,created_at,updated_at,completed_at FROM agent_scheduled_commands`
 
 type scheduledCommandScanner interface {
@@ -1589,22 +1675,48 @@ type scheduledCommandScanner interface {
 func scanScheduledCommand(scanner scheduledCommandScanner) (model.ScheduledCommand, error) {
 	var item model.ScheduledCommand
 	var goalID, stepID sql.NullInt64
-	var arguments, conditions, result, executeAt, createdAt, updatedAt string
+	var arguments, conditions, resourceIDs, desiredState, result, executeAt, createdAt, updatedAt string
 	var expiresAt, leaseUntil, mutationAttemptedAt, completedAt sql.NullString
-	err := scanner.Scan(&item.ID, &goalID, &stepID, &item.Capability, &arguments, &conditions, &item.Status,
-		&item.Timezone, &executeAt, &expiresAt, &item.IdempotencyKey, &item.LeaseOwner, &leaseUntil,
+	err := scanner.Scan(&item.ID, &goalID, &stepID, &item.Capability, &arguments, &conditions, &item.IntentType, &item.ResourceType, &resourceIDs, &item.Operation, &desiredState, &item.Status,
+		&item.Timezone, &executeAt, &expiresAt, &item.IdempotencyKey, &item.OccurrenceID, &item.MissedPolicy, &item.Authority, &item.LeaseOwner, &leaseUntil,
 		&item.AttemptCount, &item.MaxAttempts, &mutationAttemptedAt, &result, &item.LastError, &item.CreatedBy, &createdAt, &updatedAt,
 		&completedAt)
 	if err != nil {
 		return item, err
 	}
 	item.GoalID, item.StepID = nullableInt64(goalID), nullableInt64(stepID)
-	item.Arguments, item.Conditions, item.Result = json.RawMessage(arguments), json.RawMessage(conditions), json.RawMessage(result)
+	item.Arguments, item.Conditions, item.ResourceIDs, item.DesiredState, item.Result = json.RawMessage(arguments), json.RawMessage(conditions), json.RawMessage(resourceIDs), json.RawMessage(desiredState), json.RawMessage(result)
 	item.ExecuteAt, item.ExpiresAt = parseTime(executeAt), parseNullableTime(expiresAt)
 	item.MutationAttemptedAt = parseNullableTime(mutationAttemptedAt)
 	item.LeaseUntil, item.CompletedAt = parseNullableTime(leaseUntil), parseNullableTime(completedAt)
 	item.CreatedAt, item.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
 	return item, nil
+}
+
+func normalizedJSONArray(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage("[]"), nil
+	}
+	var value []any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, errors.New("must be a JSON array")
+	}
+	return json.Marshal(value)
+}
+
+func sameScheduledCommandSemantics(left, right model.ScheduledCommand) bool {
+	return left.Capability == right.Capability && string(left.Arguments) == string(right.Arguments) &&
+		string(left.Conditions) == string(right.Conditions) && left.IntentType == right.IntentType && left.ResourceType == right.ResourceType &&
+		string(left.ResourceIDs) == string(right.ResourceIDs) && left.Operation == right.Operation && string(left.DesiredState) == string(right.DesiredState) &&
+		left.Timezone == right.Timezone && left.ExecuteAt.Equal(right.ExecuteAt) && equalOptionalTime(left.ExpiresAt, right.ExpiresAt) &&
+		left.OccurrenceID == right.OccurrenceID && left.MissedPolicy == right.MissedPolicy && left.Authority == right.Authority && left.CreatedBy == right.CreatedBy
+}
+
+func equalOptionalTime(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Equal(*right)
 }
 
 func (s *Store) SetAgentFreezeState(ctx context.Context, item *model.AgentFreezeState) error {

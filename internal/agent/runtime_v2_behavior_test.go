@@ -130,7 +130,7 @@ func TestCharacterizationScheduledCommandPersistsExactAdministratorGrant(t *test
 	outerGrant := mintAdministratorGrant(administratorCommandHash("scheduled-test-scope"), commandHash,
 		"scheduled", "schedule_command", arguments,
 		[]string{"global:scheduler"}, "trigger_reconcile", targetArguments, []string{"global:scheduler"})
-	_, retryable, err := manager.executeMutationCapability(ctx, CapabilityInvocation{
+	output, retryable, err := manager.executeMutationCapability(ctx, CapabilityInvocation{
 		Name:               "schedule_command",
 		Arguments:          arguments,
 		Actor:              "administrator:agent",
@@ -144,7 +144,11 @@ func TestCharacterizationScheduledCommandPersistsExactAdministratorGrant(t *test
 		t.Fatal("local scheduled-command persistence was unexpectedly marked retryable")
 	}
 
-	command, err := database.GetScheduledCommandByIdempotencyKey(ctx, idempotencyKey)
+	created, ok := output.(model.ScheduledCommand)
+	if !ok || created.OccurrenceID == "" || created.IdempotencyKey != created.OccurrenceID {
+		t.Fatalf("scheduled command did not return a stable occurrence identity: %#v", output)
+	}
+	command, err := database.GetScheduledCommandByIdempotencyKey(ctx, created.OccurrenceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +300,7 @@ func TestCharacterizationRuntimeMessagesAdvancePastStepsCreatedAfterCheckpoint(t
 	}
 }
 
-func TestCheckpointRuntimeYieldClosesRunAndWaitsGoal(t *testing.T) {
+func TestCheckpointRuntimeYieldWaitsGoalWithoutWritingLegacyRun(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
@@ -314,9 +318,6 @@ func TestCheckpointRuntimeYieldClosesRunAndWaitsGoal(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := model.AgentRun{Kind: model.AgentRunChat, Trigger: "freeze", Status: "running", StartedAt: time.Now().UTC(), ActionsJSON: json.RawMessage("[]")}
-	if err := database.CreateAgentRun(ctx, &run); err != nil {
-		t.Fatal(err)
-	}
 	manager := &Manager{store: database, interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1)}
 	cause := errors.New("智能体已被冻结")
 	gotErr := manager.checkpointRuntimeYield(ctx, &goal, &run,
@@ -337,8 +338,8 @@ func TestCheckpointRuntimeYieldClosesRunAndWaitsGoal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runs) != 1 || runs[0].Status != "waiting" || runs[0].CompletedAt == nil || runs[0].Error != cause.Error() {
-		t.Fatalf("run remained active after yield: %+v", runs)
+	if len(runs) != 0 {
+		t.Fatalf("runtime v2 wrote the legacy agent_runs table: %+v", runs)
 	}
 	checkpoint, err := database.LatestAgentCheckpoint(ctx, goal.ID)
 	if err != nil || len(checkpoint.State) == 0 {
@@ -417,7 +418,7 @@ func TestRuntimeObservationRecordsStructuralAndPrivilegeFailures(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	manager := &Manager{store: database}
-	settings := model.AgentSettings{Mode: model.AgentModeObserve}
+	settings := model.AgentSettings{OptimizerMode: model.AgentOptimizerObserve}
 	manager.recordRuntimeObservation(ctx, settings, 2, 0, 2, 1)
 	loaded, err := database.GetAgentSettings(ctx)
 	if err != nil {

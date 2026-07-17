@@ -39,6 +39,10 @@ type MonitorAccountResolver interface {
 	AccountIDsForMonitors(...int64) []int64
 }
 
+type FailoverEvidenceProcessor interface {
+	ProcessFailoverEvidence(context.Context) error
+}
+
 type sourcedReconcileRequester interface {
 	RequestAccountsFrom(string, ...int64)
 	RequestFullFrom(string)
@@ -97,12 +101,19 @@ type Manager struct {
 
 	requester ReconcileRequester
 	resolver  MonitorAccountResolver
+	failover  FailoverEvidenceProcessor
 
 	mu              sync.Mutex
 	lastSuccessAt   time.Time
 	lastError       string
 	lastMonitorKeys map[int64]time.Time
 	running         atomic.Bool
+}
+
+func (m *Manager) SetFailoverEvidenceProcessor(processor FailoverEvidenceProcessor) {
+	m.mu.Lock()
+	m.failover = processor
+	m.mu.Unlock()
 }
 
 func (m *Manager) Status() (*time.Time, string) {
@@ -265,6 +276,7 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 	workers.Wait()
 	close(results)
 	issues := make([]MonitorIssue, 0)
+	evidenceInserted := trafficInserted > 0
 	for result := range results {
 		if result.issue != nil {
 			issues = append(issues, *result.issue)
@@ -277,6 +289,7 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 				}
 			}
 		}
+		evidenceInserted = evidenceInserted || result.inserted
 		m.mu.Lock()
 		cursor := cursors[result.monitorID]
 		for _, item := range result.items {
@@ -295,6 +308,14 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 	}
 	if err := m.store.DeleteTelemetryBefore(ctx, now.Add(-14*24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour)); err != nil {
 		issues = append(issues, MonitorIssue{Code: "monitor_store_failed", Err: fmt.Errorf("清理过期证据失败: %w", err)})
+	}
+	m.mu.Lock()
+	failover := m.failover
+	m.mu.Unlock()
+	if evidenceInserted && failover != nil {
+		if err := failover.ProcessFailoverEvidence(ctx); err != nil {
+			issues = append(issues, MonitorIssue{Code: "failover_evidence_failed", Err: err})
+		}
 	}
 	if trafficInserted > 0 || len(issues) < len(monitors) {
 		m.mu.Lock()

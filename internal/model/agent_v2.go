@@ -127,6 +127,22 @@ type AgentEvent struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+type ActionConfirmation struct {
+	ID            int64           `json:"id"`
+	GoalID        int64           `json:"goal_id"`
+	Administrator string          `json:"administrator"`
+	TokenHash     string          `json:"-"`
+	PayloadHash   string          `json:"-"`
+	Resources     json.RawMessage `json:"resources"`
+	Operation     string          `json:"operation"`
+	DesiredState  json.RawMessage `json:"desired_state"`
+	ProposalID    *int64          `json:"proposal_id,omitempty"`
+	Status        string          `json:"status"`
+	ExpiresAt     time.Time       `json:"expires_at"`
+	ConsumedAt    *time.Time      `json:"consumed_at,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
 // AgentCheckpoint stores the last fully persisted state needed to resume a
 // plan without reconstructing it from model conversation text.
 type AgentCheckpoint struct {
@@ -166,11 +182,19 @@ type ScheduledCommand struct {
 	Capability     string          `json:"capability"`
 	Arguments      json.RawMessage `json:"arguments"`
 	Conditions     json.RawMessage `json:"conditions"`
+	IntentType     string          `json:"intent_type"`
+	ResourceType   string          `json:"resource_type"`
+	ResourceIDs    json.RawMessage `json:"resource_ids"`
+	Operation      string          `json:"operation"`
+	DesiredState   json.RawMessage `json:"desired_state"`
 	Status         string          `json:"status"`
 	Timezone       string          `json:"timezone"`
 	ExecuteAt      time.Time       `json:"execute_at"`
 	ExpiresAt      *time.Time      `json:"expires_at,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key"`
+	OccurrenceID   string          `json:"occurrence_id"`
+	MissedPolicy   string          `json:"missed_policy"`
+	Authority      string          `json:"authority"`
 	LeaseOwner     string          `json:"lease_owner,omitempty"`
 	LeaseUntil     *time.Time      `json:"lease_until,omitempty"`
 	AttemptCount   int             `json:"attempt_count"`

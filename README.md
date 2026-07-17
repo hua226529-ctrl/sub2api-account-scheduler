@@ -62,9 +62,10 @@ docker network inspect "$SUB2API_DOCKER_NETWORK"
 cp .env.example .env
 openssl rand -base64 32
 openssl rand -base64 32
+openssl rand -base64 32
 ```
 
-将两次生成的不同随机值分别写入 `UPSTREAM_CREDENTIAL_KEY` 和 `AGENT_CREDENTIAL_KEY`，再填写 `SUB2API_ADMIN_API_KEY`。不要把 `.env` 提交到 Git。
+将三个不同随机值分别写入 `SCHEDULER_ADMIN_SECRET`、`UPSTREAM_CREDENTIAL_KEY` 和 `AGENT_CREDENTIAL_KEY`，再填写只供服务端调用上游的 `SUB2API_ADMIN_API_KEY`。不要把 `.env` 提交到 Git。
 
 ```bash
 chmod 600 .env
@@ -96,7 +97,7 @@ api.example.com {
 }
 ```
 
-访问 `https://api.example.com/scheduler/`，使用 `SUB2API_ADMIN_API_KEY` 登录。
+访问 `https://api.example.com/scheduler/`，使用独立的 `SCHEDULER_ADMIN_SECRET` 登录。浏览器不会提交或持有上游管理员密钥。
 
 ### 4. 验证状态
 
@@ -112,7 +113,10 @@ curl --fail http://127.0.0.1:8323/readyz
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `SUB2API_ADMIN_API_KEY` | 无 | 必填。Sub2API 全局管理员密钥，同时用于管理端登录。 |
+| `SUB2API_ADMIN_API_KEY` | 无 | 必填。仅供服务端调用 Sub2API 管理接口。 |
+| `SCHEDULER_ADMIN_SECRET` | 无 | 必填。仅用于调度中心管理端登录，必须与上游密钥分离。 |
+| `ALLOW_LEGACY_ADMIN_KEY_LOGIN` | `false` | 一个兼容版本的显式旧登录开关；启用会记录弃用警告。 |
+| `TRUSTED_PROXY_CIDRS` | 空 | 逗号分隔的直接可信反向代理 CIDR；未配置时忽略所有 forwarded headers。 |
 | `SUB2API_BASE_URL` | `http://sub2api:8080` | Sub2API 管理接口地址。 |
 | `LISTEN_ADDRESS` | `:8323` | 进程监听地址。 |
 | `BASE_PATH` | `/scheduler/` | 管理端部署路径，会自动规范化首尾斜杠。 |
@@ -166,7 +170,7 @@ curl --fail http://127.0.0.1:8323/readyz
 
 仅当整个模型调度池没有任何可调度渠道，同时满足数据新鲜度、连续硬失败和真实流量证据时，系统才允许从主组升级到备用组，再升级到紧急组。黄色性能下降、客户端错误、模型不支持、凭据错误和数据失联不会触发自动切组。
 
-所有切换都先写入唯一幂等流水，再调用上游并回读确认。切换受冷却、频率限制、人工保护和全局冻结约束。恢复主组需要连续稳定 30 分钟、至少 10 个正常监控结果，以及最近 30 分钟不少于 20 个真实样本且成功率不低于 98%。
+所有切换都经过唯一 Group Transition Executor：先写入幂等流水，再调用上游并回读确认。相同令牌严格串行，不同令牌可有限并行；超时且无法回读时进入 uncertain，重启只回读协调，不盲目重放。切换受冷却、频率限制、人工保护、单轮预算和全局冻结约束。
 
 ## 智能体安全边界
 
@@ -182,19 +186,16 @@ curl --fail http://127.0.0.1:8323/readyz
 
 管理员对话是异步持久任务。智能体每轮上下文包含最近 24 小时的相关分析、动作、结果、目标和对话记忆；记录默认保留 90 天。定时命令默认使用 `Asia/Shanghai`。
 
-## 观察门槛
+## 独立运行模式
 
-确定性调度首次部署应保持 `DRY_RUN=true` 至少 30 分钟，确认账号映射、拟暂停、拟恢复和拟调负载均符合预期。
+确定性调度首次部署应保持 Scheduler `observe` 至少 30 分钟，确认账号映射、拟暂停、拟恢复和拟调负载均符合预期。
 
-智能体首次启用、重新启用或更换模型后固定进入观察模式。只有同时满足以下条件，服务端才自动进入完全自治：
+- Scheduler：`observe` / `control`，决定确定性策略是否执行账号写入。
+- Optimizer：`disabled` / `observe` / `propose` / `auto`，只有低风险、模拟通过且未超过每日预算的提案可以自动发布。
+- Operator：`disabled` / `confirm` / `direct`，决定管理员聊天和受控直接动作的执行方式。
+- Failover：`disabled` / `observe` / `control`，独立决定三级分组救灾是否执行。
 
-- 连续观察满 24 小时。
-- 至少 40 次成功的定时分析。
-- 模拟动作可执行率不低于 95%。
-- 越权次数为零。
-- 结构错误次数为零。
-
-网页不能绕过该门槛，服务重启不会重置观察进度。模型不可用时，50 秒确定性调度仍按照最后生效的策略运行。
+旧 `agent.enabled/mode` 仅作为兼容展示值，不会自动升级或控制 Failover。模型不可用时，确定性调度仍按照最后生效的策略运行。
 
 ## 数据与备份
 
@@ -210,6 +211,8 @@ curl --fail http://127.0.0.1:8323/readyz
 - 当前镜像标签或可执行文件版本。
 
 升级前停止写入或停止容器，完成备份，再构建新版本。回滚时同时恢复兼容的程序与数据库备份。
+
+Core C 升级步骤、legacy 登录迁移和回滚细节见 [upgrade-core-c.md](docs/operations/upgrade-core-c.md)。最终控制链见 [core-c-final-control-plane.md](docs/architecture/core-c-final-control-plane.md)。
 
 ## 本地开发
 

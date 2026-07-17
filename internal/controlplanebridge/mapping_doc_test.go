@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestLegacyWritePathMappingDocumentsAllKnownMutationPoints(t *testing.T) {
+func TestLegacyWritePathMappingDocumentsFinalMutationBoundaries(t *testing.T) {
 	documentPath := filepath.Join("..", "..", "docs", "architecture", "legacy-write-path-mapping.md")
 	contents, err := os.ReadFile(documentPath)
 	if err != nil {
@@ -19,9 +19,6 @@ func TestLegacyWritePathMappingDocumentsAllKnownMutationPoints(t *testing.T) {
 		"WP-A07", "WP-A08", "WP-A09", "WP-A10", "WP-A11",
 		"WP-G01", "WP-G02", "WP-G03", "WP-G04", "WP-G05", "WP-G06", "WP-G07",
 		"Engine.ManualPause",
-		"Engine.AgentPause",
-		"Engine.AgentResume",
-		"Engine.AgentSetLoadFactor",
 		"Engine.ForceSetLoadFactor",
 		"Engine.PinLoad",
 		"Engine.ManualResume",
@@ -30,19 +27,16 @@ func TestLegacyWritePathMappingDocumentsAllKnownMutationPoints(t *testing.T) {
 		"Engine.applyPause",
 		"Engine.applyResume",
 		"balance.Manager.reconcileCostRouting",
-		"balance.Manager.SwitchGroup",
 		"balance.Manager.TransitionGroupTier",
-		"balance.Manager.switchAutomatedGroup",
 		"failover.Controller.handleOutage",
-		"failover.Controller.handleRecovery",
-		"agent.Manager.executeAction",
-		"agent.Manager.executeMutationCapability",
-		"httpserver.accountAction",
-		"httpserver.switchUpstreamKeyGroup",
-		"httpserver.switchUpstreamKeyTier",
+		"next configured enabled level",
+		"Automatic return and dynamic candidate selection are absent",
 		"sub2api.Client.SetSchedulable",
 		"sub2api.Client.UpdateLoadFactor",
 		"balance.Fetcher.SwitchGroup",
+		"PublishPolicyProposal",
+		"RollbackPolicyProposal",
+		"historical read-only",
 	}
 	document := string(contents)
 	for _, marker := range required {

@@ -212,9 +212,9 @@ func TestDecisionValidationAllowsOneConfirmedGroupTierTransition(t *testing.T) {
 		GroupFailoverTokens: []model.AgentGroupFailoverToken{{
 			SourceID: 9, Pool: "主池", KeyID: "token-7", Enabled: true, Confirmed: true,
 			DataFresh: true, CurrentTier: model.GroupTierMain, AccountIDs: []int64{1, 2},
-			Main:      model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主分组"},
-			Backup:    model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用分组"},
-			Emergency: model.AgentGroupTierSummary{Tier: model.GroupTierEmergency, Name: "紧急分组"},
+			Main:      model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主分组", Configured: true, Enabled: true},
+			Backup:    model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用分组", Configured: true, Enabled: true},
+			Emergency: model.AgentGroupTierSummary{Tier: model.GroupTierEmergency, Name: "紧急分组", Configured: true, Enabled: true},
 		}},
 	}
 	action := AgentAction{Type: "transition_token_group_tier", SourceID: 9, KeyID: "token-7",
@@ -230,7 +230,10 @@ func TestDecisionValidationAllowsOneConfirmedGroupTierTransition(t *testing.T) {
 	second.KeyID = "token-8"
 	packet.GroupFailoverTokens = append(packet.GroupFailoverTokens, model.AgentGroupFailoverToken{
 		SourceID: 10, Pool: "主池", KeyID: "token-8", Enabled: true, Confirmed: true, DataFresh: true,
-		CurrentTier: model.GroupTierMain, Backup: model.AgentGroupTierSummary{Name: "备用二组"}, AccountIDs: []int64{1, 2},
+		CurrentTier: model.GroupTierMain,
+		Main:        model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主二组", Configured: true, Enabled: true},
+		Backup:      model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用二组", Configured: true, Enabled: true},
+		AccountIDs:  []int64{1, 2},
 	})
 	if err := manager.validateDecision(packet, ModelDecision{Confidence: 1, Actions: []AgentAction{action, second}}); err == nil {
 		t.Fatal("two group transitions in one analysis should be rejected")
@@ -250,7 +253,9 @@ func TestDecisionValidationRejectsUnsafeGroupTierTransition(t *testing.T) {
 		GroupFailoverTokens: []model.AgentGroupFailoverToken{{
 			SourceID: 9, Pool: "主池", KeyID: "token-7", Enabled: true, Confirmed: true,
 			DataFresh: true, CurrentTier: model.GroupTierMain, AccountIDs: []int64{1},
-			Backup: model.AgentGroupTierSummary{Name: "备用分组"}, Emergency: model.AgentGroupTierSummary{Name: "紧急分组"},
+			Main:      model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主分组", Configured: true, Enabled: true},
+			Backup:    model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用分组", Configured: true, Enabled: true},
+			Emergency: model.AgentGroupTierSummary{Tier: model.GroupTierEmergency, Name: "紧急分组", Configured: true, Enabled: true},
 		}},
 	}
 	action := AgentAction{Type: "transition_token_group_tier", SourceID: 9, KeyID: "token-7",
@@ -279,7 +284,7 @@ func TestDecisionValidationRejectsUnsafeGroupTierTransition(t *testing.T) {
 	}
 }
 
-func TestDecisionValidationRequiresStableEvidenceToReturnMain(t *testing.T) {
+func TestDecisionValidationRejectsAutonomousReturnToMain(t *testing.T) {
 	now := testPacketTime()
 	healthySince := now.Add(-31 * time.Minute)
 	manager := &Manager{}
@@ -290,18 +295,41 @@ func TestDecisionValidationRequiresStableEvidenceToReturnMain(t *testing.T) {
 			Windows: map[string]model.AgentWindowStats{"30m": {EligibleCount: 20, SuccessCount: 20}}}},
 		GroupFailoverTokens: []model.AgentGroupFailoverToken{{
 			SourceID: 9, Pool: "主池", KeyID: "token-7", Enabled: true, Confirmed: true, DataFresh: true,
-			CurrentTier: model.GroupTierBackup, Main: model.AgentGroupTierSummary{Name: "主分组"},
-			AccountIDs: []int64{1}, HealthySince: &healthySince, RecoveryHealthyCount: 10,
+			CurrentTier: model.GroupTierBackup,
+			Main:        model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主分组", Configured: true, Enabled: true},
+			Backup:      model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用分组", Configured: true, Enabled: true},
+			AccountIDs:  []int64{1}, HealthySince: &healthySince, RecoveryHealthyCount: 10,
 		}},
 	}
 	action := AgentAction{Type: "transition_token_group_tier", SourceID: 9, KeyID: "token-7",
 		TargetTier: model.GroupTierMain, Reason: "已满足稳定窗口并尝试恢复主分组"}
-	if err := manager.validateDecision(packet, ModelDecision{Confidence: .90, Actions: []AgentAction{action}}); err != nil {
-		t.Fatalf("stable return to main rejected: %v", err)
-	}
-	packet.GroupFailoverTokens[0].RecoveryHealthyCount = 9
 	if err := manager.validateDecision(packet, ModelDecision{Confidence: 1, Actions: []AgentAction{action}}); err == nil {
-		t.Fatal("return to main before ten healthy confirmations should be rejected")
+		t.Fatal("autonomous return to an unobservable main group must always be rejected")
+	}
+}
+
+func TestDecisionValidationSkipsDisabledBackupInFixedChain(t *testing.T) {
+	manager := &Manager{}
+	packet := model.AnalysisPacket{
+		CutoffAt:      testPacketTime(),
+		DataHealth:    model.AgentDataHealth{MonitorFresh: true, TrafficFresh: true},
+		PoolSummaries: []model.AgentPoolSummary{{Name: "主池", Accounts: 1, Unavailable: 1}},
+		AccountCompactStates: []model.AgentAccountState{{
+			AccountID: 1, AvailabilityState: "unavailable", HardFailureStreak: 3,
+			Windows: map[string]model.AgentWindowStats{"5m": {EligibleCount: 10, ErrorCategoryCounts: map[string]int{model.ErrorClassInfrastructure: 10}}},
+		}},
+		GroupFailoverTokens: []model.AgentGroupFailoverToken{{
+			SourceID: 9, Pool: "主池", KeyID: "token-7", Enabled: true, Confirmed: true,
+			DataFresh: true, CurrentTier: model.GroupTierMain, AccountIDs: []int64{1},
+			Main:      model.AgentGroupTierSummary{Tier: model.GroupTierMain, Name: "主分组", Configured: true, Enabled: true},
+			Backup:    model.AgentGroupTierSummary{Tier: model.GroupTierBackup, Name: "备用分组", Configured: true, Enabled: false},
+			Emergency: model.AgentGroupTierSummary{Tier: model.GroupTierEmergency, Name: "紧急分组", Configured: true, Enabled: true},
+		}},
+	}
+	action := AgentAction{Type: "transition_token_group_tier", SourceID: 9, KeyID: "token-7",
+		TargetTier: model.GroupTierEmergency, Reason: "备用层禁用，按固定链进入紧急分组"}
+	if err := manager.validateDecision(packet, ModelDecision{Confidence: 1, Actions: []AgentAction{action}}); err != nil {
+		t.Fatalf("fixed chain should skip a disabled backup: %v", err)
 	}
 }
 
@@ -316,12 +344,15 @@ func TestGroupFailoverPacketIsTierBasedAndRedacted(t *testing.T) {
 		FailoverPolicies: []model.GroupFailoverPolicy{{
 			SourceID: 3, KeyID: "token-7", KeyName: "生产令牌", KeyHint: "sk-***7890", Enabled: true,
 			MainGroupID: "secret-main-id", BackupGroupID: "secret-backup-id", EmergencyGroupID: "secret-emergency-id",
+			MainEnabled: true, BackupEnabled: true, EmergencyEnabled: true,
 			Version: 2, ConfirmedVersion: 2, Confirmed: true, AccountIDs: []int64{225},
 			State: model.GroupFailoverState{CurrentTier: model.GroupTierMain},
 		}},
 		MatchedAccounts: []model.AccountRef{{ID: 225, Name: "账号225"}},
 	}}, nil)
-	if len(items) != 1 || items[0].Backup.Name != "备用分组" || items[0].Backup.RateMultiplier != 1.2 {
+	if len(items) != 1 || items[0].Backup.Name != "备用分组" || items[0].Backup.RateMultiplier != 1.2 ||
+		!items[0].Main.Configured || !items[0].Main.Enabled || !items[0].Backup.Configured || !items[0].Backup.Enabled ||
+		!items[0].Emergency.Configured || !items[0].Emergency.Enabled {
 		t.Fatalf("unexpected failover packet: %#v", items)
 	}
 	payload, err := json.Marshal(items)

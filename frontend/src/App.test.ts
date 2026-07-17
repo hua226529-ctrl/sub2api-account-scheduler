@@ -5,10 +5,10 @@ import App from "./App.vue";
 const api = vi.hoisted(() => ({
   restoreSession: vi.fn(), login: vi.fn(), logout: vi.fn(), getOverview: vi.fn(), getEvents: vi.fn(), getDiagnostics: vi.fn(),
   getUpstreams: vi.fn(), getUpstreamFailoverTransitions: vi.fn(), validateUpstream: vi.fn(), createUpstream: vi.fn(), updateUpstream: vi.fn(), deleteUpstream: vi.fn(), refreshUpstream: vi.fn(),
-  switchUpstreamKeyGroup: vi.fn(), saveUpstreamFailoverPolicy: vi.fn(), confirmUpstreamFailoverPolicy: vi.fn(), switchUpstreamKeyTier: vi.fn(),
+	  saveUpstreamFailoverPolicy: vi.fn(), confirmUpstreamFailoverPolicy: vi.fn(), switchUpstreamKeyTier: vi.fn(),
   triggerReconcile: vi.fn(), updatePolicy: vi.fn(), updateSettings: vi.fn(), accountAction: vi.fn(),
   getAgentOverview: vi.fn(), updateAgentSettings: vi.fn(), validateAgentProvider: vi.fn(), saveAgentProvider: vi.fn(),
-  runAgent: vi.fn(), chatAgent: vi.fn(), getAgentMessages: vi.fn(), activateAgentPolicy: vi.fn(),
+	  runAgent: vi.fn(), chatAgent: vi.fn(), confirmAgentGoal: vi.fn(), getAgentMessages: vi.fn(), activateAgentPolicy: vi.fn(), rejectAgentPolicy: vi.fn(), rollbackAgentPolicy: vi.fn(),
   getAgentCapabilities: vi.fn(), getAgentGoals: vi.fn(), getAgentRuntimeEvents: vi.fn(), getAgentTasks: vi.fn(),
   getAgentMemories: vi.fn(), getAgentFreezeState: vi.fn(), setAgentFreezeState: vi.fn(), openAgentStream: vi.fn()
 }));
@@ -16,7 +16,8 @@ const api = vi.hoisted(() => ({
 vi.mock("./api", () => api);
 
 const adaptiveSettings = {
-  dry_run: false, failure_threshold: 3, recovery_threshold: 3, manual_hold_minutes: 10,
+	  dry_run: false, scheduler_mode: "control" as const, failover_mode: "observe" as const, group_failover_mutation_budget: 1,
+	  failure_threshold: 3, recovery_threshold: 3, manual_hold_minutes: 10,
   flap_window_minutes: 60, flap_pause_threshold: 3, flap_recovery_threshold: 10,
   health_engine_mode: "adaptive" as const, healthy_score_threshold: 80, watch_score_threshold: 60,
   quarantine_score_threshold: 35, latency_warning_ms: 8000, latency_critical_ms: 15000,
@@ -26,7 +27,8 @@ const adaptiveSettings = {
 };
 
 const agentSettings = {
-  enabled: true, mode: "observe" as const, analysis_interval_minutes: 30, emergency_cooldown_minutes: 5,
+	  enabled: true, mode: "observe" as const, optimizer_mode: "propose" as const, operator_mode: "confirm" as const, daily_policy_change_budget: 2,
+	  analysis_interval_minutes: 30, emergency_cooldown_minutes: 5,
   context_token_budget: 16000, max_anomalies: 20, max_drilldowns: 8, retention_days: 90,
   successful_observation_runs: 17, observation_started_at: "2026-07-13T00:00:00Z"
 };
@@ -51,8 +53,8 @@ function populatedAgentOverview() {
     ],
     daily_reports: [{ id: 7, report_date: "2026-07-13", status: "completed", summary: "昨日可用率稳定，成本下降。", metrics: {}, advice: ["继续观察高倍率备用池"], created_at: "2026-07-14T00:10:00Z" }],
     policy_versions: [
-      { id: 12, scope_type: "global", scope_id: "", version: 3, status: "active", config: {}, reason: "降低单次性能下降影响", created_by: "agent", created_at: "2026-07-14T09:30:00Z" },
-      { id: 11, scope_type: "global", scope_id: "", version: 2, status: "archived", config: {}, reason: "上一版本", created_by: "agent", created_at: "2026-07-13T09:30:00Z" }
+		  { id: 12, scope_type: "global", scope_id: "", version: 3, status: "active", config: {}, previous_active_version_id: 10, risk_level: "low", reason: "降低单次性能下降影响", created_by: "agent", created_at: "2026-07-14T09:30:00Z" },
+		  { id: 11, scope_type: "global", scope_id: "", version: 4, status: "simulated", config: {}, diff: { failure_threshold: { before: 3, after: 4 } }, simulation: { passed: true, data_sufficient: true, sample_count: 120, summary: "动作次数未增加" }, risk_level: "low", affected_account_ids: [225], reason: "减少抖动", created_by: "agent", created_at: "2026-07-14T09:40:00Z" }
     ],
     packets: [{ id: 81, kind: "scheduled", cutoff_at: "2026-07-14T10:00:00Z", hash: "packet-hash", token_estimate: 4280, no_material_change: false, system_summary: { accounts: 2, schedulable: 2, available: 1, degraded: 1, unavailable: 0, insufficient_data: 0, average_availability: 94.5, average_performance: 77, average_confidence: 88, critical_anomalies: 1, data_fresh: true }, changes: ["账号298性能下降"], created_at: "2026-07-14T10:00:00Z" }],
     tool_calls: [{ id: 6, run_id: 41, tool: "set_load_factor", arguments: { account_id: 298, value: 50 }, status: "proposed", result: "观察模式，仅记录拟执行动作", created_at: "2026-07-14T10:00:04Z" }],
@@ -66,7 +68,7 @@ describe("App", () => {
     vi.useFakeTimers();
     Object.values(api).forEach((mock) => mock.mockReset());
     api.getAgentOverview.mockResolvedValue({
-      settings: { enabled: false, mode: "observe", analysis_interval_minutes: 30, emergency_cooldown_minutes: 5, context_token_budget: 16000, max_anomalies: 20, max_drilldowns: 8, retention_days: 90, successful_observation_runs: 0 },
+		  settings: { enabled: false, mode: "observe", optimizer_mode: "disabled", operator_mode: "disabled", daily_policy_change_budget: 2, analysis_interval_minutes: 30, emergency_cooldown_minutes: 5, context_token_budget: 16000, max_anomalies: 20, max_drilldowns: 8, retention_days: 90, successful_observation_runs: 0 },
       providers: [], runs: [], assessments: [], daily_reports: [], policy_versions: [], packets: [], tool_calls: [], running: false
     });
     api.getAgentMessages.mockResolvedValue({ items: [] });
@@ -315,7 +317,7 @@ describe("App", () => {
 		wrapper.unmount();
 	});
 
-	it("switches a token group only after confirmation", async () => {
+		it("does not expose an arbitrary token group writer", async () => {
 		api.restoreSession.mockResolvedValue(true);
 		api.getEvents.mockResolvedValue({ items: [] });
 		api.getDiagnostics.mockResolvedValue({ alive: true, ready: true, database: "ok", service_started_at: new Date().toISOString(), poll_interval_seconds: 50, dry_run: false });
@@ -327,19 +329,13 @@ describe("App", () => {
 			groups: [{ external_id: "cheap", name: "低价组", rate_multiplier: 0.5 }, { external_id: "backup", name: "备用组", rate_multiplier: 1.2 }],
 			key_rates: [{ external_id: "11", name: "调度令牌", key_hint: "sk-1...7890", group_id: "cheap", group_name: "低价组", rate_multiplier: 0.5, dynamic: false, status: "active" }], matched_accounts: []
 		}] });
-		api.switchUpstreamKeyGroup.mockResolvedValue({});
-
-		const wrapper = mount(App);
+			const wrapper = mount(App);
 		await flushPromises();
 		await wrapper.findAll("nav button").find((button) => button.text().includes("余额中心"))!.trigger("click");
 		await wrapper.find('button[title="展开密钥倍率"]').trigger("click");
-		await wrapper.find('select[aria-label="调度令牌目标分组"]').setValue("backup");
-		await wrapper.find(".rate-change-button").trigger("click");
-		expect(wrapper.text()).toContain("确认将「调度令牌」切换到「备用组（1.20 倍）」");
-		expect(api.switchUpstreamKeyGroup).not.toHaveBeenCalled();
-		await wrapper.find(".danger-button").trigger("click");
-		await flushPromises();
-		expect(api.switchUpstreamKeyGroup).toHaveBeenCalledWith(2, "11", "backup");
+			expect(wrapper.text()).toContain("分组写入只允许通过已确认的三级层级控制");
+			expect(wrapper.find('select[aria-label="调度令牌目标分组"]').exists()).toBe(false);
+			expect(wrapper.find(".rate-change-button").exists()).toBe(false);
 		wrapper.unmount();
 	});
 
@@ -395,7 +391,8 @@ describe("App", () => {
     await flushPromises();
     expect(api.createUpstream).toHaveBeenCalledWith(expect.objectContaining({ username: "operator", password: "secret-password" }));
     expect(api.saveUpstreamFailoverPolicy).toHaveBeenCalledWith(44, {
-      enabled: true, key_id: "key-7", main_group_id: "main-group", backup_group_id: "backup-group", emergency_group_id: "emergency-group",
+		enabled: true, key_id: "key-7", main_enabled: true, backup_enabled: true, emergency_enabled: true,
+		main_group_id: "main-group", backup_group_id: "backup-group", emergency_group_id: "emergency-group",
       account_ids: [225], pool: "主池"
     });
     expect(api.confirmUpstreamFailoverPolicy).toHaveBeenCalledWith(44, "key-7", 3);
@@ -470,10 +467,10 @@ describe("App", () => {
       balance: 20, unit: "USD", low_streak: 0, recovery_streak: 0, balance_locked: false, stale: false, selected_key_id: "", routing_enabled: false, routing_pool: "",
       groups: [{ external_id: "g1", name: "主用组", rate_multiplier: 0.5 }, { external_id: "g2", name: "备用组", rate_multiplier: 1 }, { external_id: "g3", name: "应急组", rate_multiplier: 2 }],
       key_rates: [{ external_id: "key-9", name: "受控令牌", key_hint: "sk-9...7890", group_id: "g1", group_name: "主用组", rate_multiplier: 0.5, dynamic: false, status: "active" }], matched_accounts: [],
-      failover_policies: [{ source_id: 9, enabled: true, key_id: "key-9", key_name: "受控令牌", key_hint: "sk-9...7890", main_group_id: "g1", backup_group_id: "g2", emergency_group_id: "g3", account_ids: [225], pool: "主池", version: 2, confirmed_version: 2, confirmed: true, state: { source_id: 9, key_id: "key-9", current_tier: "main", observed_group_id: "g1", frozen: false, recovery_healthy_count: 0 } }]
+		failover_policies: [{ source_id: 9, enabled: true, key_id: "key-9", key_name: "受控令牌", key_hint: "sk-9...7890", main_enabled: true, backup_enabled: true, emergency_enabled: true, main_group_id: "g1", backup_group_id: "g2", emergency_group_id: "g3", account_ids: [225], pool: "主池", version: 2, confirmed_version: 2, confirmed: true, state: { source_id: 9, key_id: "key-9", current_tier: "backup", observed_group_id: "g2", frozen: false, recovery_healthy_count: 0, validation_status: "awaiting_evidence", validation_mode: "passive", successful_evidence_count: 0, failed_evidence_count: 0, evidence_deadline: "2026-07-14T10:10:03Z" } }]
     }] });
     api.getUpstreamFailoverTransitions.mockResolvedValue({ items: [
-      { id: 31, idempotency_key: "switch-31", source_id: 9, key_id: "key-9", from_tier: "main", to_tier: "backup", from_group_id: "g1", to_group_id: "g2", status: "completed", actor: "deterministic", reason: "主池完全不可用", trigger: "连续 3 次硬失败", manual: false, dry_run: false, created_at: "2026-07-14T10:00:00Z", completed_at: "2026-07-14T10:00:03Z" },
+		{ id: 31, idempotency_key: "switch-31", source_id: 9, key_id: "key-9", from_tier: "main", to_tier: "backup", from_group_id: "g1", to_group_id: "g2", status: "applied", actor: "deterministic", reason: "主池完全不可用", trigger: "连续 3 次硬失败", manual: false, dry_run: false, created_at: "2026-07-14T10:00:00Z", completed_at: "2026-07-14T10:00:03Z" },
       { id: 30, idempotency_key: "switch-30", source_id: 9, key_id: "key-9", from_tier: "backup", to_tier: "emergency", from_group_id: "g2", to_group_id: "g3", status: "failed", actor: "agent", reason: "备用组验证失败", trigger: "真实请求成功率低于 20%", error: "上游回读仍为备用组", manual: false, dry_run: false, created_at: "2026-07-14T09:50:00Z", completed_at: "2026-07-14T09:50:05Z" }
     ] });
     api.switchUpstreamKeyTier.mockResolvedValue({});
@@ -481,24 +478,26 @@ describe("App", () => {
     const wrapper = mount(App);
     await flushPromises();
     await wrapper.findAll("nav button").find((button) => button.text().includes("余额中心"))!.trigger("click");
-    expect(wrapper.text()).toContain("当前主用层");
+	expect(wrapper.text()).toContain("等待切换后证据");
     await wrapper.find('button[title="展开密钥倍率"]').trigger("click");
     await flushPromises();
     expect(api.getUpstreamFailoverTransitions).toHaveBeenCalledWith(9, "key-9");
-    expect(wrapper.text()).toContain("绑定 1 个账号");
+	expect(wrapper.text()).toContain("当前 备用层 · g2");
+	expect(wrapper.text()).toContain("成功 0 / 失败 0");
     expect(wrapper.text()).toContain("最近切换流水");
     expect(wrapper.text()).toContain("主用层 → 备用层");
     expect(wrapper.text()).toContain("连续 3 次硬失败");
     expect(wrapper.text()).toContain("回读已确认目标分组 g2");
+	expect(wrapper.text()).toContain("已切换，等待新分组监控证据");
     expect(wrapper.text()).toContain("备用层 → 应急层");
     expect(wrapper.text()).toContain("真实请求成功率低于 20%");
     expect(wrapper.text()).toContain("错误：上游回读仍为备用组");
-    await wrapper.find(".tier-button.backup").trigger("click");
+	await wrapper.find(".tier-button.emergency").trigger("click");
     expect(api.switchUpstreamKeyTier).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain("确认将受控令牌切换到备用层「备用组」");
+	expect(wrapper.text()).toContain("确认将受控令牌切换到应急层「应急组」");
     await wrapper.find(".danger-button").trigger("click");
     await flushPromises();
-    expect(api.switchUpstreamKeyTier).toHaveBeenCalledWith(9, "key-9", "backup");
+	expect(api.switchUpstreamKeyTier).toHaveBeenCalledWith(9, "key-9", "emergency");
     wrapper.unmount();
   });
 
@@ -590,9 +589,9 @@ describe("App", () => {
     wrapper.unmount();
   });
 
-  it("tracks an asynchronous chat goal and polls until runtime state changes", async () => {
+	  it("tracks an asynchronous chat goal and polls until runtime state changes", async () => {
     mockAuthenticatedConsole(populatedAgentOverview());
-    api.chatAgent.mockResolvedValue({ conversation_id: 9, goal_id: 71, run_id: 43, status: "queued" });
+	  api.chatAgent.mockResolvedValue({ conversation_id: 9, goal_id: 71, run_id: 43, status: "queued", intent: { intent_type: "analysis", resource_type: "account", resource_ids: ["225"], operation: "analyze", read_only: true, requires_confirmation: false, risk_level: "low", user_facing_summary: "只读分析账号" } });
     api.getAgentMessages.mockResolvedValue({ items: [{ id: 1, conversation_id: 9, role: "user", content: "恢复示例账号上游", created_at: "2026-07-14T10:05:00Z" }] });
     api.getAgentGoals.mockResolvedValue({ items: [{ id: 71, title: "恢复示例账号上游", objective: "等待数据后恢复", status: "queued", priority: 70, risk_level: "medium", source: "chat", context: {}, created_by: "operator", created_at: "2026-07-14T10:05:00Z", updated_at: "2026-07-14T10:05:00Z" }], steps: [] });
 
@@ -610,7 +609,43 @@ describe("App", () => {
     await flushPromises();
     expect(api.getAgentGoals.mock.calls.length).toBeGreaterThan(callsBeforePoll);
     wrapper.unmount();
-  });
+	  });
+
+	  it("shows a high-risk chat preview and consumes confirmation explicitly", async () => {
+		mockAuthenticatedConsole(populatedAgentOverview());
+		api.chatAgent.mockResolvedValue({ conversation_id: 9, goal_id: 72, status: "waiting", confirmation_token: "one-use-token", confirmation_expires_at: "2026-07-14T10:10:00Z", intent: { intent_type: "direct_action", resource_type: "account", resource_ids: ["225", "298"], operation: "bulk_pause", read_only: false, requires_confirmation: true, risk_level: "critical", user_facing_summary: "暂停 2 个账号" } });
+		api.confirmAgentGoal.mockResolvedValue({ conversation_id: 9, goal_id: 72, status: "planned", intent: { intent_type: "direct_action", resource_type: "account", resource_ids: ["225", "298"], operation: "bulk_pause", read_only: false, requires_confirmation: true, risk_level: "critical", user_facing_summary: "暂停 2 个账号" } });
+		const wrapper = mount(App);
+		await flushPromises();
+		await wrapper.findAll("nav button").find((button) => button.text().includes("智能调度"))!.trigger("click");
+		await wrapper.find('.agent-chat-form textarea').setValue("暂停所有账号。");
+		await wrapper.find(".agent-chat-form").trigger("submit");
+		await flushPromises();
+		expect(wrapper.text()).toContain("暂停 2 个账号");
+		expect(wrapper.text()).toContain("影响 2 个资源");
+		await wrapper.find(".agent-intent-receipt .danger-button").trigger("click");
+		await flushPromises();
+		expect(api.confirmAgentGoal).not.toHaveBeenCalled();
+		await wrapper.find(".confirm-panel .danger-button").trigger("click");
+		await flushPromises();
+		expect(api.confirmAgentGoal).toHaveBeenCalledWith(72, "one-use-token");
+		wrapper.unmount();
+	  });
+
+	  it("renders policy simulation and requires confirmation before activation", async () => {
+		mockAuthenticatedConsole(populatedAgentOverview());
+		api.activateAgentPolicy.mockResolvedValue({ activated: true });
+		const wrapper = mount(App);
+		await flushPromises();
+		await wrapper.findAll("nav button").find((button) => button.text().includes("智能调度"))!.trigger("click");
+		expect(wrapper.text()).toContain("动作次数未增加");
+		await wrapper.findAll("button").find((button) => button.text().includes("批准并激活"))!.trigger("click");
+		expect(api.activateAgentPolicy).not.toHaveBeenCalled();
+		await wrapper.find(".confirm-panel .danger-button").trigger("click");
+		await flushPromises();
+		expect(api.activateAgentPolicy).toHaveBeenCalledWith(11);
+		wrapper.unmount();
+	  });
 
   it("validates and saves the primary model configuration", async () => {
     mockAuthenticatedConsole(populatedAgentOverview());
@@ -656,8 +691,8 @@ describe("App", () => {
     await wrapper.findAll("button").find((button) => button.text().includes("运行设置"))!.trigger("click");
 
     expect(wrapper.text()).toContain("智能体运行设置");
-    expect(wrapper.find("select").attributes("disabled")).toBeDefined();
-    await wrapper.findAll('input[type="number"]')[0].setValue("45");
+	  const intervalLabel = wrapper.findAll("label").find((label) => label.text().includes("全量分析周期"))!;
+	  await intervalLabel.find('input[type="number"]').setValue("45");
     await wrapper.findAll("button").find((button) => button.text().includes("保存设置"))!.trigger("click");
     expect(api.updateAgentSettings).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("确认更新智能体运行模式和分析参数？");
@@ -665,7 +700,8 @@ describe("App", () => {
     await wrapper.find(".danger-button").trigger("click");
     await flushPromises();
     expect(api.updateAgentSettings).toHaveBeenCalledWith(expect.objectContaining({
-      enabled: true, mode: "observe", analysis_interval_minutes: 45, context_token_budget: 16000, max_drilldowns: 8
+		  optimizer_mode: "propose", operator_mode: "confirm", daily_policy_change_budget: 2,
+		  analysis_interval_minutes: 45, context_token_budget: 16000, max_drilldowns: 8
     }));
     wrapper.unmount();
   });
@@ -673,7 +709,7 @@ describe("App", () => {
   it("confirms a manual analysis and keeps the conversation transcript", async () => {
     mockAuthenticatedConsole(populatedAgentOverview());
     api.runAgent.mockResolvedValue({ id: 42, status: "completed" });
-    api.chatAgent.mockResolvedValue({ conversation_id: 9, run: { id: 43, status: "completed" } });
+	  api.chatAgent.mockResolvedValue({ conversation_id: 9, run: { id: 43, status: "completed" }, intent: { intent_type: "query", resource_type: "account", resource_ids: ["225"], operation: "query", read_only: true, requires_confirmation: false, risk_level: "low", user_facing_summary: "查询账号状态" } });
     api.getAgentMessages.mockResolvedValue({ items: [
       { id: 1, conversation_id: 9, role: "user", content: "为什么示例账号上游降级？", created_at: "2026-07-14T10:05:00Z" },
       { id: 2, conversation_id: 9, role: "assistant", content: "真实请求成功，当前仅降低性能质量分。", run_id: 43, created_at: "2026-07-14T10:05:03Z" }
