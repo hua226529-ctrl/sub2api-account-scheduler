@@ -385,7 +385,10 @@ func (m *Manager) switchAutomatedGroup(ctx context.Context, manual, automationLe
 		return model.UpstreamResult{}, errors.New("自动切组缺少全局冻结屏障，已拒绝外部写入")
 	}
 	if !automationLeaseHeld {
-		release := m.barrier.EnterMutation()
+		release, err := m.barrier.EnterMutation(ctx)
+		if err != nil {
+			return model.UpstreamResult{}, fmt.Errorf("等待自动切组冻结屏障: %w", err)
+		}
 		defer release()
 	}
 	freeze, err := m.freeze.FreezeState(ctx)

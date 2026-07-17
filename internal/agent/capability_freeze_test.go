@@ -16,7 +16,10 @@ func TestAdministratorCapabilityWaitsForFreezePublication(t *testing.T) {
 		administratorCommandHash("立即暂停account-example"), "immediate",
 		"pause_account", arguments, []string{"account:298"}, "", nil, nil)
 
-	releaseFreeze := manager.engine.AutomationBarrier().EnterFreeze()
+	releaseFreeze, err := manager.engine.AutomationBarrier().EnterFreeze(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() {
 		_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{

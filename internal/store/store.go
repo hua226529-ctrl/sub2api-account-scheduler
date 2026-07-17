@@ -341,6 +341,88 @@ func (s *Store) migrate(ctx context.Context) error {
 			FOREIGN KEY(source_id) REFERENCES upstream_sources(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cost_account_locks_source ON cost_account_locks(source_id)`,
+		`CREATE TABLE IF NOT EXISTS account_overrides (
+			id TEXT PRIMARY KEY,
+			command_id TEXT NOT NULL,
+			intent_id TEXT NOT NULL UNIQUE,
+			idempotency_key TEXT NOT NULL,
+			semantic_signature TEXT NOT NULL,
+			account_id INTEGER NOT NULL,
+			operation TEXT NOT NULL,
+			override_kind TEXT NOT NULL DEFAULT 'temporary',
+			desired_schedulable INTEGER,
+			desired_load_factor INTEGER,
+			desired_load_factor_set INTEGER NOT NULL DEFAULT 0,
+			producer TEXT NOT NULL,
+			authority TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			evidence_refs TEXT NOT NULL DEFAULT '[]',
+			policy_version TEXT NOT NULL DEFAULT '',
+			snapshot_version TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			expires_at TEXT,
+			status TEXT NOT NULL,
+			mutation_id TEXT NOT NULL DEFAULT '',
+			revoked_at TEXT,
+			revoked_by TEXT NOT NULL DEFAULT '',
+			revoke_reason TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_account_overrides_active ON account_overrides(account_id,operation,status,expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_account_overrides_authority ON account_overrides(account_id,operation,authority,status)`,
+		`CREATE TABLE IF NOT EXISTS account_mutations (
+			id TEXT PRIMARY KEY,
+			command_id TEXT NOT NULL,
+			intent_id TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			semantic_signature TEXT NOT NULL,
+			account_id INTEGER NOT NULL,
+			operation TEXT NOT NULL,
+			requested_schedulable INTEGER,
+			requested_load_factor INTEGER,
+			requested_load_factor_set INTEGER NOT NULL DEFAULT 0,
+			winning_intent_id TEXT NOT NULL,
+			winning_idempotency_key TEXT NOT NULL,
+			winning_producer TEXT NOT NULL,
+			winning_authority TEXT NOT NULL,
+			winning_actor TEXT NOT NULL,
+			winning_reason TEXT NOT NULL,
+			winning_evidence_refs TEXT NOT NULL DEFAULT '[]',
+			winning_policy_version TEXT NOT NULL DEFAULT '',
+			winning_snapshot_version TEXT NOT NULL DEFAULT '',
+			winning_created_at TEXT NOT NULL,
+			winning_expires_at TEXT,
+			winning_schedulable INTEGER,
+			winning_load_factor INTEGER,
+			winning_load_factor_set INTEGER NOT NULL DEFAULT 0,
+			winning_override_kind TEXT NOT NULL DEFAULT '',
+			producer TEXT NOT NULL,
+			authority TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			reason_code TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL,
+			policy_version TEXT NOT NULL DEFAULT '',
+			snapshot_version TEXT NOT NULL DEFAULT '',
+			expires_at TEXT,
+			status TEXT NOT NULL,
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			before_schedulable INTEGER,
+			before_load_factor INTEGER,
+			before_load_factor_set INTEGER NOT NULL DEFAULT 0,
+			after_schedulable INTEGER,
+			after_load_factor INTEGER,
+			after_load_factor_set INTEGER NOT NULL DEFAULT 0,
+			last_error_code TEXT NOT NULL DEFAULT '',
+			override_id TEXT NOT NULL DEFAULT '',
+			revoke_override_id TEXT NOT NULL DEFAULT '',
+			telemetry_fresh INTEGER NOT NULL DEFAULT 0,
+			cooldown_active INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_account_mutations_pending ON account_mutations(status,account_id,created_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -353,6 +435,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		definition string
 	}{
 		{"account_policies", "flap_enabled", "INTEGER"},
+		{"account_overrides", "override_kind", "TEXT NOT NULL DEFAULT 'temporary'"},
+		{"account_mutations", "winning_override_kind", "TEXT NOT NULL DEFAULT ''"},
 		{"account_policies", "flap_window_minutes", "INTEGER"},
 		{"account_policies", "flap_pause_threshold", "INTEGER"},
 		{"account_policies", "flap_recovery_threshold", "INTEGER"},
@@ -419,6 +503,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE account_controls SET manual_locked=1 WHERE owns_pause=1 AND owner='operator' AND manual_locked=0`); err != nil {
 		return fmt.Errorf("migrate manual locks: %w", err)
+	}
+	if err := s.migrateLegacyAccountOverrides(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1002,9 +1089,6 @@ func (s *Store) GetControl(ctx context.Context, accountID int64) (model.AccountC
 	control.LoadPinValue = nullIntPointer(loadPinValue)
 	control.LoadPinUntil = parseNullTime(loadPinUntil)
 	control.RecoveryStartedAt = parseNullTime(recoveryStartedAt)
-	if control.OwnsPause && control.Owner == "automatic" && !control.HealthLocked && !control.ManualLocked {
-		control.HealthLocked = true
-	}
 	control.FlapTriggeredAt = parseNullTime(flapTriggeredAt)
 	control.UpdatedAt = parseTime(updated)
 	return control, nil

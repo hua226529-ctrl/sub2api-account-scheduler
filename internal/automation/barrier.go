@@ -1,34 +1,107 @@
 package automation
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
-// Barrier serializes a freeze-state publication with automated external
-// mutations owned by modules outside the deterministic reconcile engine.
+// Barrier serializes freeze-state publication with automated external
+// mutations. Freeze waiters have priority over new mutations so publication
+// cannot starve under a steady write load.
 type Barrier struct {
-	mu sync.RWMutex
+	mu              sync.Mutex
+	changed         chan struct{}
+	activeMutations int
+	freezeActive    bool
+	freezeWaiters   int
 }
 
 func NewBarrier() *Barrier {
-	return &Barrier{}
+	return &Barrier{changed: make(chan struct{})}
 }
 
-// EnterMutation holds the shared side of the barrier until the returned
-// release function is called. Callers must re-read the freeze state while the
-// lease is held and before starting the external write.
-func (b *Barrier) EnterMutation() func() {
+// EnterMutation holds the shared side of the barrier until release is called.
+// Callers must re-read freeze state while the lease is held and before writing.
+func (b *Barrier) EnterMutation(ctx context.Context) (func(), error) {
 	if b == nil {
-		return func() {}
+		return func() {}, nil
 	}
-	b.mu.RLock()
-	return b.mu.RUnlock
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		b.mu.Lock()
+		if !b.freezeActive && b.freezeWaiters == 0 {
+			b.activeMutations++
+			b.mu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					b.mu.Lock()
+					b.activeMutations--
+					b.signalLocked()
+					b.mu.Unlock()
+				})
+			}, nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
-// EnterFreeze blocks until every in-flight automated external mutation has
-// finished, then prevents a new one from starting while freeze state changes.
-func (b *Barrier) EnterFreeze() func() {
+// EnterFreeze waits for in-flight mutations, then excludes new mutations until
+// release is called. Waiting is canceled when ctx ends.
+func (b *Barrier) EnterFreeze(ctx context.Context) (func(), error) {
 	if b == nil {
-		return func() {}
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	b.mu.Lock()
-	return b.mu.Unlock
+	b.freezeWaiters++
+	b.signalLocked()
+	b.mu.Unlock()
+	waiting := true
+	for {
+		b.mu.Lock()
+		if !b.freezeActive && b.activeMutations == 0 {
+			b.freezeWaiters--
+			waiting = false
+			b.freezeActive = true
+			b.mu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					b.mu.Lock()
+					b.freezeActive = false
+					b.signalLocked()
+					b.mu.Unlock()
+				})
+			}, nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			if waiting {
+				b.mu.Lock()
+				b.freezeWaiters--
+				b.signalLocked()
+				b.mu.Unlock()
+			}
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (b *Barrier) signalLocked() {
+	close(b.changed)
+	b.changed = make(chan struct{})
 }

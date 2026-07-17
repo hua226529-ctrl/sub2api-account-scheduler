@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/automation"
-	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplaneshadow"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/health"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
@@ -28,7 +28,10 @@ type Sub2API interface {
 	UpdateLoadFactor(context.Context, int64, *int) (model.Account, error)
 }
 
+type EngineOption func(*Engine)
+
 type Repository interface {
+	accountcontrol.Repository
 	GetSettings(context.Context) (model.Settings, error)
 	UpdateSettings(context.Context, model.Settings) error
 	GetAgentFreezeState(context.Context, string, string) (model.AgentFreezeState, error)
@@ -58,12 +61,12 @@ type Repository interface {
 }
 
 type Engine struct {
-	api          Sub2API
-	store        Repository
-	pollInterval time.Duration
-	logger       *slog.Logger
-	startedAt    time.Time
-	shadow       controlplaneshadow.Runtime
+	api            Sub2API
+	store          Repository
+	pollInterval   time.Duration
+	logger         *slog.Logger
+	startedAt      time.Time
+	accountControl *accountcontrol.Service
 
 	runMu      sync.Mutex
 	barrier    *automation.Barrier
@@ -77,9 +80,9 @@ func NewEngine(api Sub2API, store Repository, pollInterval time.Duration, logger
 	started := time.Now().UTC()
 	engine := &Engine{
 		api: api, store: store, pollInterval: pollInterval, logger: logger, startedAt: started,
-		shadow:  controlplaneshadow.NewRuntime(controlplaneshadow.NoopObserver{}),
 		barrier: automation.NewBarrier(), snapshot: model.Snapshot{ServiceStarted: started}, trigger: make(chan struct{}, 1), conflicts: make(map[string]bool),
 	}
+	engine.accountControl = accountcontrol.New(store, api)
 	for _, option := range options {
 		if option != nil {
 			option(engine)
@@ -95,6 +98,16 @@ func (e *Engine) AutomationBarrier() *automation.Barrier {
 }
 
 func (e *Engine) Start(ctx context.Context) {
+	release, barrierErr := e.barrier.EnterMutation(ctx)
+	if barrierErr != nil {
+		e.logger.Error("account_mutation_startup_recovery_blocked", "error", barrierErr)
+	} else {
+		err := e.accountControl.ReconcilePendingAccountMutations(ctx)
+		release()
+		if err != nil {
+			e.logger.Error("account_mutation_startup_recovery_failed", "error", err)
+		}
+	}
 	go func() {
 		e.reconcileLogged(ctx)
 		ticker := time.NewTicker(e.pollInterval)
@@ -146,7 +159,10 @@ func (e *Engine) FreezeState(ctx context.Context) (model.FreezeState, error) {
 }
 
 func (e *Engine) UpdateFreezeState(ctx context.Context, state model.FreezeState, actor string) error {
-	releaseBarrier := e.barrier.EnterFreeze()
+	releaseBarrier, err := e.barrier.EnterFreeze(ctx)
+	if err != nil {
+		return fmt.Errorf("等待自动化冻结屏障: %w", err)
+	}
 	defer releaseBarrier()
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
@@ -302,618 +318,78 @@ func effectiveFreezeState(state model.AgentFreezeState, now time.Time) model.Fre
 }
 
 func (e *Engine) ManualPause(ctx context.Context, accountID int64, actor string) error {
-	e.observeManualPause(ctx, accountID, actor)
-	updated, err := e.api.SetSchedulable(ctx, accountID, false)
-	if err != nil {
-		return uncertainExternalMutation("管理员暂停账号", err)
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	value := false
-	control.AccountID = accountID
-	control.OwnsPause = true
-	control.Owner = "operator"
-	control.ManualLocked = true
-	control.ExpectedSchedulable = &value
-	control.LastObserved = &value
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "paused"
-	control.LastActionAt = &now
-	event := model.Event{Type: "manual_pause", Severity: "warning", AccountID: &accountID, Message: "账号已由管理端暂停调度", BeforeState: "schedulable", AfterState: fmt.Sprint(updated.Schedulable), Actor: actor, CreatedAt: now}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		rolledBack, rollbackErr := e.api.SetSchedulable(ctx, accountID, true)
-		if rollbackErr != nil || !rolledBack.Schedulable {
-			return uncertainExternalMutation("暂停账号后保存归属失败且回滚未确认",
-				mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认账号恢复"))
-		}
-		return fmt.Errorf("保存管理员暂停归属失败，外部状态已回滚: %w", err)
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.ManualPauseCommand(ctx, accountID, actor, commandID)
+	return legacyMutationResult(result, err)
 }
 
-// AgentPause performs an explicit agent-owned pause. It deliberately does not
-// create a manual lock, so later agent or deterministic recovery can undo it.
 func (e *Engine) AgentPause(ctx context.Context, accountID int64, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-
-	control, err := e.store.GetControl(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	if control.ManualLocked || control.Owner == "operator" {
-		return errors.New("账号由人工暂停，智能体不能接管暂停归属")
-	}
-	if control.ManualOverrideUntil != nil && now.Before(control.ManualOverrideUntil.UTC()) {
-		return errors.New("账号处于人工保护期，智能体不能暂停")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return err
-	}
-	account, found := findAccount(accounts, accountID)
-	if !found || !accountCanBeManaged(account, now) {
-		return errors.New("账号状态异常、凭据错误或已过期")
-	}
-	if !account.Schedulable {
-		return errors.New("账号已经暂停，智能体不会覆盖现有归属")
-	}
-	e.observeAutonomousSchedulable(ctx, controlplaneshadow.PathAgentPause, accountID, false, actor, reason, now)
-	updated, err := e.api.SetSchedulable(ctx, accountID, false)
-	if err != nil {
-		return uncertainExternalMutation("智能体暂停账号", err)
-	}
-	if updated.Schedulable {
-		return errors.New("Sub2API 未确认账号暂停")
-	}
-	control.AccountID = accountID
-	control.OwnsPause = true
-	control.Owner = "agent"
-	control.ManualLocked = false
-	control.ExpectedSchedulable = boolPtr(false)
-	control.LastObserved = boolPtr(false)
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "agent_paused"
-	control.LastActionAt = &now
-	event := model.Event{Type: "agent_pause", Severity: "warning", AccountID: &accountID, Message: reason,
-		BeforeState: "schedulable", AfterState: "paused", Actor: actor, CreatedAt: now}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		rolledBack, rollbackErr := e.api.SetSchedulable(ctx, accountID, true)
-		if rollbackErr != nil || !rolledBack.Schedulable {
-			return uncertainExternalMutation("智能体暂停后保存归属失败且回滚未确认",
-				mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认账号恢复"))
-		}
-		return fmt.Errorf("保存智能体暂停归属失败，外部状态已回滚: %w", err)
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.agentSchedulable(ctx, accountID, false, actor, reason)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) AgentResume(ctx context.Context, accountID int64, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-
-	control, err := e.store.GetControl(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	if !control.OwnsPause || control.Owner != "agent" {
-		return errors.New("该账号不是由智能体暂停，不能自动恢复")
-	}
-	if control.ManualLocked || control.HealthLocked || control.BalanceLocked || control.CostLocked {
-		return errors.New("账号仍存在人工、健康、余额或倍率控制锁")
-	}
-	now := time.Now().UTC()
-	if control.ManualOverrideUntil != nil && now.Before(control.ManualOverrideUntil.UTC()) {
-		return errors.New("账号仍处于人工保护期")
-	}
-	if control.FlapActive {
-		return errors.New("账号仍处于抖动保护，需先解除保护或满足恢复门槛")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return err
-	}
-	account, found := findAccount(accounts, accountID)
-	if !found || !accountCanBeManaged(account, now) {
-		return errors.New("账号状态异常、凭据错误或已过期")
-	}
-	if account.Schedulable {
-		return errors.New("账号已经开启，拒绝改写暂停归属")
-	}
-	e.observeAutonomousSchedulable(ctx, controlplaneshadow.PathAgentResume, accountID, true, actor, reason, now)
-	updated, err := e.api.SetSchedulable(ctx, accountID, true)
-	if err != nil {
-		return uncertainExternalMutation("恢复账号", err)
-	}
-	if !updated.Schedulable {
-		return errors.New("Sub2API 未确认账号恢复")
-	}
-	control.OwnsPause = false
-	control.Owner = ""
-	control.ExpectedSchedulable = boolPtr(true)
-	control.LastObserved = boolPtr(true)
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "agent_resumed"
-	control.LastActionAt = &now
-	event := model.Event{Type: "agent_resume", Severity: "info", AccountID: &accountID, Message: reason,
-		BeforeState: "paused", AfterState: "schedulable", Actor: actor, CreatedAt: now}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		rolledBack, rollbackErr := e.api.SetSchedulable(ctx, accountID, false)
-		if rollbackErr != nil || rolledBack.Schedulable {
-			return uncertainExternalMutation("恢复账号后保存归属失败且回滚未确认",
-				mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认账号重新暂停"))
-		}
-		return fmt.Errorf("保存智能体恢复归属失败，外部状态已回滚: %w", err)
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.agentSchedulable(ctx, accountID, true, actor, reason)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) AgentSetLoadFactor(ctx context.Context, accountID int64, value *int, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-
-	if accountID <= 0 {
-		return errors.New("账号编号无效")
-	}
-	if value != nil && (*value < 1 || *value > 100) {
-		return errors.New("负载系数必须在 1 到 100 之间")
-	}
-	control, err := e.store.GetControl(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	if control.LoadOverrideUntil != nil && now.Before(control.LoadOverrideUntil.UTC()) {
-		return errors.New("负载系数处于人工保护期")
-	}
-	if loadPinActive(control, now) {
-		return errors.New("账号负载已固定到指定时间，需先明确解除负载固定")
-	}
-	binding, ok := findBinding(e.Snapshot().Bindings, accountID)
-	if !ok {
-		return errors.New("账号不在当前调度快照中")
-	}
-	beforeValue := cloneIntPointer(binding.Account.LoadFactor)
-	before := formatLoadFactor(beforeValue)
-	e.observeAutonomousLoadFactor(ctx, controlplaneshadow.PathAgentSetLoad, accountID, value, actor, reason, now)
-	updated, err := e.api.UpdateLoadFactor(ctx, accountID, value)
-	if err != nil {
-		return uncertainExternalMutation("调整账号负载", err)
-	}
-	control.AccountID = accountID
-	control.OwnsLoadFactor = value != nil
-	control.ExpectedLoadFactor = cloneIntPointer(updated.LoadFactor)
-	control.LastActionAt = &now
-	control.LastDecision = "agent_load_adjusted"
-	event := model.Event{Type: "agent_load_factor", Severity: "info", AccountID: &accountID, Message: reason,
-		BeforeState: before, AfterState: formatLoadFactor(updated.LoadFactor), Actor: actor, CreatedAt: now}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		rolledBack, rollbackErr := e.api.UpdateLoadFactor(ctx, accountID, beforeValue)
-		if rollbackErr != nil || !sameIntPointer(rolledBack.LoadFactor, beforeValue) {
-			return uncertainExternalMutation("调整负载后保存归属失败且回滚未确认",
-				mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认负载回滚"))
-		}
-		return fmt.Errorf("保存智能体负载归属失败，外部状态已回滚: %w", err)
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.agentLoad(ctx, accountID, value, actor, reason)
+	return legacyMutationResult(result, err)
 }
 
-// ForceSetLoadFactor applies an administrator's exact command immediately.
-// Unlike automatic load control it may replace an active pin or manual hold,
-// then starts a fresh manual-protection window so the 50-second reconciler does
-// not immediately overwrite the administrator's value.
 func (e *Engine) ForceSetLoadFactor(ctx context.Context, accountID int64, value *int, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	actor, reason = strings.TrimSpace(actor), strings.TrimSpace(reason)
-	if actor == "" || strings.HasPrefix(strings.ToLower(actor), "agent:") {
-		return errors.New("强制调整负载只能由明确的管理员操作者执行")
-	}
-	if accountID <= 0 || (value != nil && (*value < 1 || *value > 100)) {
-		return errors.New("账号编号或负载系数无效")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return fmt.Errorf("强制调整负载前读取账号失败: %w", err)
-	}
-	account, found := findAccount(accounts, accountID)
-	if !found {
-		return errors.New("账号不存在，无法执行管理员负载调整")
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	settings, err := e.store.GetSettings(ctx)
-	if err != nil {
-		return err
-	}
-	before := cloneIntPointer(account.LoadFactor)
-	e.observeAdministratorLoadFactor(ctx, controlplaneshadow.PathForceSetLoad, accountID, value, actor, reason, time.Time{}, nil)
-	updated, err := e.api.UpdateLoadFactor(ctx, accountID, value)
-	if err != nil {
-		return uncertainExternalMutation("管理员强制调整账号负载", err)
-	}
-	if !sameIntPointer(updated.LoadFactor, value) {
-		return errors.New("Sub2API 未确认管理员负载调整")
-	}
-	now := time.Now().UTC()
-	clearLoadPin(&control)
-	control.AccountID = accountID
-	control.OwnsLoadFactor = false
-	control.OriginalLoadFactor = nil
-	control.ExpectedLoadFactor = nil
-	control.LoadStage = "manual_override"
-	until := now.Add(time.Duration(settings.HealthLoadOverrideMinutes) * time.Minute)
-	control.LoadOverrideUntil = &until
-	control.LastDecision = "admin_force_load_adjusted"
-	control.LastActionAt = &now
-	event := model.Event{Type: "admin_force_load_factor", Severity: "warning", AccountID: &accountID,
-		Message: "管理员已强制调整账号负载并替换既有固定或保护", BeforeState: formatLoadFactor(before),
-		AfterState: formatLoadFactor(updated.LoadFactor), Actor: actor, CreatedAt: now,
-		Details: mustJSON(map[string]any{"reason": reason, "protection_until": until})}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		rolledBack, rollbackErr := e.api.UpdateLoadFactor(ctx, accountID, before)
-		if rollbackErr != nil || !sameIntPointer(rolledBack.LoadFactor, before) {
-			return uncertainExternalMutation("管理员调整负载后保存状态失败且回滚未确认",
-				mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认负载回滚"))
-		}
-		return fmt.Errorf("保存管理员负载状态失败，外部状态已回滚: %w", err)
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.ForceSetLoadFactorCommand(ctx, accountID, value, actor, reason, commandID, accountcontrol.DefaultAdministratorTTL)
+	return legacyMutationResult(result, err)
 }
 
-// PinLoad fixes an account's load factor until the supplied deadline. The
-// original load baseline is retained so adaptive health control does not apply
-// percentages to the pinned value after the pin expires.
 func (e *Engine) PinLoad(ctx context.Context, accountID int64, value int, until time.Time, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-	actor, reason = strings.TrimSpace(actor), strings.TrimSpace(reason)
-	if actor == "" {
-		return errors.New("负载固定缺少操作者")
-	}
-	if accountID <= 0 || value < 1 || value > 100 {
-		return errors.New("账号编号或固定负载值无效")
-	}
-	now := time.Now().UTC()
-	until = until.UTC()
-	if !until.After(now) {
-		return errors.New("负载固定截止时间必须晚于当前时间")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return fmt.Errorf("固定负载前读取账号失败: %w", err)
-	}
-	account, found := findAccount(accounts, accountID)
-	isAgent := strings.HasPrefix(strings.ToLower(actor), "agent:")
-	if !found || (isAgent && !accountCanBeManaged(account, now)) {
-		return errors.New("账号不存在，或自动调度目标状态异常、凭据错误、已过期")
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	before := cloneIntPointer(account.LoadFactor)
-	if !control.OwnsLoadFactor {
-		control.OwnsLoadFactor = true
-		control.OriginalLoadFactor = cloneIntPointer(before)
-		if control.LoadStage == "" {
-			control.LoadStage = model.HealthStageHealthy
-		}
+	var deadline *time.Time
+	permanent := until.IsZero()
+	if !permanent {
+		until = until.UTC()
+		deadline = &until
 	}
-	desired := value
-	wroteExternal := !sameIntPointer(account.LoadFactor, &desired)
-	e.observePinnedLoadFactor(ctx, accountID, &desired, actor, reason, now, until)
-	if wroteExternal {
-		updated, updateErr := e.api.UpdateLoadFactor(ctx, accountID, &desired)
-		if updateErr != nil {
-			return uncertainExternalMutation("固定账号负载", updateErr)
-		}
-		if !sameIntPointer(updated.LoadFactor, &desired) {
-			return errors.New("Sub2API 未确认固定负载值")
-		}
-		account = updated
-	}
-	control.AccountID = accountID
-	control.ExpectedLoadFactor = &desired
-	control.LoadPinValue = &desired
-	control.LoadPinUntil = &until
-	control.LoadPinOwner = actor
-	control.LoadPinReason = reason
-	control.LoadOverrideUntil = nil
-	control.LastDecision = "load_pinned"
-	control.LastActionAt = &now
-	event := model.Event{Type: "load_pin_set", Severity: "warning", AccountID: &accountID,
-		Message: "账号负载已固定到指定截止时间", BeforeState: formatLoadFactor(before), AfterState: formatLoadFactor(&desired),
-		Actor: actor, CreatedAt: now, Details: mustJSON(map[string]any{"value": value, "until": until, "reason": reason})}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		if wroteExternal {
-			rolledBack, rollbackErr := e.api.UpdateLoadFactor(ctx, accountID, before)
-			if rollbackErr != nil {
-				return uncertainExternalMutation("固定负载后保存状态失败且回滚未确认",
-					mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认负载回滚"))
-			}
-			if !sameIntPointer(rolledBack.LoadFactor, before) {
-				return uncertainExternalMutation("固定负载后保存状态失败且回滚未确认",
-					fmt.Errorf("保存状态: %w; Sub2API 未确认负载回滚", err))
-			}
-		}
-		return err
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.PinLoadCommand(ctx, accountID, value, deadline, permanent, actor, reason, commandID)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) ClearLoadPin(ctx context.Context, accountID int64, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-	actor = strings.TrimSpace(actor)
-	if actor == "" || accountID <= 0 {
-		return errors.New("账号编号或操作者无效")
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	if control.LoadPinValue == nil || control.LoadPinUntil == nil {
-		return errors.New("账号没有有效的负载固定")
-	}
-	now := time.Now().UTC()
-	before := cloneIntPointer(control.LoadPinValue)
-	clearLoadPin(&control)
-	control.LastDecision = "load_pin_cleared"
-	control.LastActionAt = &now
-	event := model.Event{Type: "load_pin_cleared", Severity: "info", AccountID: &accountID,
-		Message: "账号负载固定已解除", BeforeState: formatLoadFactor(before), Actor: actor, CreatedAt: now,
-		Details: mustJSON(map[string]any{"reason": strings.TrimSpace(reason)})}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		return err
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
-}
-
-func findBinding(bindings []model.ResolvedBinding, accountID int64) (model.ResolvedBinding, bool) {
-	for _, binding := range bindings {
-		if binding.Account.ID == accountID {
-			return binding, true
-		}
-	}
-	return model.ResolvedBinding{}, false
+	result, err := e.ClearLoadPinCommand(ctx, accountID, actor, reason, commandID)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) ManualResume(ctx context.Context, accountID int64, actor string) error {
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	if !control.OwnsPause {
-		return errors.New("该账号不是由本调度器暂停，禁止自动恢复")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return fmt.Errorf("恢复前读取账号状态失败: %w", err)
-	}
-	account, found := findAccount(accounts, accountID)
-	if !found {
-		return errors.New("账号不存在")
-	}
-	if !accountCanBeManaged(account, time.Now().UTC()) {
-		return errors.New("账号状态异常、凭据错误或已过期，禁止恢复")
-	}
-	e.observeManualResume(ctx, accountID, actor)
-	updated, err := e.api.SetSchedulable(ctx, accountID, true)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	value := true
-	balanceLock, err := e.store.GetActiveBalanceLock(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	costLock, err := e.store.GetActiveCostLock(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	if balanceLock != nil || costLock != nil {
-		settings, settingsErr := e.store.GetSettings(ctx)
-		if settingsErr != nil {
-			return settingsErr
-		}
-		until := now.Add(time.Duration(settings.ManualHoldMinutes) * time.Minute)
-		control.OwnsPause = true
-		control.BalanceLocked = balanceLock != nil
-		control.CostLocked = costLock != nil
-		if balanceLock != nil {
-			control.BalanceSourceID = &balanceLock.SourceID
-		}
-		if costLock != nil {
-			control.CostSourceID = &costLock.SourceID
-			control.CostPool = costLock.Pool
-		}
-		control.Owner = pauseOwner(control)
-		control.ExpectedSchedulable = &value
-		control.LastObserved = &value
-		control.ManualOverrideUntil = &until
-		control.LastDecision = "automatic_manual_override"
-		control.LastActionAt = &now
-		eventType := "balance_manual_override"
-		message := "管理端临时开启余额锁定账号，已进入人工保护期"
-		if costLock != nil && balanceLock == nil {
-			eventType = "cost_manual_override"
-			message = "管理端临时开启高倍率待命账号，已进入人工保护期"
-		}
-		event := model.Event{Type: eventType, Severity: "warning", AccountID: &accountID, Message: message, BeforeState: "paused", AfterState: fmt.Sprint(updated.Schedulable), Actor: actor, CreatedAt: now, Details: mustJSON(map[string]any{"until": until, "balance_locked": balanceLock != nil, "cost_locked": costLock != nil})}
-		if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-			return err
-		}
-		e.logEvent(event)
-		e.Trigger()
-		return nil
-	}
-	control.OwnsPause = false
-	control.Owner = ""
-	control.ManualLocked = false
-	control.HealthLocked = false
-	control.CostLocked = false
-	control.CostSourceID = nil
-	control.CostPool = ""
-	control.ExpectedSchedulable = &value
-	control.LastObserved = &value
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "resumed"
-	control.LastActionAt = &now
-	wasFlapProtected := control.FlapActive
-	clearFlapState(&control)
-	events := []model.Event{{Type: "manual_resume", Severity: "info", AccountID: &accountID, Message: "账号已由管理端绕过恢复门槛并恢复调度", BeforeState: "paused", AfterState: fmt.Sprint(updated.Schedulable), Actor: actor, CreatedAt: now}}
-	if wasFlapProtected {
-		events = append(events, flapClearedEvent(&accountID, control.MonitorID, actor, "管理端手动恢复已绕过抖动保护", now))
-	}
-	if err := e.store.CommitControlEvents(ctx, control, events...); err != nil {
-		return err
-	}
-	for _, event := range events {
-		e.logEvent(event)
-	}
-	e.Trigger()
-	return nil
+	result, err := e.ManualResumeCommand(ctx, accountID, actor, commandID, accountcontrol.DefaultAdministratorTTL)
+	return legacyMutationResult(result, err)
 }
 
-// ForceResume is the operator-only emergency recovery entry point. It may
-// recover an account without scheduler pause ownership, but it keeps automatic
-// locks and starts the normal protection window so an unhealthy account can be
-// paused again after the operator has had time to intervene.
 func (e *Engine) ForceResume(ctx context.Context, accountID int64, actor, reason string) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	actor, reason = strings.TrimSpace(actor), strings.TrimSpace(reason)
-	if actor == "" || strings.HasPrefix(strings.ToLower(actor), "agent:") {
-		return errors.New("强制恢复只能由明确的管理员操作者执行")
-	}
-	if accountID <= 0 {
-		return errors.New("账号编号无效")
-	}
-	accounts, err := e.api.ListAccounts(ctx)
-	if err != nil {
-		return fmt.Errorf("强制恢复前读取账号状态失败: %w", err)
-	}
-	account, found := findAccount(accounts, accountID)
-	if !found {
-		return errors.New("账号不存在，无法执行管理员强制恢复")
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	balanceLock, err := e.store.GetActiveBalanceLock(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	costLock, err := e.store.GetActiveCostLock(ctx, accountID)
-	if err != nil {
-		return err
-	}
-	settings, err := e.store.GetSettings(ctx)
-	if err != nil {
-		return err
-	}
-	wasSchedulable := account.Schedulable
-	e.observeAdministratorSchedulable(ctx, controlplaneshadow.PathForceResume, accountID, true, actor, reason, time.Time{})
-	if !wasSchedulable {
-		updated, updateErr := e.api.SetSchedulable(ctx, accountID, true)
-		if updateErr != nil {
-			return uncertainExternalMutation("管理员强制恢复账号", updateErr)
-		}
-		if !updated.Schedulable {
-			return errors.New("Sub2API 未确认账号强制恢复")
-		}
-	}
-	now := time.Now().UTC()
-	value := true
-	control.AccountID = accountID
-	control.ManualLocked = false
-	control.BalanceLocked = balanceLock != nil
-	control.CostLocked = costLock != nil
-	if balanceLock != nil {
-		control.BalanceSourceID = &balanceLock.SourceID
-	} else {
-		control.BalanceSourceID = nil
-	}
-	if costLock != nil {
-		control.CostSourceID = &costLock.SourceID
-		control.CostPool = costLock.Pool
-	} else {
-		control.CostSourceID = nil
-		control.CostPool = ""
-	}
-	automaticLocked := control.HealthLocked || control.BalanceLocked || control.CostLocked
-	var holdUntil *time.Time
-	if automaticLocked {
-		until := now.Add(time.Duration(settings.ManualHoldMinutes) * time.Minute)
-		holdUntil = &until
-		control.OwnsPause = true
-		control.Owner = pauseOwner(control)
-		control.ManualOverrideUntil = holdUntil
-	} else {
-		control.OwnsPause = false
-		control.Owner = ""
-		control.ManualOverrideUntil = nil
-		clearFlapState(&control)
-	}
-	control.ExpectedSchedulable = &value
-	control.LastObserved = &value
-	control.LastDecision = "admin_force_resumed"
-	control.LastActionAt = &now
-	event := model.Event{Type: "admin_force_resume", Severity: "warning", AccountID: &accountID,
-		Message: "管理员已强制恢复账号调度", BeforeState: fmt.Sprint(wasSchedulable), AfterState: "true", Actor: actor,
-		CreatedAt: now, Details: mustJSON(map[string]any{"reason": reason, "protection_until": holdUntil,
-			"health_locked": control.HealthLocked, "balance_locked": control.BalanceLocked, "cost_locked": control.CostLocked})}
-	if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-		if !wasSchedulable {
-			rolledBack, rollbackErr := e.api.SetSchedulable(ctx, accountID, false)
-			if rollbackErr != nil || rolledBack.Schedulable {
-				return uncertainExternalMutation("强制恢复后保存状态失败且回滚未确认",
-					mutationRollbackFailure(err, rollbackErr, "Sub2API 未确认账号重新暂停"))
-			}
-		}
-		return err
-	}
-	e.logEvent(event)
-	e.Trigger()
-	return nil
+	result, err := e.ForceResumeCommand(ctx, accountID, actor, reason, commandID, accountcontrol.DefaultAdministratorTTL)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) ClearFlapProtection(ctx context.Context, accountID int64, actor string) error {
@@ -939,21 +415,12 @@ func (e *Engine) ClearFlapProtection(ctx context.Context, accountID int64, actor
 }
 
 func (e *Engine) ClearOverride(ctx context.Context, accountID int64, actor string) error {
-	if err := e.ensureActorAutomationAllowed(ctx, actor); err != nil {
-		return err
-	}
-	control, err := e.store.GetControl(ctx, accountID)
+	commandID, err := accountcontrol.NewCommandID()
 	if err != nil {
 		return err
 	}
-	control.ManualOverrideUntil = nil
-	control.LastDecision = ""
-	if err := e.store.UpsertControl(ctx, control); err != nil {
-		return err
-	}
-	e.record(ctx, model.Event{Type: "manual_override_cleared", Severity: "info", AccountID: &accountID, Message: "人工保护已解除", Actor: actor})
-	e.Trigger()
-	return nil
+	result, err := e.ReleaseManualHoldCommand(ctx, accountID, actor, commandID)
+	return legacyMutationResult(result, err)
 }
 
 func (e *Engine) reconcileLogged(ctx context.Context) {
@@ -963,8 +430,15 @@ func (e *Engine) reconcileLogged(ctx context.Context) {
 }
 
 func (e *Engine) Reconcile(ctx context.Context) error {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
+	releaseRecovery, err := e.barrier.EnterMutation(ctx)
+	if err != nil {
+		return e.syncFailed(fmt.Errorf("等待账号恢复屏障: %w", err))
+	}
+	recoveryErr := e.accountControl.ReconcilePendingAccountMutations(ctx)
+	releaseRecovery()
+	if recoveryErr != nil {
+		e.logger.Warn("account_mutation_runtime_recovery_incomplete", "error", recoveryErr)
+	}
 
 	settings, err := e.store.GetSettings(ctx)
 	if err != nil {
@@ -1009,134 +483,157 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 
 	bindings, unmatched, conflicts := ResolveBindings(monitors, accounts, policies)
 	e.auditConflicts(ctx, conflicts)
+	accountIssues := make([]AccountReconcileIssue, 0)
 	for i := range bindings {
 		binding := &bindings[i]
-		binding.FailureThreshold = settings.FailureThreshold
-		binding.BaseRecoveryThreshold = settings.RecoveryThreshold
-		if binding.Policy.FailureThreshold != nil {
-			binding.FailureThreshold = *binding.Policy.FailureThreshold
-		}
-		if binding.Policy.RecoveryThreshold != nil {
-			binding.BaseRecoveryThreshold = *binding.Policy.RecoveryThreshold
-		}
-		if settings.HealthMode == model.HealthModeAdaptive {
-			binding.BaseRecoveryThreshold = maxInt(binding.BaseRecoveryThreshold, settings.HealthRecoverySuccesses)
-		}
-		flap := resolveFlapPolicy(settings, binding.Policy)
-		binding.FlapEnabled = flap.Enabled
-		binding.FlapWindowMinutes = flap.WindowMinutes
-		binding.FlapPauseThreshold = flap.PauseThreshold
-		binding.FlapRecoveryThreshold = flap.RecoveryThreshold
-		if binding.Monitor != nil {
-			binding.MonitorState = states[binding.Monitor.ID]
-			binding.HealthState = healthStates[binding.Monitor.ID]
-			decision, decisionErr := e.evaluateV3Decision(ctx, *binding, now, settings)
-			if decisionErr != nil {
-				return e.syncFailed(decisionErr)
+		accountErr := func() error {
+			binding.FailureThreshold = settings.FailureThreshold
+			binding.BaseRecoveryThreshold = settings.RecoveryThreshold
+			if binding.Policy.FailureThreshold != nil {
+				binding.FailureThreshold = *binding.Policy.FailureThreshold
 			}
-			binding.Decision = decision
-		}
-		control, err := e.store.GetControl(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		recentPauses, err := e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.RecentAutomaticPauses = recentPauses
-		balanceLock, err := e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.BalanceLocked = balanceLock != nil
-		if balanceLock != nil {
-			control.BalanceSourceID = &balanceLock.SourceID
-		} else {
-			control.BalanceSourceID = nil
-		}
-		costLock, err := e.store.GetActiveCostLock(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.CostLocked = costLock != nil
-		if costLock != nil {
-			control.CostSourceID = &costLock.SourceID
-			control.CostPool = costLock.Pool
-		} else {
-			control.CostSourceID = nil
-			control.CostPool = ""
-		}
-		if control.FlapActive && !flap.Enabled {
-			clearFlapState(&control)
-			event := flapClearedEvent(&binding.Account.ID, control.MonitorID, "system", "账号策略已关闭抖动保护", now)
-			if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-				return e.syncFailed(err)
+			if binding.Policy.RecoveryThreshold != nil {
+				binding.BaseRecoveryThreshold = *binding.Policy.RecoveryThreshold
 			}
-			e.logEvent(event)
-		}
-		if flap.Enabled && !control.FlapActive && control.HealthLocked && recentPauses >= flap.PauseThreshold {
-			triggeredAt := now
-			control.FlapActive = true
-			control.FlapTriggeredAt = &triggeredAt
-			control.FlapRecoveryRequired = maxInt(binding.BaseRecoveryThreshold, flap.RecoveryThreshold)
-			event := model.Event{
-				Type: "flap_protection_activated", Severity: "warning", MonitorID: control.MonitorID, AccountID: &binding.Account.ID,
-				Message: "升级后检测到账号在滚动窗口内反复暂停，已补充抖动保护", BeforeState: "normal_recovery", AfterState: "flap_protected",
-				Details: mustJSON(map[string]any{"window_minutes": flap.WindowMinutes, "recent_pause_count": recentPauses, "pause_threshold": flap.PauseThreshold, "recovery_threshold": control.FlapRecoveryRequired}), Actor: "system", CreatedAt: now,
+			if settings.HealthMode == model.HealthModeAdaptive {
+				binding.BaseRecoveryThreshold = maxInt(binding.BaseRecoveryThreshold, settings.HealthRecoverySuccesses)
 			}
-			if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
-				return e.syncFailed(err)
+			flap := resolveFlapPolicy(settings, binding.Policy)
+			binding.FlapEnabled = flap.Enabled
+			binding.FlapWindowMinutes = flap.WindowMinutes
+			binding.FlapPauseThreshold = flap.PauseThreshold
+			binding.FlapRecoveryThreshold = flap.RecoveryThreshold
+			if binding.Monitor != nil {
+				binding.MonitorState = states[binding.Monitor.ID]
+				binding.HealthState = healthStates[binding.Monitor.ID]
+				decision, decisionErr := e.evaluateV3Decision(ctx, *binding, now, settings)
+				if decisionErr != nil {
+					return decisionErr
+				}
+				binding.Decision = decision
 			}
-			e.logEvent(event)
+			control, err := e.store.GetControl(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			recentPauses, err := e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
+			if err != nil {
+				return err
+			}
+			control.RecentAutomaticPauses = recentPauses
+			balanceLock, err := e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			control.BalanceLocked = balanceLock != nil
+			if balanceLock != nil {
+				control.BalanceSourceID = &balanceLock.SourceID
+			} else {
+				control.BalanceSourceID = nil
+			}
+			costLock, err := e.store.GetActiveCostLock(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			control.CostLocked = costLock != nil
+			if costLock != nil {
+				control.CostSourceID = &costLock.SourceID
+				control.CostPool = costLock.Pool
+			} else {
+				control.CostSourceID = nil
+				control.CostPool = ""
+			}
+			if control.FlapActive && !flap.Enabled {
+				clearFlapState(&control)
+				event := flapClearedEvent(&binding.Account.ID, control.MonitorID, "system", "账号策略已关闭抖动保护", now)
+				if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
+					return err
+				}
+				e.logEvent(event)
+			}
+			if flap.Enabled && !control.FlapActive && control.HealthLocked && recentPauses >= flap.PauseThreshold {
+				triggeredAt := now
+				control.FlapActive = true
+				control.FlapTriggeredAt = &triggeredAt
+				control.FlapRecoveryRequired = maxInt(binding.BaseRecoveryThreshold, flap.RecoveryThreshold)
+				event := model.Event{
+					Type: "flap_protection_activated", Severity: "warning", MonitorID: control.MonitorID, AccountID: &binding.Account.ID,
+					Message: "升级后检测到账号在滚动窗口内反复暂停，已补充抖动保护", BeforeState: "normal_recovery", AfterState: "flap_protected",
+					Details: mustJSON(map[string]any{"window_minutes": flap.WindowMinutes, "recent_pause_count": recentPauses, "pause_threshold": flap.PauseThreshold, "recovery_threshold": control.FlapRecoveryRequired}), Actor: "system", CreatedAt: now,
+				}
+				if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
+					return err
+				}
+				e.logEvent(event)
+			}
+			binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
+			binding.Control = control
+			if err := e.reconcileAccount(ctx, binding, settings, now); err != nil {
+				return err
+			}
+			control, err = e.store.GetControl(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			recentPauses, err = e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
+			if err != nil {
+				return err
+			}
+			control.RecentAutomaticPauses = recentPauses
+			balanceLock, err = e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			control.BalanceLocked = balanceLock != nil
+			if balanceLock != nil {
+				control.BalanceSourceID = &balanceLock.SourceID
+			} else {
+				control.BalanceSourceID = nil
+			}
+			costLock, err = e.store.GetActiveCostLock(ctx, binding.Account.ID)
+			if err != nil {
+				return err
+			}
+			control.CostLocked = costLock != nil
+			if costLock != nil {
+				control.CostSourceID = &costLock.SourceID
+				control.CostPool = costLock.Pool
+			} else {
+				control.CostSourceID = nil
+				control.CostPool = ""
+			}
+			binding.Control = control
+			binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
+			return nil
+		}()
+		if accountErr != nil {
+			issue := accountReconcileIssue(binding.Account.ID, accountErr)
+			accountIssues = append(accountIssues, issue)
+			details := mustJSON(map[string]any{"status": issue.Status, "error_code": issue.Code,
+				"account_context": json.RawMessage(actionDetails(binding, &binding.Control, "账号协调失败"))})
+			e.record(ctx, model.Event{Type: "account_action_failed", Severity: "error", MonitorID: bindingMonitorID(binding),
+				AccountID: &binding.Account.ID, Message: accountErr.Error(), Details: details, Actor: "system"})
+			e.logger.Error("account_reconcile_failed", "account_id", binding.Account.ID, "status", issue.Status,
+				"code", issue.Code, "error", accountErr)
 		}
-		binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
-		binding.Control = control
-		if err := e.reconcileAccountWithFreeze(ctx, binding, settings, now, freeze.AllAutomation); err != nil {
-			e.record(ctx, model.Event{Type: "account_action_failed", Severity: "error", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: err.Error(), Details: actionDetails(binding, &binding.Control, "写入 Sub2API 失败"), Actor: "system"})
-			e.logger.Error("account_reconcile_failed", "account_id", binding.Account.ID, "error", err)
-			return e.syncFailed(fmt.Errorf("账号 %d 写入失败，已停止本轮后续操作: %w", binding.Account.ID, err))
-		}
-		control, err = e.store.GetControl(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		recentPauses, err = e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.RecentAutomaticPauses = recentPauses
-		balanceLock, err = e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.BalanceLocked = balanceLock != nil
-		if balanceLock != nil {
-			control.BalanceSourceID = &balanceLock.SourceID
-		} else {
-			control.BalanceSourceID = nil
-		}
-		costLock, err = e.store.GetActiveCostLock(ctx, binding.Account.ID)
-		if err != nil {
-			return e.syncFailed(err)
-		}
-		control.CostLocked = costLock != nil
-		if costLock != nil {
-			control.CostSourceID = &costLock.SourceID
-			control.CostPool = costLock.Pool
-		} else {
-			control.CostSourceID = nil
-			control.CostPool = ""
-		}
-		binding.Control = control
-		binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
 	}
 
 	syncedAt := time.Now().UTC()
+	var aggregate *AccountReconcileErrors
+	lastSyncError := ""
+	if len(accountIssues) > 0 {
+		aggregate = &AccountReconcileErrors{Issues: accountIssues}
+		lastSyncError = aggregate.Error()
+	}
 	e.snapshotMu.Lock()
-	e.snapshot = model.Snapshot{Bindings: bindings, Unmatched: unmatched, Conflicts: conflicts, LastSyncAt: &syncedAt, Settings: settings, Freeze: freeze, ServiceStarted: e.startedAt}
+	e.snapshot = model.Snapshot{Bindings: bindings, Unmatched: unmatched, Conflicts: conflicts, LastSyncAt: &syncedAt,
+		LastSyncError: lastSyncError, Settings: settings, Freeze: freeze, ServiceStarted: e.startedAt}
 	e.snapshotMu.Unlock()
-	e.logger.Info("reconcile_complete", "monitors", len(monitors), "accounts", len(accounts), "bindings", len(bindings), "dry_run", settings.DryRun)
+	e.logger.Info("reconcile_complete", "monitors", len(monitors), "accounts", len(accounts), "bindings", len(bindings),
+		"account_errors", len(accountIssues), "dry_run", settings.DryRun)
+	if aggregate != nil {
+		return aggregate
+	}
 	return nil
 }
 
@@ -1494,140 +991,60 @@ func minInt(left, right int) int {
 }
 
 func (e *Engine) reconcileAccount(ctx context.Context, binding *model.ResolvedBinding, settings model.Settings, now time.Time) error {
-	return e.reconcileAccountWithFreeze(ctx, binding, settings, now, false)
-}
-
-func (e *Engine) reconcileAccountWithFreeze(ctx context.Context, binding *model.ResolvedBinding, settings model.Settings, now time.Time, automationFrozen bool) error {
 	control := binding.Control
 	control.AccountID = binding.Account.ID
 	monitorID := bindingMonitorID(binding)
 	if monitorID != nil {
 		control.MonitorID = monitorID
 	}
-	actual := binding.Account.Schedulable
+	control.LastObserved = boolPtr(binding.Account.Schedulable)
 	effectiveDryRun := settings.DryRun || settings.HealthMode == model.HealthModeObserve
 
 	adaptive := settings.HealthMode == model.HealthModeAdaptive
 	if adaptive {
 		e.advanceAdaptiveHealthControl(ctx, binding, &control, settings, now)
 	} else if settings.HealthMode == model.HealthModeLegacy {
-		healthUsable := binding.State == "bound" && binding.Monitor != nil && binding.MonitorState.Phase != model.PhaseFrozen && binding.MonitorState.Phase != model.PhaseUnknown
-		if healthUsable && binding.MonitorState.Phase == model.PhaseUnhealthy && binding.MonitorState.UnhealthyStreak >= binding.FailureThreshold && accountCanBeManaged(binding.Account, now) {
+		healthUsable := binding.State == "bound" && binding.Monitor != nil &&
+			binding.MonitorState.Phase != model.PhaseFrozen && binding.MonitorState.Phase != model.PhaseUnknown
+		if healthUsable && binding.MonitorState.Phase == model.PhaseUnhealthy &&
+			binding.MonitorState.UnhealthyStreak >= binding.FailureThreshold && accountCanBeManaged(binding.Account, now) {
 			control.HealthLocked = true
 		}
-		if healthUsable && binding.MonitorState.Phase == model.PhaseHealthy && binding.MonitorState.HealthyStreak >= binding.RecoveryThreshold && accountCanBeManaged(binding.Account, now) {
-			if control.HealthLocked {
-				control.HealthLocked = false
-				if control.FlapActive {
-					clearFlapState(&control)
-					e.record(ctx, flapClearedEvent(&binding.Account.ID, monitorID, "system", "连续正常检测达到锁定门槛，健康锁已解除", now))
-				}
-			}
+		if healthUsable && binding.MonitorState.Phase == model.PhaseHealthy &&
+			binding.MonitorState.HealthyStreak >= binding.RecoveryThreshold && accountCanBeManaged(binding.Account, now) {
+			control.HealthLocked = false
 		}
 	}
+	if err := e.store.UpsertControl(ctx, control); err != nil {
+		return err
+	}
+	binding.Control = control
 
-	automaticLocked := control.HealthLocked || control.BalanceLocked || control.CostLocked
-	anyLocked := automaticLocked || control.ManualLocked
-	control.LastObserved = boolPtr(actual)
 	if adaptive {
-		if err := e.reconcileAdaptiveLoadWithFreeze(ctx, binding, &control, settings, now, automationFrozen); err != nil {
+		if err := e.reconcileAdaptiveLoad(ctx, binding, &control, settings, now); err != nil {
 			return err
 		}
+	} else if err := e.reconcileExpiredLoadControl(ctx, binding, &control, settings, now); err != nil {
+		return err
 	}
-
-	if control.OwnsPause && actual {
-		if control.ManualLocked && !automaticLocked {
-			control.ManualLocked = false
-			control.OwnsPause = false
-			control.Owner = ""
-			control.ExpectedSchedulable = boolPtr(true)
-			control.ManualOverrideUntil = nil
-			control.LastDecision = "manual_pause_reversed"
-			event := model.Event{Type: "manual_resume_confirmed", Severity: "info", MonitorID: monitorID, AccountID: &binding.Account.ID, Message: "检测到后台人工开启，已释放管理端暂停归属", Actor: "system", CreatedAt: now}
-			return e.store.CommitControlEvents(ctx, control, event)
-		}
-		if automaticLocked {
-			if control.ManualOverrideUntil == nil {
-				until := now.Add(time.Duration(settings.ManualHoldMinutes) * time.Minute)
-				control.ManualOverrideUntil = &until
-				control.LastDecision = "manual_override"
-				eventType := "manual_override"
-				if control.BalanceLocked {
-					eventType = "balance_manual_override"
-				} else if control.CostLocked {
-					eventType = "cost_manual_override"
-				}
-				e.record(ctx, model.Event{Type: eventType, Severity: "warning", MonitorID: monitorID, AccountID: &binding.Account.ID, Message: "检测到人工开启，进入保护期", Actor: "system", Details: mustJSON(map[string]any{"until": until, "balance_locked": control.BalanceLocked, "health_locked": control.HealthLocked, "cost_locked": control.CostLocked})})
-				return e.store.UpsertControl(ctx, control)
-			}
-			if now.Before(*control.ManualOverrideUntil) {
-				return e.store.UpsertControl(ctx, control)
-			}
-			if automationFrozen {
-				return e.persistFrozenAutomaticAction(ctx, binding, &control, "pause", "人工保护到期且控制锁仍未解除", now)
-			}
-			return e.applyPause(ctx, binding, &control, effectiveDryRun, "人工保护到期且控制锁仍未解除", now)
-		}
-		control.OwnsPause = false
-		control.Owner = ""
-		control.ExpectedSchedulable = boolPtr(true)
-		control.ManualOverrideUntil = nil
-		control.LastDecision = "manual_resume_confirmed"
-		return e.store.UpsertControl(ctx, control)
-	}
-
-	if anyLocked {
-		if !actual {
-			return e.store.UpsertControl(ctx, control)
-		}
-		if control.ManualOverrideUntil != nil && now.Before(*control.ManualOverrideUntil) {
-			return e.store.UpsertControl(ctx, control)
-		}
+	locked := control.HealthLocked || control.BalanceLocked || control.CostLocked
+	if locked {
 		reason := "账号存在有效控制锁"
-		if control.CostLocked && (control.BalanceLocked || control.HealthLocked) {
+		switch {
+		case control.CostLocked && (control.BalanceLocked || control.HealthLocked):
 			reason = "账号同时受到健康、余额或倍率策略限制"
-		} else if control.BalanceLocked && control.HealthLocked {
+		case control.BalanceLocked && control.HealthLocked:
 			reason = "余额不足且渠道连续异常"
-		} else if control.BalanceLocked {
+		case control.BalanceLocked:
 			reason = "上游余额连续低于停用阈值"
-		} else if control.HealthLocked {
+		case control.HealthLocked:
 			reason = "上游连续检测异常"
-		} else if control.CostLocked {
+		case control.CostLocked:
 			reason = "倍率池已有更低成本的可用上游，该账号转入待命"
-		}
-		if automationFrozen {
-			return e.persistFrozenAutomaticAction(ctx, binding, &control, "pause", reason, now)
 		}
 		return e.applyPause(ctx, binding, &control, effectiveDryRun, reason, now)
 	}
-
-	control.ManualOverrideUntil = nil
-	if control.OwnsPause && !actual && accountCanBeManaged(binding.Account, now) {
-		if automationFrozen {
-			return e.persistFrozenAutomaticAction(ctx, binding, &control, "resume", "全部控制锁均已解除", now)
-		}
-		return e.applyResume(ctx, binding, &control, effectiveDryRun, "全部控制锁均已解除", now)
-	}
-	if control.LastDecision != "" {
-		control.LastDecision = ""
-	}
-	return e.store.UpsertControl(ctx, control)
-}
-
-func (e *Engine) persistFrozenAutomaticAction(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl, action, reason string, now time.Time) error {
-	decision := "automation_frozen_" + action
-	if control.LastDecision == decision {
-		return e.store.UpsertControl(ctx, *control)
-	}
-	control.LastDecision = decision
-	event := model.Event{Type: "automation_write_blocked", Severity: "warning", MonitorID: bindingMonitorID(binding),
-		AccountID: &binding.Account.ID, Message: "全部自动化冻结已阻止账号写入", Actor: "system", CreatedAt: now,
-		Details: mustJSON(map[string]any{"action": action, "reason": reason})}
-	if err := e.store.CommitControlEvents(ctx, *control, event); err != nil {
-		return err
-	}
-	e.logEvent(event)
-	return nil
+	return e.applyResume(ctx, binding, &control, effectiveDryRun, "全部控制锁均已解除", now)
 }
 
 func (e *Engine) advanceAdaptiveHealthControl(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl, settings model.Settings, now time.Time) {
@@ -1790,71 +1207,9 @@ func (e *Engine) advanceV3RecoveryStage(binding *model.ResolvedBinding, control 
 }
 
 func (e *Engine) reconcileAdaptiveLoad(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl, settings model.Settings, now time.Time) error {
-	return e.reconcileAdaptiveLoadWithFreeze(ctx, binding, control, settings, now, false)
-}
-
-func (e *Engine) reconcileAdaptiveLoadWithFreeze(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl, settings model.Settings, now time.Time, automationFrozen bool) error {
-	if binding.State != "bound" || binding.Monitor == nil || control.ManualLocked {
+	if binding.State != "bound" || binding.Monitor == nil {
 		return nil
 	}
-	if control.LoadPinValue != nil || control.LoadPinUntil != nil {
-		if !loadPinActive(*control, now) {
-			before := cloneIntPointer(control.LoadPinValue)
-			clearLoadPin(control)
-			if control.LoadStage == "" {
-				control.LoadStage = model.HealthStageHealthy
-			}
-			event := model.Event{Type: "load_pin_expired", Severity: "info", MonitorID: bindingMonitorID(binding),
-				AccountID: &binding.Account.ID, Message: "账号负载固定已到期，恢复健康调度控制", BeforeState: formatLoadFactor(before),
-				Actor: "system", CreatedAt: now}
-			if err := e.store.CommitControlEvents(ctx, *control, event); err != nil {
-				return err
-			}
-			e.logEvent(event)
-		} else if !sameIntPointer(binding.Account.LoadFactor, control.LoadPinValue) {
-			until := now.Add(time.Duration(settings.HealthLoadOverrideMinutes) * time.Minute)
-			before := cloneIntPointer(control.LoadPinValue)
-			clearLoadPin(control)
-			control.OwnsLoadFactor = false
-			control.OriginalLoadFactor = nil
-			control.ExpectedLoadFactor = nil
-			control.LoadOverrideUntil = &until
-			control.LoadStage = "manual_override"
-			event := model.Event{Type: "load_pin_overridden", Severity: "warning", MonitorID: bindingMonitorID(binding),
-				AccountID: &binding.Account.ID, Message: "检测到后台人工修改负载，已解除负载固定", BeforeState: formatLoadFactor(before),
-				AfterState: formatLoadFactor(binding.Account.LoadFactor), Actor: "system", CreatedAt: now, Details: mustJSON(map[string]any{"until": until})}
-			if err := e.store.CommitControlEvents(ctx, *control, event); err != nil {
-				return err
-			}
-			e.logEvent(event)
-			return nil
-		} else {
-			// A valid pin owns the actual load value. Health state may continue to
-			// evolve, but it cannot overwrite this value until the deadline.
-			return nil
-		}
-	}
-	if control.OwnsLoadFactor && !sameIntPointer(binding.Account.LoadFactor, control.ExpectedLoadFactor) {
-		until := now.Add(time.Duration(settings.HealthLoadOverrideMinutes) * time.Minute)
-		control.OwnsLoadFactor = false
-		control.OriginalLoadFactor = nil
-		control.ExpectedLoadFactor = nil
-		control.LoadOverrideUntil = &until
-		control.LoadStage = "manual_override"
-		e.record(ctx, model.Event{Type: "manual_load_override", Severity: "warning", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: "检测到后台人工修改负载，调度器已暂停负载控制", Details: mustJSON(map[string]any{"until": until}), Actor: "system", CreatedAt: now})
-		return nil
-	}
-	if !binding.Account.Schedulable && !control.OwnsPause {
-		return nil
-	}
-	if control.LoadOverrideUntil != nil {
-		if now.Before(*control.LoadOverrideUntil) {
-			return nil
-		}
-		control.LoadOverrideUntil = nil
-		control.LoadStage = binding.HealthState.Stage
-	}
-
 	var desired *int
 	restore := false
 	switch control.LoadStage {
@@ -1862,16 +1217,14 @@ func (e *Engine) reconcileAdaptiveLoadWithFreeze(ctx context.Context, binding *m
 		desired = desiredLoadFactor(binding.Account, control, 80)
 	case model.HealthStageLimited50, model.HealthStageDegraded:
 		desired = desiredLoadFactor(binding.Account, control, settings.HealthDegradedPercent)
-	case model.HealthStageLimited25:
-		desired = desiredLoadFactor(binding.Account, control, settings.HealthTrialPercent)
-	case model.HealthStageRecovering25:
+	case model.HealthStageLimited25, model.HealthStageRecovering25:
 		desired = desiredLoadFactor(binding.Account, control, settings.HealthTrialPercent)
 	case model.HealthStageRecovering50:
 		desired = desiredLoadFactor(binding.Account, control, settings.HealthMidPercent)
 	case model.HealthStageRecovering80:
 		desired = desiredLoadFactor(binding.Account, control, 80)
 	case model.HealthStageHealthy:
-		if control.OwnsLoadFactor {
+		if control.OwnsLoadFactor || loadControlExpired(*control, now) {
 			desired = cloneIntPointer(control.OriginalLoadFactor)
 			restore = true
 		}
@@ -1881,105 +1234,66 @@ func (e *Engine) reconcileAdaptiveLoadWithFreeze(ctx context.Context, binding *m
 	if desired == nil && !restore {
 		return nil
 	}
-	if sameIntPointer(binding.Account.LoadFactor, desired) {
-		if restore {
-			return e.completeLoadRecovery(ctx, binding, control, now, binding.Account.LoadFactor, desired)
-		}
-		return nil
+	eventType, message, severity := "load_factor_adjusted", "账号负载已按渠道健康状态调整", "warning"
+	if restore {
+		eventType, message, severity = "load_factor_restored", "账号已恢复策略基线负载", "info"
 	}
 	if settings.DryRun {
-		eventType := "would_reduce_load"
-		message := "智能判定建议降低账号负载"
-		if restore {
-			eventType = "would_restore_load"
-			message = "智能判定建议恢复账号原始负载"
-		}
-		if control.LastDecision != eventType {
-			control.LastDecision = eventType
-			e.record(ctx, model.Event{Type: eventType, Severity: "info", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: message, BeforeState: formatLoadFactor(binding.Account.LoadFactor), AfterState: formatLoadFactor(desired), Details: actionDetails(binding, control, message), Actor: "system", CreatedAt: now})
-		}
-		return nil
+		return e.store.CommitControlEvents(ctx, *control, model.Event{Type: "would_" + eventType, Severity: severity,
+			MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: message,
+			BeforeState: formatLoadFactor(binding.Account.LoadFactor), AfterState: formatLoadFactor(desired),
+			Details: actionDetails(binding, control, message), Actor: "system", CreatedAt: now})
 	}
-	if automationFrozen {
-		return e.persistFrozenAutomaticAction(ctx, binding, control, "set_load_factor", "健康调度拟调整账号负载", now)
-	}
-	if !control.OwnsLoadFactor {
-		control.OwnsLoadFactor = true
-		control.OriginalLoadFactor = cloneIntPointer(binding.Account.LoadFactor)
-	}
-	beforeLoad := cloneIntPointer(binding.Account.LoadFactor)
-	if !control.ManualLocked && !control.BalanceLocked && !control.CostLocked {
-		e.observePolicyLoadFactor(ctx, binding, desired, reasonForAdaptiveLoad(restore), now)
-	}
-	updated, err := e.api.UpdateLoadFactor(ctx, binding.Account.ID, desired)
+	intent, safety, err := e.policyLoadIntent(ctx, binding, desired, reasonForAdaptiveLoad(restore))
 	if err != nil {
 		return err
 	}
-	if !sameIntPointer(updated.LoadFactor, desired) {
-		return errors.New("Sub2API 未确认账号负载系数更新")
-	}
-	binding.Account = updated
-	control.ExpectedLoadFactor = cloneIntPointer(desired)
-	control.LastActionAt = &now
-	if restore {
-		if err := e.completeLoadRecovery(ctx, binding, control, now, beforeLoad, desired); err != nil {
-			return e.rollbackLoadFactor(ctx, binding, beforeLoad, err)
-		}
+	result, err := e.submitAccountMutation(ctx, accountcontrol.Submission{CommandID: intent.ID, Intent: intent, Safety: safety,
+		Event: model.Event{Type: eventType, Severity: severity, MonitorID: bindingMonitorID(binding), Message: message}})
+	if expectedPolicyBlock(err) {
 		return nil
 	}
-	event := model.Event{Type: "load_factor_adjusted", Severity: "warning", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: "账号负载已按渠道健康状态调整", BeforeState: formatLoadFactor(beforeLoad), AfterState: formatLoadFactor(desired), Details: actionDetails(binding, control, "第三版建议负载"), Actor: "system", CreatedAt: now}
-	if err := e.store.CommitControlEvents(ctx, *control, event); err != nil {
-		return e.rollbackLoadFactor(ctx, binding, beforeLoad, err)
-	}
-	e.logEvent(event)
-	return nil
-}
-
-func loadPinActive(control model.AccountControl, now time.Time) bool {
-	return control.LoadPinValue != nil && control.LoadPinUntil != nil && now.Before(control.LoadPinUntil.UTC())
-}
-
-func clearLoadPin(control *model.AccountControl) {
-	control.LoadPinValue = nil
-	control.LoadPinUntil = nil
-	control.LoadPinOwner = ""
-	control.LoadPinReason = ""
-}
-
-func (e *Engine) rollbackLoadFactor(ctx context.Context, binding *model.ResolvedBinding, previous *int, cause error) error {
-	rolledBack, rollbackErr := e.api.UpdateLoadFactor(ctx, binding.Account.ID, previous)
-	if rollbackErr != nil {
-		return fmt.Errorf("保存负载控制状态失败: %w; 回滚负载失败: %v", cause, rollbackErr)
-	}
-	if !sameIntPointer(rolledBack.LoadFactor, previous) {
-		return fmt.Errorf("保存负载控制状态失败: %w; Sub2API 未确认负载回滚", cause)
-	}
-	binding.Account = rolledBack
-	return cause
-}
-
-func (e *Engine) completeLoadRecovery(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl, now time.Time, before, after *int) error {
-	details := actionDetails(binding, control, "分阶段恢复完成")
-	control.OwnsLoadFactor = false
-	control.OriginalLoadFactor = nil
-	control.ExpectedLoadFactor = nil
-	control.LoadOverrideUntil = nil
-	control.LoadStage = model.HealthStageHealthy
-	control.RecoveryStep = 0
-	control.RecoveryStartedAt = nil
-	wasFlapProtected := control.FlapActive
-	clearFlapState(control)
-	events := []model.Event{{Type: "load_factor_restored", Severity: "info", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: "账号已完成分阶段恢复并还原原始负载", BeforeState: formatLoadFactor(before), AfterState: formatLoadFactor(after), Details: details, Actor: "system", CreatedAt: now}}
-	if wasFlapProtected {
-		events = append(events, flapClearedEvent(&binding.Account.ID, bindingMonitorID(binding), "system", "账号已完成分阶段恢复", now))
-	}
-	if err := e.store.CommitControlEvents(ctx, *control, events...); err != nil {
+	if err != nil {
 		return err
 	}
-	for _, event := range events {
-		e.logEvent(event)
+	if result.VerifiedAfter != nil {
+		binding.Account.LoadFactor = cloneIntPointer(result.VerifiedAfter.LoadFactor)
 	}
 	return nil
+}
+
+func (e *Engine) reconcileExpiredLoadControl(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl,
+	settings model.Settings, now time.Time) error {
+	if !loadControlExpired(*control, now) {
+		return nil
+	}
+	desired := cloneIntPointer(control.OriginalLoadFactor)
+	if settings.DryRun || settings.HealthMode == model.HealthModeObserve {
+		return e.store.CommitControlEvents(ctx, *control, model.Event{Type: "would_load_factor_restored", Severity: "info",
+			MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: "临时负载控制到期后将恢复策略基线",
+			BeforeState: formatLoadFactor(binding.Account.LoadFactor), AfterState: formatLoadFactor(desired), Actor: "system", CreatedAt: now})
+	}
+	intent, safety, err := e.policyLoadIntent(ctx, binding, desired, "临时负载控制已到期，恢复策略基线")
+	if err != nil {
+		return err
+	}
+	result, err := e.submitAccountMutation(ctx, accountcontrol.Submission{CommandID: intent.ID, Intent: intent, Safety: safety,
+		Event: model.Event{Type: "load_factor_restored", Severity: "info", MonitorID: bindingMonitorID(binding), Message: "临时负载控制已到期，账号恢复策略基线"}})
+	if expectedPolicyBlock(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if result.VerifiedAfter != nil {
+		binding.Account.LoadFactor = cloneIntPointer(result.VerifiedAfter.LoadFactor)
+	}
+	return nil
+}
+
+func loadControlExpired(control model.AccountControl, now time.Time) bool {
+	return control.LoadOverrideUntil != nil && !control.LoadOverrideUntil.After(now) ||
+		control.LoadPinUntil != nil && !control.LoadPinUntil.After(now)
 }
 
 func desiredLoadFactor(account model.Account, control *model.AccountControl, percent int) *int {
@@ -2075,50 +1389,33 @@ func (e *Engine) applyPause(ctx context.Context, binding *model.ResolvedBinding,
 		eventType = "cost_pause"
 	}
 	if dryRun {
-		if control.LastDecision != "would_pause" {
-			control.LastDecision = "would_pause"
-			e.record(ctx, model.Event{Type: "would_pause", Severity: "warning", MonitorID: monitorID, AccountID: &binding.Account.ID, Message: reason, BeforeState: "schedulable", AfterState: "paused", Details: actionDetails(binding, control, reason), Actor: "system"})
-		}
-		return e.store.UpsertControl(ctx, *control)
+		control.LastDecision = "would_pause"
+		return e.store.CommitControlEvents(ctx, *control, model.Event{Type: "would_pause", Severity: "warning",
+			MonitorID: monitorID, AccountID: &binding.Account.ID, Message: reason, BeforeState: "schedulable",
+			AfterState: "paused", Details: actionDetails(binding, control, reason), Actor: "system", CreatedAt: now})
 	}
-	if control.HealthLocked && !control.ManualLocked && !control.BalanceLocked && !control.CostLocked {
-		e.observePolicySchedulable(ctx, controlplaneshadow.PathReconcilePolicyPause, binding, false, reason, now)
-	}
-	updated, err := e.api.SetSchedulable(ctx, binding.Account.ID, false)
+	binding.Control = *control
+	intent, safety, err := e.policySchedulableIntent(ctx, binding, false, reason)
 	if err != nil {
 		return err
 	}
-	if updated.Schedulable {
-		return errors.New("Sub2API 未确认账号暂停")
+	var flap *model.FlapPolicy
+	if control.HealthLocked {
+		value := model.FlapPolicy{Enabled: binding.FlapEnabled, WindowMinutes: binding.FlapWindowMinutes,
+			PauseThreshold:    binding.FlapPauseThreshold,
+			RecoveryThreshold: maxInt(binding.BaseRecoveryThreshold, binding.FlapRecoveryThreshold)}
+		flap = &value
 	}
-	control.OwnsPause = true
-	control.Owner = pauseOwner(*control)
-	control.ExpectedSchedulable = boolPtr(false)
-	control.LastObserved = boolPtr(false)
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "paused"
-	control.LastActionAt = &now
-	event := model.Event{Type: eventType, Severity: "warning", MonitorID: monitorID, AccountID: &binding.Account.ID, Message: reason, BeforeState: "schedulable", AfterState: "paused", Details: actionDetails(binding, control, reason), Actor: "system", CreatedAt: now}
-	if !control.HealthLocked {
-		if err := e.store.CommitControlEvents(ctx, *control, event); err != nil {
-			return err
-		}
-		e.logEvent(event)
+	result, err := e.submitAccountMutation(ctx, accountcontrol.Submission{CommandID: intent.ID, Intent: intent, Safety: safety,
+		Event: model.Event{Type: eventType, Severity: "warning", MonitorID: monitorID, Message: reason}, FlapPolicy: flap})
+	if expectedPolicyBlock(err) {
 		return nil
 	}
-	flap := model.FlapPolicy{
-		Enabled: binding.FlapEnabled, WindowMinutes: binding.FlapWindowMinutes,
-		PauseThreshold:    binding.FlapPauseThreshold,
-		RecoveryThreshold: maxInt(binding.BaseRecoveryThreshold, binding.FlapRecoveryThreshold),
-	}
-	updatedControl, _, activated, err := e.store.CommitAutomaticPause(ctx, *control, event, flap)
 	if err != nil {
 		return err
 	}
-	*control = updatedControl
-	e.logEvent(event)
-	if activated {
-		e.logEvent(model.Event{Type: "flap_protection_activated", Severity: "warning", MonitorID: monitorID, AccountID: &binding.Account.ID, Message: "账号在滚动窗口内反复暂停，已启用抖动保护", Actor: "scheduler"})
+	if result.VerifiedAfter != nil {
+		binding.Account.Schedulable = result.VerifiedAfter.Schedulable
 	}
 	return nil
 }
@@ -2128,48 +1425,37 @@ func (e *Engine) applyResume(ctx context.Context, binding *model.ResolvedBinding
 		return nil
 	}
 	if dryRun {
-		if control.LastDecision != "would_resume" {
-			control.LastDecision = "would_resume"
-			e.record(ctx, model.Event{Type: "would_resume", Severity: "info", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: reason, BeforeState: "paused", AfterState: "schedulable", Details: actionDetails(binding, control, reason), Actor: "system"})
-		}
-		return e.store.UpsertControl(ctx, *control)
+		control.LastDecision = "would_resume"
+		return e.store.CommitControlEvents(ctx, *control, model.Event{Type: "would_resume", Severity: "info",
+			MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: reason, BeforeState: "paused",
+			AfterState: "schedulable", Details: actionDetails(binding, control, reason), Actor: "system", CreatedAt: now})
 	}
 	previousOwner := control.Owner
-	if previousOwner == "automatic" && !control.ManualLocked && !control.HealthLocked && !control.BalanceLocked && !control.CostLocked {
-		e.observePolicySchedulable(ctx, controlplaneshadow.PathReconcilePolicyResume, binding, true, reason, now)
-	}
-	updated, err := e.api.SetSchedulable(ctx, binding.Account.ID, true)
-	if err != nil {
-		return err
-	}
-	if !updated.Schedulable {
-		return errors.New("Sub2API 未确认账号恢复")
-	}
-	control.OwnsPause = false
-	control.Owner = ""
-	control.ManualLocked = false
-	control.ExpectedSchedulable = boolPtr(true)
-	control.LastObserved = boolPtr(true)
-	control.ManualOverrideUntil = nil
-	control.LastDecision = "resumed"
-	control.LastActionAt = &now
-	wasFlapProtected := control.FlapActive
-	clearFlapState(control)
 	eventType := "automatic_resume"
 	if previousOwner == "balance" {
 		eventType = "balance_resume"
 	} else if previousOwner == "cost" {
 		eventType = "cost_resume"
 	}
-	events := []model.Event{{Type: eventType, Severity: "info", MonitorID: bindingMonitorID(binding), AccountID: &binding.Account.ID, Message: reason, BeforeState: "paused", AfterState: "schedulable", Details: actionDetails(binding, control, reason), Actor: "system", CreatedAt: now}}
-	if wasFlapProtected {
-		events = append(events, flapClearedEvent(&binding.Account.ID, bindingMonitorID(binding), "system", "连续正常检测达到锁定门槛并恢复账号", now))
+	policyBinding := *binding
+	policyBinding.Control = *control
+	if policyBinding.Control.FlapActive {
+		policyBinding.Control.FlapActive = false
 	}
-	if err := e.store.CommitControlEvents(ctx, *control, events...); err != nil {
+	intent, safety, err := e.policySchedulableIntent(ctx, &policyBinding, true, reason)
+	if err != nil {
 		return err
 	}
-	for _, event := range events {
-		e.logEvent(event)
+	result, err := e.submitAccountMutation(ctx, accountcontrol.Submission{CommandID: intent.ID, Intent: intent, Safety: safety,
+		Event: model.Event{Type: eventType, Severity: "info", MonitorID: bindingMonitorID(binding), Message: reason}})
+	if expectedPolicyBlock(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if result.VerifiedAfter != nil {
+		binding.Account.Schedulable = result.VerifiedAfter.Schedulable
 	}
 	return nil
 }
@@ -2243,32 +1529,6 @@ func bindingMonitorID(binding *model.ResolvedBinding) *int64 {
 	}
 	value := binding.Monitor.ID
 	return &value
-}
-
-func pauseOwner(control model.AccountControl) string {
-	if control.ManualLocked {
-		return "operator"
-	}
-	lockCount := 0
-	if control.HealthLocked {
-		lockCount++
-	}
-	if control.BalanceLocked {
-		lockCount++
-	}
-	if control.CostLocked {
-		lockCount++
-	}
-	if lockCount > 1 {
-		return "combined"
-	}
-	if control.BalanceLocked {
-		return "balance"
-	}
-	if control.CostLocked {
-		return "cost"
-	}
-	return "automatic"
 }
 
 func flapClearedEvent(accountID, monitorID *int64, actor, reason string, now time.Time) model.Event {

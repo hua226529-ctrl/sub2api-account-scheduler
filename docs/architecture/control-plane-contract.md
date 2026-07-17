@@ -1,8 +1,8 @@
 # Control Plane Contract
 
-状态：阶段 0 基线合同，基准 `main@bbb318f` / `v1.0.0`。
+状态：阶段 0 基线合同，基准 `main@bbb318f` / `v1.0.0`；符合度已更新到核心阶段 A。
 
-本文件定义后续控制平面重构不可回退的产品和可靠性边界。阶段 0 只记录合同及当前符合度，不实现 Intent、Arbiter、Mutation Executor、Resource Lease 或 OverrideLease。
+本文件定义后续控制平面重构不可回退的产品和可靠性边界。核心阶段 A 已实现账号范围的 Intent、Arbiter、持久 Override、资源锁和 Mutation Executor；分组与其他资源仍按后续小步迁移。
 
 ## 不可回退合同
 
@@ -26,11 +26,11 @@
 | 确定性调度器为主控制器 | 已满足 | `main` 独立启动 `reconcile.Engine`；engine 不依赖 Agent provider。现有 engine 测试覆盖暂停、恢复、负载档位。 |
 | 模型不可用时最后策略继续运行 | 已满足 | 策略保存在 SQLite；`Reconcile` 不调用模型；`TestCurrentBehaviorInteractiveGoalWaitsForOccupiedRuntimeMutex` 中无 provider 只使 goal 等待。 |
 | Optimizer / Operator 分责 | 部分满足 | 已有 scheduled/emergency/chat goal 和 capability，但共享一个 Manager、worker 和 `runtimeMu`，没有正式 lane/角色边界。 |
-| 所有 producer 进入统一写入通道 | 未满足 | Engine、Balance/Fetcher、Failover、HTTP 和旧 Agent action 仍存在多条写路径。 |
-| mutation 完整生命周期 | 部分满足 | 账号路径有归属、回滚和 uncertain error；三级切组有幂等 transition、回读和协调；覆盖并不统一。 |
-| 全局锁不跨网络/长查询 | 未满足 | `reconcile.runMu`、`balance.runMu`、Telemetry `mu` 和 Agent `runtimeMu` 当前跨越 I/O。 |
-| 同资源串行、异资源有界并行 | 部分满足 | 全局锁提供了过度串行；人工账号路径又可绕过 `runMu` 并发写同一资源。 |
-| Agent 直接动作默认 TTL Override | 未满足 | 部分 load pin/manual hold 有截止时间；Agent pause/resume 仍直接改变控制状态，不是统一 OverrideLease。 |
+| 所有 producer 进入统一写入通道 | 部分满足 | 所有账号 producer 已进入 `accountcontrol`；SwitchGroup/TransitionGroupTier 仍保留现有分组通道。 |
+| mutation 完整生命周期 | 账号已满足 | 账号具备 prepared journal、前后回读、Guard、原子审计和 restart recovery；三级切组继续使用既有 transition journal。 |
+| 全局锁不跨网络/长查询 | 部分满足 | 账号 Reconcile 不再在 `runMu` 下执行网络写入；balance、Telemetry 和 Agent runtime 的其他 I/O 锁仍属后续范围。 |
+| 同资源串行、异资源有界并行 | 账号已满足 | Service 实例持有可回收 keyed account lock；同账号串行，不同账号和恢复任务有限并行。 |
+| Agent 直接动作默认 TTL Override | 账号已满足 | 管理员聊天默认 30 分钟；自主账号动作默认 15 分钟、最长 2 小时并要求 evidence/snapshot。分组动作尚未统一。 |
 | 单进程 + SQLite | 已满足 | 当前 scheduler 为单进程，Store 使用 modernc SQLite。 |
 | 安全能力不可降低 | 部分满足 | 精确 grant、单次消费、脱敏、freeze 和部分 uncertain 协调已有测试；写路径覆盖不一致。 |
 
@@ -45,4 +45,4 @@
 
 ## 已知当前例外
 
-以下是阶段 0 固化的现状，不是目标合同：网页 `ManualPause`/`ManualResume` 可在 `writes_frozen` 下写入，且不受 `reconcile.runMu` 串行；普通 `SwitchGroup` 和部分账号 mutation 没有统一持久 journal；Agent V2 全局串行；Telemetry 单 monitor 失败会终止整轮。后续阶段必须通过兼容开关或 shadow 模式迁移，并同步修改对应 `CurrentBehavior` 测试预期。
+阶段 0 的账号例外已经关闭：网页 pause/resume 受 `writes_frozen` 约束，所有账号入口共享资源锁和 journal，ManualResume 已改为有期限 Override。仍存在的例外是普通 `SwitchGroup` 尚未进入统一控制面、Agent V2 非账号工作仍全局串行、Telemetry 单 monitor 失败仍会终止整轮；后续阶段必须小步迁移且不得恢复账号直写。

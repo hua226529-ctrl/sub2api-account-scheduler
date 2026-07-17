@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/agent"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/balance"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/config"
@@ -712,19 +714,41 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Confirm bool `json:"confirm"`
+		Confirm    bool `json:"confirm"`
+		TTLMinutes *int `json:"ttl_minutes,omitempty"`
 	}
 	if err := decodeJSON(r, &body); err != nil || !body.Confirm {
 		writeError(w, http.StatusBadRequest, "需要二次确认")
 		return
 	}
+	commandID := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if commandID == "" {
+		commandID, err = accountcontrol.NewCommandID()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "生成命令编号失败")
+			return
+		}
+	}
+	if err := accountcontrol.ValidateCommandID(commandID); err != nil {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key 无效")
+		return
+	}
+	ttl := accountcontrol.DefaultAdministratorTTL
+	if body.TTLMinutes != nil {
+		if *body.TTLMinutes < 1 || *body.TTLMinutes > 24*60 {
+			writeError(w, http.StatusBadRequest, "TTL 必须在 1 到 1440 分钟之间")
+			return
+		}
+		ttl = time.Duration(*body.TTLMinutes) * time.Minute
+	}
+	var result accountcontrol.Result
 	switch r.PathValue("action") {
 	case "pause":
-		err = s.engine.ManualPause(r.Context(), accountID, "web")
+		result, err = s.engine.ManualPauseCommand(r.Context(), accountID, "web", commandID)
 	case "resume":
-		err = s.engine.ManualResume(r.Context(), accountID, "web")
-	case "clear-override":
-		err = s.engine.ClearOverride(r.Context(), accountID, "web")
+		result, err = s.engine.ManualResumeCommand(r.Context(), accountID, "web", commandID, ttl)
+	case "release-manual-hold", "clear-override":
+		result, err = s.engine.ReleaseManualHoldCommand(r.Context(), accountID, "web", commandID)
 	case "clear-flap":
 		err = s.engine.ClearFlapProtection(r.Context(), accountID, "web")
 	default:
@@ -732,10 +756,34 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		var idempotencyConflict *accountcontrol.IdempotencyConflictError
+		var blocked *accountcontrol.BlockedError
+		var mutationState *accountcontrol.MutationStateError
+		switch {
+		case errors.As(err, &idempotencyConflict):
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "idempotency_conflict", "command_id": commandID})
+		case errors.As(err, &blocked):
+			writeJSON(w, http.StatusConflict, blocked.Result)
+		case errors.As(err, &mutationState):
+			status := http.StatusConflict
+			if mutationState.Result.Uncertain {
+				status = http.StatusServiceUnavailable
+			}
+			writeJSON(w, status, mutationState.Result)
+		case result.Uncertain:
+			writeJSON(w, http.StatusServiceUnavailable, result)
+		case result.MutationID != "":
+			writeJSON(w, http.StatusConflict, result)
+		default:
+			writeError(w, http.StatusConflict, err.Error())
+		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	if r.PathValue("action") == "clear-flap" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "command_id": commandID})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) triggerReconcile(w http.ResponseWriter, r *http.Request) {

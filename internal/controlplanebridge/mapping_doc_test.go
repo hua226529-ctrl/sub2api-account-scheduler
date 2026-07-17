@@ -24,7 +24,7 @@ func TestLegacyWritePathMappingDocumentsAllKnownMutationPoints(t *testing.T) {
 		"Engine.PinLoad",
 		"Engine.ManualResume",
 		"Engine.ForceResume",
-		"Engine.reconcileAdaptiveLoadWithFreeze",
+		"Engine.reconcileAdaptiveLoad",
 		"Engine.applyPause",
 		"Engine.applyResume",
 		"balance.Manager.reconcileCostRouting",

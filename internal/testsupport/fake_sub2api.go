@@ -36,6 +36,7 @@ type Failure struct {
 	AtCall           int
 	Err              error
 	ApplyBeforeError bool
+	Always           bool
 }
 
 type CallStats struct {
@@ -57,16 +58,17 @@ type FakeSub2API struct {
 	transitions     map[string]model.GroupTierTransition
 	groupTiers      map[string]string
 
-	delay      time.Duration
-	delays     map[string]time.Duration
-	failure    map[string]Failure
-	staleReads bool
-	callCount  map[string]int
-	order      []Call
-	sequence   int64
-	active     int
-	maxActive  int
-	beforeCall func(Call)
+	delay           time.Duration
+	delays          map[string]time.Duration
+	failure         map[string]Failure
+	resourceFailure map[string]Failure
+	staleReads      bool
+	callCount       map[string]int
+	order           []Call
+	sequence        int64
+	active          int
+	maxActive       int
+	beforeCall      func(Call)
 }
 
 func NewFakeSub2API(fixture Fixture) *FakeSub2API {
@@ -75,7 +77,8 @@ func NewFakeSub2API(fixture Fixture) *FakeSub2API {
 		monitors: cloneMonitors(fixture.Monitors), successes: append([]model.TrafficSuccess(nil), fixture.Successes...),
 		failures: append([]model.TrafficError(nil), fixture.Failures...), history: cloneHistory(fixture.History),
 		transitions: make(map[string]model.GroupTierTransition), groupTiers: make(map[string]string),
-		delays: make(map[string]time.Duration), failure: make(map[string]Failure), callCount: make(map[string]int),
+		delays: make(map[string]time.Duration), failure: make(map[string]Failure), resourceFailure: make(map[string]Failure),
+		callCount: make(map[string]int),
 	}
 }
 
@@ -97,6 +100,12 @@ func (f *FakeSub2API) SetFailure(name string, failure Failure) {
 	f.mu.Unlock()
 }
 
+func (f *FakeSub2API) SetResourceFailure(name, resource string, failure Failure) {
+	f.mu.Lock()
+	f.resourceFailure[name+":"+resource] = failure
+	f.mu.Unlock()
+}
+
 func (f *FakeSub2API) SetStaleReads(stale bool) {
 	f.mu.Lock()
 	f.staleReads = stale
@@ -104,6 +113,13 @@ func (f *FakeSub2API) SetStaleReads(stale bool) {
 		f.visibleAccounts = cloneAccounts(f.accounts)
 	}
 	f.mu.Unlock()
+}
+
+func (f *FakeSub2API) SetAccountRateLimit(accountID int64, until *time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, _ = updateAccount(f.accounts, accountID, func(account *model.Account) { account.RateLimitResetAt = cloneTime(until) })
+	_, _ = updateAccount(f.visibleAccounts, accountID, func(account *model.Account) { account.RateLimitResetAt = cloneTime(until) })
 }
 
 func (f *FakeSub2API) SetBeforeCall(hook func(Call)) {
@@ -147,6 +163,9 @@ func (f *FakeSub2API) begin(ctx context.Context, name, resource string) (Call, F
 		delay = configured
 	}
 	failure := f.failure[name]
+	if configured, ok := f.resourceFailure[name+":"+resource]; ok {
+		failure = configured
+	}
 	hook := f.beforeCall
 	f.mu.Unlock()
 	if hook != nil {
@@ -171,7 +190,7 @@ func (f *FakeSub2API) finish() {
 }
 
 func failureFor(call Call, failure Failure) error {
-	if failure.AtCall <= 0 || failure.AtCall != call.Number {
+	if !failure.Always && (failure.AtCall <= 0 || failure.AtCall != call.Number) {
 		return nil
 	}
 	if failure.Err != nil {
@@ -376,6 +395,14 @@ func cloneInt(value *int) *int {
 	return &copy
 }
 
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := value.UTC()
+	return &copy
+}
+
 func updateAccount(accounts []model.Account, id int64, update func(*model.Account)) (model.Account, bool) {
 	for i := range accounts {
 		if accounts[i].ID == id {
@@ -389,8 +416,9 @@ func updateAccount(accounts []model.Account, id int64, update func(*model.Accoun
 func cloneAccount(account model.Account) model.Account {
 	account.LoadFactor = cloneInt(account.LoadFactor)
 	if account.Credentials != nil {
-		account.Credentials = make(map[string]any, len(account.Credentials))
-		for key, value := range account.Credentials {
+		credentials := account.Credentials
+		account.Credentials = make(map[string]any, len(credentials))
+		for key, value := range credentials {
 			account.Credentials[key] = value
 		}
 	}

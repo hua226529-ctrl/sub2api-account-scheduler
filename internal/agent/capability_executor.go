@@ -13,9 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/balance"
-	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplanebridge"
-	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplaneshadow"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/reconcile"
 )
@@ -82,7 +81,10 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		// Every model-driven write, including one performed on behalf of an
 		// administrator, shares the same barrier as global freeze publication.
 		// Browser-originated manual operations deliberately remain outside it.
-		release := m.engine.AutomationBarrier().EnterMutation()
+		release, err := m.engine.AutomationBarrier().EnterMutation(ctx)
+		if err != nil {
+			return CapabilityExecution{}, fmt.Errorf("等待智能体 mutation 冻结屏障: %w", err)
+		}
 		defer release()
 	}
 	if spec.Mutating {
@@ -107,7 +109,7 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		}
 	}
 	if spec.Mutating {
-		ctx = withControlplaneShadowContext(ctx, invocation)
+		ctx = withAccountControlContext(ctx, invocation)
 	}
 	before := m.capabilityState(ctx, invocation)
 	call := model.AgentToolCall{RunID: invocation.RunID, Tool: invocation.Name, Arguments: invocation.Arguments,
@@ -351,12 +353,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_pause": args.AccountID}, false, nil
 		}
-		var err error
-		if administratorGrantedInvocation(invocation) {
-			err = m.engine.ManualPause(ctx, args.AccountID, actor)
-		} else {
-			err = m.engine.AgentPause(ctx, args.AccountID, actor, args.Reason)
-		}
+		err := m.engine.AgentPause(ctx, args.AccountID, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "schedulable": false}, retryableExternal(err), err
 	case "resume_account":
 		var args accountReasonArgs
@@ -369,12 +366,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_resume": args.AccountID, "administrator_direct": administratorGrantedInvocation(invocation)}, false, nil
 		}
-		var err error
-		if administratorGrantedInvocation(invocation) {
-			err = m.engine.ForceResume(ctx, args.AccountID, actor, args.Reason)
-		} else {
-			err = m.engine.AgentResume(ctx, args.AccountID, actor, args.Reason)
-		}
+		err := m.engine.AgentResume(ctx, args.AccountID, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "schedulable": true}, retryableExternal(err), err
 	case "set_load_factor":
 		var args struct {
@@ -391,12 +383,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_set_load_factor": args.LoadFactor}, false, nil
 		}
-		var err error
-		if administratorGrantedInvocation(invocation) {
-			err = m.engine.ForceSetLoadFactor(ctx, args.AccountID, args.LoadFactor, actor, args.Reason)
-		} else {
-			err = m.engine.AgentSetLoadFactor(ctx, args.AccountID, args.LoadFactor, actor, args.Reason)
-		}
+		err := m.engine.AgentSetLoadFactor(ctx, args.AccountID, args.LoadFactor, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "load_factor": args.LoadFactor}, retryableExternal(err), err
 	case "pin_load_until":
 		var args struct {
@@ -414,7 +401,11 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_pin": args.AccountID, "load_factor": args.LoadFactor, "until": args.Until}, false, nil
 		}
-		err := m.engine.PinLoad(ctx, args.AccountID, args.LoadFactor, args.Until, actor, args.Reason)
+		command := accountcontrol.CommandContextFrom(ctx)
+		command.ExpiresAt = cloneInvocationTime(&args.Until)
+		command.OverrideKind = accountcontrol.OverrideKindLoadPin
+		ctx = accountcontrol.WithCommandContext(ctx, command)
+		err := m.engine.AgentSetLoadFactor(ctx, args.AccountID, &args.LoadFactor, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID, "load_factor": args.LoadFactor, "until": args.Until}, retryableExternal(err), err
 	case "clear_load_pin":
 		var args accountReasonArgs
@@ -424,7 +415,10 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.DryRun {
 			return map[string]any{"would_clear_load_pin": args.AccountID}, false, nil
 		}
-		err := m.engine.ClearLoadPin(ctx, args.AccountID, actor, args.Reason)
+		if !administratorGrantedInvocation(invocation) {
+			return nil, false, errors.New("解除负载固定需要管理员精确授权")
+		}
+		err := m.engine.AgentReleaseLoadPin(ctx, args.AccountID, actor, args.Reason)
 		return map[string]any{"account_id": args.AccountID}, retryableExternal(err), err
 	case "clear_flap_protection", "clear_manual_override":
 		var args accountReasonArgs
@@ -438,7 +432,10 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		if invocation.Name == "clear_flap_protection" {
 			err = m.engine.ClearFlapProtection(ctx, args.AccountID, actor)
 		} else {
-			err = m.engine.ClearOverride(ctx, args.AccountID, actor)
+			if !administratorGrantedInvocation(invocation) {
+				return nil, false, errors.New("解除人工保持需要管理员精确授权")
+			}
+			err = m.engine.AgentReleaseManualHold(ctx, args.AccountID, actor, args.Reason)
 		}
 		return map[string]any{"account_id": args.AccountID}, retryableExternal(err), err
 	case "update_binding":
@@ -663,6 +660,12 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 			}
 		}
 		conditions := map[string]any{"reason": args.Reason}
+		if invocation.SnapshotVersion != "" {
+			conditions["snapshot_version"] = invocation.SnapshotVersion
+		}
+		if len(invocation.EvidenceRefs) > 0 {
+			conditions["evidence_refs"] = append([]string(nil), invocation.EvidenceRefs...)
+		}
 		if targetGrant != nil {
 			conditions["administrator_grant"] = targetGrant
 		}
@@ -737,29 +740,22 @@ func administratorGrantedInvocation(invocation CapabilityInvocation) bool {
 		validateAdministratorGrant(invocation.AdministratorGrant, invocation.Name, invocation.Arguments) == nil
 }
 
-func withControlplaneShadowContext(ctx context.Context, invocation CapabilityInvocation) context.Context {
-	var reason struct {
-		Reason string `json:"reason"`
+func withAccountControlContext(ctx context.Context, invocation CapabilityInvocation) context.Context {
+	createdAt := invocation.CreatedAt.UTC()
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
 	}
-	_ = json.Unmarshal(invocation.Arguments, &reason)
-	actionContext := controlplaneshadow.ActionContext{
-		StableSourceNamespace: controlplanebridge.SourceAgentAction,
-		StableSourceID:        strings.TrimSpace(invocation.IdempotencyKey),
-		Reason:                strings.TrimSpace(reason.Reason),
-		SnapshotVersion:       strings.TrimSpace(invocation.SnapshotVersion),
-		EvidenceRefs:          append([]string(nil), invocation.EvidenceRefs...),
-		CreatedAt:             invocation.CreatedAt,
-		ExpiresAt:             cloneInvocationTime(invocation.ExpiresAt),
-	}
+	actionContext := accountcontrol.CommandContext{CommandID: strings.TrimSpace(invocation.IdempotencyKey),
+		CreatedAt: createdAt, ExpiresAt: cloneInvocationTime(invocation.ExpiresAt),
+		SnapshotVersion: strings.TrimSpace(invocation.SnapshotVersion), EvidenceRefs: append([]string(nil), invocation.EvidenceRefs...),
+		RunID: invocation.RunID, GoalID: invocation.GoalID, StepID: invocation.StepID, AutomationLeaseHeld: true}
 	if invocation.AdministratorGrant != nil {
 		grantID := strings.TrimSpace(invocation.AdministratorGrant.GrantID)
-		actionContext.StableSourceNamespace = controlplanebridge.SourceAdministratorGrantConsumption
-		actionContext.StableSourceID = grantID
-		actionContext.AdministratorAuthorization = controlplanebridge.AdministratorAuthorization{
-			IdentityVerified: true, ExactGrant: true, GrantConsumed: !invocation.DryRun, GrantConsumptionID: grantID,
-		}
+		actionContext.CommandID = grantID
+		actionContext.Administrator = true
+		actionContext.GrantConsumptionID = grantID
 	}
-	return controlplaneshadow.WithActionContext(ctx, actionContext)
+	return accountcontrol.WithCommandContext(ctx, actionContext)
 }
 
 func cloneInvocationTime(value *time.Time) *time.Time {

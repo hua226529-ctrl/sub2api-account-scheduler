@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
 
@@ -39,7 +40,7 @@ func (m *Manager) executeActions(ctx context.Context, run model.AgentRun, settin
 			m.recordEvent(ctx, "agent_would_execute", "warning", action.AccountID, "智能体观察模式拟执行 "+action.Type, run.ID)
 			continue
 		}
-		err := m.executeAction(ctx, run, action)
+		err := m.executeAction(ctx, run, call.ID, action)
 		if err != nil {
 			call.Status, call.Result = "failed", err.Error()
 			call.AfterState = m.actionState(action)
@@ -237,11 +238,23 @@ func poolCompletelyUnavailable(packet model.AnalysisPacket, poolName string) boo
 	return false
 }
 
-func (m *Manager) executeAction(ctx context.Context, run model.AgentRun, action AgentAction) error {
+func (m *Manager) executeAction(ctx context.Context, run model.AgentRun, toolCallID int64, action AgentAction) error {
 	actor := "agent:" + strconv.FormatInt(run.ID, 10)
 	reason := strings.TrimSpace(action.Reason)
 	if reason == "" {
 		reason = "智能体根据分析数据包执行"
+	}
+	if action.Type == "pause_account" || action.Type == "resume_account" || action.Type == "set_load_factor" {
+		if run.PacketID == nil || *run.PacketID <= 0 || toolCallID <= 0 {
+			return errors.New("智能体账号动作缺少持久分析数据包或动作编号")
+		}
+		created := run.StartedAt.UTC()
+		expires := created.Add(accountcontrol.DefaultAutonomousTTL)
+		evidence := "analysis_packet:" + strconv.FormatInt(*run.PacketID, 10)
+		ctx = accountcontrol.WithCommandContext(ctx, accountcontrol.CommandContext{
+			CommandID: fmt.Sprintf("agent-v1:run:%d:tool:%d", run.ID, toolCallID), CreatedAt: created, ExpiresAt: &expires,
+			SnapshotVersion: evidence, EvidenceRefs: []string{evidence}, RunID: run.ID,
+		})
 	}
 	switch action.Type {
 	case "pause_account":

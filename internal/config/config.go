@@ -11,29 +11,27 @@ import (
 )
 
 type Config struct {
-	ListenAddress                 string
-	BasePath                      string
-	DatabasePath                  string
-	Sub2APIBaseURL                string
-	AdminAPIKey                   string
-	PollInterval                  time.Duration
-	RequestTimeout                time.Duration
-	SessionIdleTimeout            time.Duration
-	CookieSecure                  bool
-	InitialDryRun                 bool
-	FailureThreshold              int
-	RecoveryThreshold             int
-	ManualHoldMinutes             int
-	FlapWindowMinutes             int
-	FlapPauseThreshold            int
-	FlapRecoveryThreshold         int
-	BalancePollInterval           time.Duration
-	TelemetryPollInterval         time.Duration
-	CredentialKey                 []byte
-	AgentCredentialKey            []byte
-	AllowInsecureUpstream         bool
-	ControlplaneShadowMode        string
-	ControlplaneShadowModeInvalid bool
+	ListenAddress         string
+	BasePath              string
+	DatabasePath          string
+	Sub2APIBaseURL        string
+	AdminAPIKey           string
+	PollInterval          time.Duration
+	RequestTimeout        time.Duration
+	SessionIdleTimeout    time.Duration
+	CookieSecure          bool
+	InitialDryRun         bool
+	FailureThreshold      int
+	RecoveryThreshold     int
+	ManualHoldMinutes     int
+	FlapWindowMinutes     int
+	FlapPauseThreshold    int
+	FlapRecoveryThreshold int
+	BalancePollInterval   time.Duration
+	TelemetryPollInterval time.Duration
+	CredentialKey         []byte
+	AgentCredentialKey    []byte
+	AllowInsecureUpstream bool
 }
 
 func Load() (Config, error) {
@@ -58,7 +56,6 @@ func Load() (Config, error) {
 		TelemetryPollInterval: durationEnv("TELEMETRY_POLL_INTERVAL", 2*time.Minute),
 		AllowInsecureUpstream: boolEnv("ALLOW_INSECURE_UPSTREAMS", false),
 	}
-	cfg.ControlplaneShadowMode, cfg.ControlplaneShadowModeInvalid = controlplaneShadowModeEnv()
 	if cfg.AdminAPIKey == "" {
 		return Config{}, fmt.Errorf("SUB2API_ADMIN_API_KEY is required")
 	}
@@ -92,17 +89,6 @@ func Load() (Config, error) {
 		cfg.AgentCredentialKey = key
 	}
 	return cfg, nil
-}
-
-func controlplaneShadowModeEnv() (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CONTROLPLANE_SHADOW_MODE"))) {
-	case "", "off":
-		return "off", false
-	case "log":
-		return "log", false
-	default:
-		return "off", true
-	}
 }
 
 func decodeCredentialKey(raw string) ([]byte, error) {

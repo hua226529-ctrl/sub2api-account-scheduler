@@ -93,4 +93,4 @@ Intent ID 使用 `cp-intent-v2-<sha256>`，计算规则是 `hash(IdempotencyKey,
 
 ## 阶段状态
 
-阶段 1B 没有运行时接入、feature flag、shadow observer、数据库表或持久化。阶段 1C 才能在默认 no-op、显式开启的前提下接入只读 runtime shadow observer；旧 writer 仍必须是唯一生产决策和执行路径。
+阶段 1B 本身没有运行时接入、feature flag、数据库表或持久化。其后阶段 1C 曾短期接入默认关闭的只读账号 shadow；核心阶段 A 完成账号生产迁移后，该 observer、Engine option 和环境开关已删除。适配器现在由正式账号入口使用，但仍只负责类型转换，不访问网络、数据库或执行 Mutation。

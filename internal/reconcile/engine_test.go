@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/store"
 )
@@ -201,7 +202,7 @@ func TestCharacterizationAgentCannotTakeOwnershipOfManualPause(t *testing.T) {
 
 func TestCharacterizationAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.T) {
 	engine, database, api := newEngineTest(t, false)
-	ctx := context.Background()
+	ctx := autonomousAgentTestContext("agent-pause", time.Now().UTC())
 	if err := engine.AgentPause(ctx, 225, "agent:2", "风险证据充分"); err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestCharacterizationAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.
 	if err := database.UpsertControl(ctx, control); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.AgentResume(ctx, 225, "agent:3", "尝试恢复"); err == nil {
+	if err := engine.AgentResume(autonomousAgentTestContext("agent-resume-blocked", time.Now().UTC()), 225, "agent:3", "尝试恢复"); err == nil {
 		t.Fatal("agent resume should reject an active health lock")
 	}
 	if len(api.actions) != 1 || api.actions[0] {
@@ -223,7 +224,7 @@ func TestCharacterizationAgentResumeRequiresAgentOwnershipAndNoLocks(t *testing.
 	if err := database.UpsertControl(ctx, control); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.AgentResume(ctx, 225, "agent:4", "控制锁均已解除"); err != nil {
+	if err := engine.AgentResume(autonomousAgentTestContext("agent-resume", time.Now().UTC().Add(time.Second)), 225, "agent:4", "控制锁均已解除"); err != nil {
 		t.Fatal(err)
 	}
 	if len(api.actions) != 2 || !api.actions[1] {
@@ -339,12 +340,12 @@ func TestCharacterizationBalanceAndHealthLocksMustBothClearBeforeResume(t *testi
 		t.Fatalf("account did not resume after both locks cleared: %v", api.actions)
 	}
 	events, _ := database.ListEvents(ctx, 20)
-	if !containsEvent(events, "balance_pause") || !containsEvent(events, "balance_resume") {
+	if !containsEvent(events, "balance_pause") || !containsEvent(events, "automatic_resume") {
 		t.Fatalf("balance control actions were not audited: %+v", events)
 	}
 }
 
-func TestManualResumeStartsTenMinuteProtection(t *testing.T) {
+func TestManualResumeDoesNotBypassHealthLock(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	base := time.Now().UTC()
@@ -354,18 +355,15 @@ func TestManualResumeStartsTenMinuteProtection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	api.mu.Lock()
-	api.accounts[0].Schedulable = true
-	api.mu.Unlock()
-	if err := engine.Reconcile(ctx); err != nil {
-		t.Fatal(err)
+	if err := engine.ManualResume(ctx, 225, "web"); err == nil {
+		t.Fatal("manual resume bypassed an active health lock")
 	}
 	control, _ := database.GetControl(ctx, 225)
-	if control.ManualOverrideUntil == nil || time.Until(*control.ManualOverrideUntil) < 9*time.Minute {
-		t.Fatalf("manual protection was not created: %+v", control)
+	if control.ManualOverrideUntil != nil || !control.HealthLocked || !control.OwnsPause {
+		t.Fatalf("blocked manual resume changed protected control state: %+v", control)
 	}
-	if len(api.actions) != 1 {
-		t.Fatalf("account was immediately paused again: %v", api.actions)
+	if len(api.actions) != 1 || api.actions[0] {
+		t.Fatalf("blocked manual resume reached upstream: %v", api.actions)
 	}
 }
 
@@ -448,7 +446,7 @@ func TestDegradedResetsProtectedRecoveryProgress(t *testing.T) {
 	control := model.AccountControl{
 		AccountID: 225, MonitorID: int64Ptr(2), OwnsPause: true, Owner: "automatic",
 		ExpectedSchedulable: &falseValue, LastObserved: &falseValue,
-		FlapActive: true, FlapTriggeredAt: &now, FlapRecoveryRequired: 10,
+		HealthLocked: true, FlapActive: true, FlapTriggeredAt: &now, FlapRecoveryRequired: 10,
 	}
 	if err := database.UpsertControl(ctx, control); err != nil {
 		t.Fatal(err)
@@ -487,7 +485,7 @@ func TestFailedPauseWriteDoesNotCountTowardFlapping(t *testing.T) {
 	}
 }
 
-func TestManualResumeBypassesAndClearsFlapProtection(t *testing.T) {
+func TestManualResumeTemporarilyOverridesButDoesNotDeleteFlapProtection(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	api.mu.Lock()
@@ -502,12 +500,12 @@ func TestManualResumeBypassesAndClearsFlapProtection(t *testing.T) {
 		t.Fatal(err)
 	}
 	control, _ = database.GetControl(ctx, 225)
-	if control.OwnsPause || control.FlapActive || control.FlapRecoveryRequired != 0 {
-		t.Fatalf("manual resume did not clear protected pause: %+v", control)
+	if control.OwnsPause || !control.FlapActive || control.FlapRecoveryRequired != 10 || control.ManualOverrideUntil == nil {
+		t.Fatalf("manual resume did not preserve the business cooldown while applying a temporary override: %+v", control)
 	}
 	events, _ := database.ListEvents(ctx, 20)
-	if !containsEvent(events, "flap_protection_cleared") {
-		t.Fatal("manual bypass was not audited")
+	if !containsEvent(events, "manual_resume") {
+		t.Fatal("manual temporary override was not audited")
 	}
 }
 
@@ -563,9 +561,10 @@ func TestCharacterizationAdaptiveHealthReducesLoadAndRespectsManualLoadOverride(
 	}
 
 	manual := 75
-	api.mu.Lock()
-	api.accounts[0].LoadFactor = &manual
-	api.mu.Unlock()
+	if _, err := engine.ForceSetLoadFactorCommand(ctx, 225, &manual, "web", "manual load override",
+		"manual-load-override", accountcontrol.DefaultAdministratorTTL); err != nil {
+		t.Fatal(err)
+	}
 	checkedAt = checkedAt.Add(time.Minute)
 	api.setMonitorHealth(model.StatusDegraded, 20_000, checkedAt)
 	if _, err := database.InsertMonitorHistory(ctx, model.MonitorHistoryRecord{SourceID: 2, MonitorID: 2, Model: "gpt", Status: model.StatusDegraded, LatencyMS: 20_000, CheckedAt: checkedAt, IngestedAt: checkedAt}); err != nil {
@@ -578,7 +577,7 @@ func TestCharacterizationAdaptiveHealthReducesLoadAndRespectsManualLoadOverride(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if control.OwnsLoadFactor || control.LoadOverrideUntil == nil || len(api.loadActions) != 1 {
+	if control.OwnsLoadFactor || control.LoadOverrideUntil == nil || len(api.loadActions) != 2 || api.loadActions[1] == nil || *api.loadActions[1] != manual {
 		t.Fatalf("人工修改负载后应进入保护期且不再覆盖: control=%+v actions=%v", control, api.loadActions)
 	}
 }
@@ -1255,7 +1254,7 @@ func TestAdaptiveLoadFreezesExistingOwnershipForExternallyPausedAccount(t *testi
 	}
 }
 
-func TestAdaptiveLoadRollsBackWhenControlPersistenceFails(t *testing.T) {
+func TestAdaptiveLoadDoesNotWriteWhenJournalIsUnavailable(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	settings, err := database.GetSettings(ctx)
@@ -1284,14 +1283,14 @@ func TestAdaptiveLoadRollsBackWhenControlPersistenceFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("控制状态写库失败时应返回错误")
 	}
-	if len(api.loadActions) != 2 || api.loadActions[0] == nil || *api.loadActions[0] != 25 || api.loadActions[1] == nil || *api.loadActions[1] != 100 {
-		t.Fatalf("写库失败后应把负载从 25 回滚到 100: %v", api.loadActions)
+	if len(api.loadActions) != 0 {
+		t.Fatalf("journal 不可用时不得先写上游，也不得执行反向 rollback: %v", api.loadActions)
 	}
 	api.mu.Lock()
 	actual := cloneIntPointer(api.accounts[0].LoadFactor)
 	api.mu.Unlock()
 	if actual == nil || *actual != 100 {
-		t.Fatalf("回滚后实际负载不正确: %v", actual)
+		t.Fatalf("journal 失败后上游状态被改变: %v", actual)
 	}
 }
 
@@ -1310,7 +1309,7 @@ func TestObserveModeNeverWritesAccountState(t *testing.T) {
 	}
 }
 
-func TestAllAutomationFreezeBlocksAutomaticWritesButKeepsCollectionAndManualRecovery(t *testing.T) {
+func TestWritesFreezeBlocksAllAccountWritesButKeepsCollection(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
 	if err := engine.UpdateFreezeState(ctx, model.FreezeState{AllAutomation: true, Reason: "incident"}, "web"); err != nil {
@@ -1329,18 +1328,23 @@ func TestAllAutomationFreezeBlocksAutomaticWritesButKeepsCollectionAndManualReco
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !control.HealthLocked || control.LastDecision != "automation_frozen_pause" {
+	if !control.HealthLocked {
 		t.Fatalf("health state should advance while external write is frozen: %+v", control)
+	}
+	mutations, err := database.ListAccountMutations(ctx, 225)
+	if err != nil || len(mutations) == 0 || mutations[len(mutations)-1].Status != accountcontrol.StatusBlocked ||
+		mutations[len(mutations)-1].LastErrorCode != string(accountcontrol.BlockWritesFrozen) {
+		t.Fatalf("blocked policy action was not journaled: mutations=%+v err=%v", mutations, err)
 	}
 
 	api.mu.Lock()
 	api.accounts[0].Schedulable = false
 	api.mu.Unlock()
-	if err := engine.ForceResume(ctx, 225, "web", "operator emergency recovery"); err != nil {
-		t.Fatal(err)
+	if err := engine.ForceResume(ctx, 225, "web", "operator emergency recovery"); err == nil {
+		t.Fatal("force resume bypassed the global writes freeze")
 	}
-	if len(api.actions) != 1 || !api.actions[0] {
-		t.Fatalf("operator force resume must remain available during freeze: %v", api.actions)
+	if len(api.actions) != 0 {
+		t.Fatalf("global writes freeze allowed an account write: %v", api.actions)
 	}
 }
 
@@ -1380,15 +1384,14 @@ func TestLoadPinPreventsHealthOverwriteAndRetainsOriginalBaseline(t *testing.T) 
 	api.accounts[0].Concurrency = 100
 	api.accounts[0].LoadFactor = &original
 	api.mu.Unlock()
+	if err := engine.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := engine.PinLoad(ctx, 225, 40, time.Now().UTC().Add(time.Hour), "web", "night capacity cap"); err != nil {
 		t.Fatal(err)
 	}
-	override := 80
-	if err := engine.AgentSetLoadFactor(ctx, 225, &override, "agent:test", "adaptive adjustment"); err == nil || err.Error() != "账号负载已固定到指定时间，需先明确解除负载固定" {
-		t.Fatalf("ordinary load adjustment bypassed active pin: %v", err)
-	}
 	if len(api.loadActions) != 1 {
-		t.Fatalf("rejected load adjustment reached Sub2API: %v", api.loadActions)
+		t.Fatalf("load pin did not produce exactly one write: %v", api.loadActions)
 	}
 	control, err := database.GetControl(ctx, 225)
 	if err != nil {
@@ -1398,10 +1401,11 @@ func TestLoadPinPreventsHealthOverwriteAndRetainsOriginalBaseline(t *testing.T) 
 	if err := database.UpsertControl(ctx, control); err != nil {
 		t.Fatal(err)
 	}
-	api.mu.Lock()
-	account := api.accounts[0]
-	api.mu.Unlock()
-	binding := model.ResolvedBinding{Account: account, Monitor: &model.Monitor{ID: 2, Enabled: true}, State: "bound"}
+	binding, ok := findBinding(engine.Snapshot().Bindings, 225)
+	if !ok {
+		t.Fatal("reconciled account is missing from the policy snapshot")
+	}
+	binding.Control = control
 	if err := engine.reconcileAdaptiveLoad(ctx, &binding, &control, settings, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -1409,82 +1413,52 @@ func TestLoadPinPreventsHealthOverwriteAndRetainsOriginalBaseline(t *testing.T) 
 		t.Fatalf("health control overwrote an active load pin: %v", api.loadActions)
 	}
 
-	expired := time.Now().UTC().Add(-time.Second)
-	control.LoadPinUntil = &expired
-	if err := database.UpsertControl(ctx, control); err != nil {
+	if err := engine.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.reconcileAdaptiveLoad(ctx, &binding, &control, settings, time.Now().UTC()); err != nil {
+	if _, err := engine.ClearLoadPinCommand(ctx, 225, "web", "capacity restored", "clear-load-pin"); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.loadActions) != 2 || api.loadActions[1] == nil || *api.loadActions[1] != 25 {
-		t.Fatalf("expired pin must calculate 25%% from original 100, not pinned 40: %v", api.loadActions)
+	if len(api.loadActions) != 2 || api.loadActions[1] == nil || *api.loadActions[1] != 100 {
+		t.Fatalf("clearing the pin did not return to the policy baseline: %v", api.loadActions)
 	}
 	loaded, err := database.GetControl(ctx, 225)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.LoadPinValue != nil || loaded.LoadPinUntil != nil || !loaded.OwnsLoadFactor || loaded.OriginalLoadFactor == nil || *loaded.OriginalLoadFactor != 100 {
-		t.Fatalf("expired pin was not cleaned while retaining health baseline: %+v", loaded)
+	if loaded.LoadPinValue != nil || loaded.LoadPinUntil != nil || loaded.OriginalLoadFactor == nil || *loaded.OriginalLoadFactor != 100 {
+		t.Fatalf("cleared pin projection did not retain the policy baseline: %+v", loaded)
 	}
 }
 
-func TestAdministratorLoadAdjustmentOverridesProtectionAndActivePin(t *testing.T) {
+func TestDirectAdministratorLoadAdjustmentCreatesTemporaryOverride(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)
-	settings, err := database.GetSettings(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	settings.HealthLoadOverrideMinutes = 17
-	if err := database.UpdateSettings(ctx, settings); err != nil {
-		t.Fatal(err)
-	}
 	original := 90
 	api.mu.Lock()
 	api.accounts[0].LoadFactor = &original
 	api.mu.Unlock()
-	pinnedUntil := time.Now().UTC().Add(time.Hour)
-	oldHold := time.Now().UTC().Add(30 * time.Minute)
-	pinned := 35
-	control, err := database.GetControl(ctx, 225)
-	if err != nil {
-		t.Fatal(err)
-	}
-	control.AccountID = 225
-	control.OwnsLoadFactor = true
-	control.OriginalLoadFactor = &original
-	control.ExpectedLoadFactor = &pinned
-	control.LoadPinValue = &pinned
-	control.LoadPinUntil = &pinnedUntil
-	control.LoadPinOwner = "administrator:old"
-	control.LoadPinReason = "old command"
-	control.LoadOverrideUntil = &oldHold
-	if err := database.UpsertControl(ctx, control); err != nil {
-		t.Fatal(err)
-	}
 
 	desired := 70
-	if err := engine.ForceSetLoadFactor(ctx, 225, &desired, "administrator:agent", "new exact command"); err != nil {
+	started := time.Now().UTC()
+	if _, err := engine.ForceSetLoadFactorCommand(ctx, 225, &desired, "web", "direct administrator command",
+		"admin-load-override", accountcontrol.DefaultAdministratorTTL); err != nil {
 		t.Fatal(err)
 	}
 	if len(api.loadActions) != 1 || api.loadActions[0] == nil || *api.loadActions[0] != desired {
 		t.Fatalf("administrator load adjustment did not reach Sub2API: %v", api.loadActions)
 	}
-	control, err = database.GetControl(ctx, 225)
+	control, err := database.GetControl(ctx, 225)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if control.LoadPinValue != nil || control.LoadPinUntil != nil || control.LoadPinOwner != "" || control.LoadPinReason != "" {
-		t.Fatalf("administrator adjustment retained stale pin state: %+v", control)
-	}
-	if control.OwnsLoadFactor || control.OriginalLoadFactor != nil || control.ExpectedLoadFactor != nil ||
-		control.LoadStage != "manual_override" || control.LoadOverrideUntil == nil {
+	if control.LoadPinValue != nil || control.LoadPinUntil != nil || control.OwnsLoadFactor ||
+		control.OriginalLoadFactor == nil || *control.OriginalLoadFactor != original || control.ExpectedLoadFactor == nil ||
+		*control.ExpectedLoadFactor != desired || control.LoadOverrideUntil == nil {
 		t.Fatalf("administrator adjustment did not establish a clean manual override: %+v", control)
 	}
-	remaining := time.Until(control.LoadOverrideUntil.UTC())
-	if remaining < 16*time.Minute || remaining > 18*time.Minute {
-		t.Fatalf("administrator protection window does not use configured duration: %s", remaining)
+	if control.LoadOverrideUntil.Before(started.Add(29*time.Minute)) || control.LoadOverrideUntil.After(time.Now().UTC().Add(31*time.Minute)) {
+		t.Fatalf("administrator protection window does not use product default: %v", control.LoadOverrideUntil)
 	}
 }
 
@@ -1530,6 +1504,14 @@ func containsEvent(events []model.Event, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func autonomousAgentTestContext(commandID string, created time.Time) context.Context {
+	expires := created.Add(accountcontrol.DefaultAutonomousTTL)
+	return accountcontrol.WithCommandContext(context.Background(), accountcontrol.CommandContext{
+		CommandID: commandID, CreatedAt: created, ExpiresAt: &expires, SnapshotVersion: "test-snapshot-" + commandID,
+		EvidenceRefs: []string{"test-evidence-" + commandID},
+	})
 }
 
 func int64Ptr(value int64) *int64 { return &value }

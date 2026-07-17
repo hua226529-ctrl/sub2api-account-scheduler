@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
@@ -43,22 +42,22 @@ func TestCharacterizationWritesFrozenCollectsButSkipsDeterministicMutation(t *te
 	}
 }
 
-func TestCurrentBehaviorManualPauseAndResumeBypassWritesFrozen(t *testing.T) {
+func TestAccountCommandsCannotBypassWritesFrozen(t *testing.T) {
 	engine, _, api := stage0Engine(t)
 	ctx := context.Background()
 	if err := engine.UpdateFreezeState(ctx, model.FreezeState{Mode: model.AgentFreezeModeWritesFrozen, Reason: "incident"}, "web"); err != nil {
 		t.Fatal(err)
 	}
 	api.ResetStats()
-	if err := engine.ManualPause(ctx, 1, "web"); err != nil {
-		t.Fatal(err)
+	if err := engine.ManualPause(ctx, 1, "web"); err == nil {
+		t.Fatal("manual pause bypassed writes freeze")
 	}
-	if err := engine.ManualResume(ctx, 1, "web"); err != nil {
-		t.Fatal(err)
+	if err := engine.ManualResume(ctx, 1, "web"); err == nil {
+		t.Fatal("manual resume bypassed writes freeze")
 	}
 	stats := api.Stats()
-	if stats.ByName[testsupport.CallSetSchedulable] != 2 {
-		t.Fatalf("manual writes under writes_frozen = %d, want current behavior 2", stats.ByName[testsupport.CallSetSchedulable])
+	if stats.ByName[testsupport.CallSetSchedulable] != 0 {
+		t.Fatalf("manual writes under writes_frozen = %d, want 0", stats.ByName[testsupport.CallSetSchedulable])
 	}
 }
 
@@ -152,15 +151,14 @@ func TestCurrentBehaviorManualResumeCanOverlapReconcileNetworkRead(t *testing.T)
 	}
 }
 
-func TestCurrentBehaviorUncertainManualPauseSurvivesOnlyUpstreamAfterRestart(t *testing.T) {
+func TestAmbiguousAppliedManualPauseIsConfirmedAndPersistsAcrossRestart(t *testing.T) {
 	engine, database, api := stage0Engine(t)
 	ctx := context.Background()
 	api.SetFailure(testsupport.CallSetSchedulable, testsupport.Failure{
-		AtCall: 1, ApplyBeforeError: true,
+		AtCall: 1, Err: io.EOF, ApplyBeforeError: true,
 	})
-	err := engine.ManualPause(ctx, 1, "web")
-	if err == nil || !strings.Contains(err.Error(), "结果不明确") {
-		t.Fatalf("ManualPause error = %v, want uncertain mutation", err)
+	if err := engine.ManualPause(ctx, 1, "web"); err != nil {
+		t.Fatalf("readback-confirmed pause returned error: %v", err)
 	}
 	if err := database.Reopen(); err != nil {
 		t.Fatal(err)
@@ -169,8 +167,8 @@ func TestCurrentBehaviorUncertainManualPauseSurvivesOnlyUpstreamAfterRestart(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if control.OwnsPause {
-		t.Fatalf("unexpected persisted pause ownership: %+v", control)
+	if !control.OwnsPause || !control.ManualLocked {
+		t.Fatalf("confirmed pause was not persisted: %+v", control)
 	}
 	accounts, err := api.ListAccounts(ctx)
 	if err != nil {
