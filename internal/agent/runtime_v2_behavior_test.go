@@ -14,7 +14,7 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/store"
 )
 
-func TestUnifiedRunGuardIsVisibleInOverview(t *testing.T) {
+func TestOverviewDerivesRunningStateFromPersistentGoal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
@@ -27,27 +27,37 @@ func TestUnifiedRunGuardIsVisibleInOverview(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 
 	manager := &Manager{store: database}
-	if !manager.beginRun() {
-		t.Fatal("first run did not acquire the unified run guard")
+	goal := model.AgentGoal{Title: "running", Objective: "verify overview", Status: model.AgentGoalStatusPlanned,
+		Lane: model.AgentLaneInteractive, Priority: 50, RiskLevel: model.AgentRiskLow, Source: "test",
+		Context: json.RawMessage(`{"kind":"chat"}`), CreatedBy: "test"}
+	if err := database.CreateAgentGoal(ctx, &goal); err != nil {
+		t.Fatal(err)
 	}
-	if manager.beginRun() {
-		t.Fatal("a concurrent legacy or V2 run acquired the same run guard")
+	claimed, err := database.ClaimAgentGoal(ctx, model.AgentLaneInteractive, "overview-test", time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.ID != goal.ID {
+		t.Fatalf("goal was not claimed: %+v", claimed)
 	}
 	overview, err := manager.Overview(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !overview.Running {
-		t.Fatal("overview did not expose the active V2/legacy run")
+		t.Fatal("overview did not expose the persistently leased goal")
 	}
 
-	manager.endRun()
+	claimed.Status = model.AgentGoalStatusCompleted
+	if err := database.UpdateAgentGoal(ctx, *claimed); err != nil {
+		t.Fatal(err)
+	}
 	overview, err = manager.Overview(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if overview.Running {
-		t.Fatal("overview remained running after the unified guard was released")
+		t.Fatal("overview remained running after the goal completed")
 	}
 }
 
@@ -190,7 +200,7 @@ func TestEnqueueAnalysisGoalDeduplicatesActiveEmergencyAcrossTriggers(t *testing
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
-	manager := &Manager{store: database, runtimeWake: make(chan struct{}, 1)}
+	manager := &Manager{store: database, interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1)}
 	first, err := manager.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, "账号池清空", 95)
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +317,7 @@ func TestCheckpointRuntimeYieldClosesRunAndWaitsGoal(t *testing.T) {
 	if err := database.CreateAgentRun(ctx, &run); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{store: database, runtimeWake: make(chan struct{}, 1)}
+	manager := &Manager{store: database, interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1)}
 	cause := errors.New("智能体已被冻结")
 	gotErr := manager.checkpointRuntimeYield(ctx, &goal, &run,
 		[]RuntimeMessage{{Role: "system", Content: runtimeSystemPrompt()}}, 2, "", 0,
@@ -336,6 +346,35 @@ func TestCheckpointRuntimeYieldClosesRunAndWaitsGoal(t *testing.T) {
 	}
 }
 
+func TestRuntimeErrorReleasePreservesExplicitWaitingState(t *testing.T) {
+	manager, database := stage0AgentManager(t)
+	ctx := context.Background()
+	goal := model.AgentGoal{Title: "waiting", Objective: "waiting", Status: model.AgentGoalStatusPlanned,
+		Lane: model.AgentLaneInteractive, Priority: 50, RiskLevel: model.AgentRiskLow, Source: "administrator",
+		Context: json.RawMessage(`{"kind":"chat"}`), CreatedBy: "administrator"}
+	if err := database.Store.CreateAgentGoal(ctx, &goal); err != nil {
+		t.Fatal(err)
+	}
+	worker := manager.workerID + ":" + model.AgentLaneInteractive
+	claimed, err := database.Store.ClaimAgentGoal(ctx, model.AgentLaneInteractive, worker, time.Now().UTC(), time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim waiting goal: goal=%+v err=%v", claimed, err)
+	}
+	claimed.Status = model.AgentGoalStatusWaiting
+	claimed.LastError = "frozen"
+	if err := database.Store.UpdateAgentGoal(ctx, *claimed); err != nil {
+		t.Fatal(err)
+	}
+	manager.releaseRuntimeGoalAfterError(ctx, claimed.ID, worker, model.AgentLaneInteractive, errors.New("frozen"))
+	stored, err := database.Store.GetAgentGoal(ctx, claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.AgentGoalStatusWaiting || stored.LeaseOwner != "" || stored.LeaseUntil != nil || stored.NextRunnableAt != nil {
+		t.Fatalf("waiting goal was requeued or retained its lease: %+v", stored)
+	}
+}
+
 func TestResumeGoalAfterReconciliationDoesNotReopenTerminalGoal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -347,7 +386,7 @@ func TestResumeGoalAfterReconciliationDoesNotReopenTerminalGoal(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	manager := &Manager{store: database, runtimeWake: make(chan struct{}, 1)}
+	manager := &Manager{store: database, interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1)}
 
 	for _, status := range []string{model.AgentGoalStatusCompleted, model.AgentGoalStatusCancelled, model.AgentGoalStatusFailed} {
 		goal := model.AgentGoal{Title: status, Objective: "terminal", Status: status, Priority: 50,

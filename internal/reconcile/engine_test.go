@@ -19,9 +19,11 @@ import (
 
 type fakeAPI struct {
 	mu           sync.Mutex
+	listStarted  chan time.Time
 	monitors     []model.Monitor
 	accounts     []model.Account
 	actions      []bool
+	actionIDs    []int64
 	loadActions  []*int
 	setError     error
 	scheduleErr  error
@@ -33,6 +35,12 @@ type fakeAPI struct {
 func (f *fakeAPI) ListMonitors(context.Context) ([]model.Monitor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listStarted != nil {
+		select {
+		case f.listStarted <- time.Now():
+		default:
+		}
+	}
 	return append([]model.Monitor(nil), f.monitors...), nil
 }
 
@@ -46,6 +54,7 @@ func (f *fakeAPI) SetSchedulable(_ context.Context, id int64, value bool) (model
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.actions = append(f.actions, value)
+	f.actionIDs = append(f.actionIDs, id)
 	if len(f.scheduleErrs) > 0 {
 		err := f.scheduleErrs[0]
 		f.scheduleErrs = f.scheduleErrs[1:]
@@ -134,6 +143,103 @@ func newEngineTestWithPath(t *testing.T, dryRun bool) (*Engine, *store.Store, *f
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return NewEngine(api, database, 50*time.Second, logger), database, api, path
+}
+
+func newTargetedEngineTest(t *testing.T) (*Engine, *store.Store, *fakeAPI) {
+	t.Helper()
+	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
+		FailureThreshold: 1, RecoveryThreshold: 1, ManualHoldMinutes: 10,
+		FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10,
+		HealthMode: model.HealthModeLegacy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Now().UTC()
+	api := &fakeAPI{
+		monitors: []model.Monitor{
+			{ID: 1, Name: "one", Provider: "openai", Endpoint: "https://one.example", PrimaryModel: "gpt", Enabled: true, LastCheckedAt: &now, PrimaryStatus: model.StatusFailed},
+			{ID: 2, Name: "two", Provider: "openai", Endpoint: "https://two.example", PrimaryModel: "gpt", Enabled: true, LastCheckedAt: &now, PrimaryStatus: model.StatusFailed},
+		},
+		accounts: []model.Account{
+			{ID: 101, Name: "one", Platform: "openai", Type: "apikey", Status: "active", Schedulable: true, Credentials: map[string]any{"base_url": "https://one.example/v1"}},
+			{ID: 102, Name: "two", Platform: "openai", Type: "apikey", Status: "active", Schedulable: true, Credentials: map[string]any{"base_url": "https://two.example/v1"}},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewEngine(api, database, 50*time.Second, logger), database, api
+}
+
+func TestReconcileAccountsOnlyAllowsTargetAccountsToMutate(t *testing.T) {
+	engine, _, api := newTargetedEngineTest(t)
+	if err := engine.ReconcileAccounts(context.Background(), []int64{101}); err != nil {
+		t.Fatal(err)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.actionIDs) != 1 || api.actionIDs[0] != 101 {
+		t.Fatalf("targeted reconcile wrote non-target accounts: %#v", api.actionIDs)
+	}
+}
+
+func TestReconcileAccountsContinuesAfterOneTargetFails(t *testing.T) {
+	engine, _, api := newTargetedEngineTest(t)
+	api.scheduleErrs = []error{errors.New("first target rejected"), nil}
+	err := engine.ReconcileAccounts(context.Background(), []int64{101, 102})
+	if err == nil {
+		t.Fatal("target failure was not reported")
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.actionIDs) != 2 || api.actionIDs[0] != 101 || api.actionIDs[1] != 102 {
+		t.Fatalf("second target did not continue after the first failed: %#v", api.actionIDs)
+	}
+}
+
+func TestPolicyCommitQueuesTargetedReconcileAfterPersistence(t *testing.T) {
+	engine, database, _ := newEngineTest(t, false)
+	policy := model.Policy{AccountID: 225, Enabled: true}
+	if err := engine.UpdatePolicy(context.Background(), policy, "web"); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := database.ListPolicies(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted[225]; !ok {
+		t.Fatal("policy trigger was queued before the policy commit became durable")
+	}
+	full, ids, sources, _, _, _ := engine.coordinator.takePending()
+	if full || len(ids) != 1 || ids[0] != 225 {
+		t.Fatalf("account policy did not queue one targeted pass: full=%v ids=%#v", full, ids)
+	}
+	if len(sources) != 1 || sources[0] != "policy_update" {
+		t.Fatalf("policy trigger source was not retained: %#v", sources)
+	}
+}
+
+func TestPolicyCommitStartsCoordinatorReconcileWithinLatencyTarget(t *testing.T) {
+	engine, _, api := newEngineTest(t, false)
+	api.listStarted = make(chan time.Time, 1)
+	engine.coordinator.interval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go engine.coordinator.Run(ctx)
+	if err := engine.UpdatePolicy(ctx, model.Policy{AccountID: 225, Enabled: true}, "web"); err != nil {
+		t.Fatal(err)
+	}
+	committed := time.Now()
+	select {
+	case started := <-api.listStarted:
+		latency := started.Sub(committed)
+		t.Logf("policy commit to reconcile start: %v", latency)
+		if latency >= 500*time.Millisecond {
+			t.Fatalf("policy reconcile start exceeded target: %v", latency)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("policy commit did not start reconcile within 500ms")
+	}
 }
 
 func failEventCommit(t *testing.T, path, eventType string) {

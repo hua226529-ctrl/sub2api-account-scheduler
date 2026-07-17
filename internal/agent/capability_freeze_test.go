@@ -52,3 +52,34 @@ func TestAdministratorCapabilityWaitsForFreezePublication(t *testing.T) {
 		t.Fatalf("frozen administrator capability reached Sub2API: %v", api.actions)
 	}
 }
+
+func TestBlockedCapabilityDoesNotOccupyInteractiveModelSlot(t *testing.T) {
+	manager, _, api := newAdministratorTestManager(t)
+	arguments := json.RawMessage(`{"account_id":298,"reason":"background capability barrier"}`)
+	grant := mintAdministratorGrant(administratorCommandHash("capability-lane-scope"),
+		administratorCommandHash("立即暂停account-example"), "immediate",
+		"pause_account", arguments, []string{"account:298"}, "", nil, nil)
+	api.scheduleStarted = make(chan struct{}, 1)
+	api.scheduleRelease = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{
+			Name: "pause_account", Arguments: arguments, GoalID: 501, StepID: 601,
+			Actor: "administrator:agent", AdministratorGrant: grant,
+		})
+		done <- err
+	}()
+	<-api.scheduleStarted
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	release, err := manager.acquireModelSlot(ctx, model.AgentLaneInteractive)
+	cancel()
+	if err != nil {
+		close(api.scheduleRelease)
+		t.Fatalf("interactive model slot waited for blocked capability: %v", err)
+	}
+	release()
+	close(api.scheduleRelease)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

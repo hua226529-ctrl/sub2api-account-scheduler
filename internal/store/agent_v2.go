@@ -24,6 +24,7 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			title TEXT NOT NULL,
 			objective TEXT NOT NULL,
 			status TEXT NOT NULL,
+			lane TEXT NOT NULL DEFAULT 'background',
 			priority INTEGER NOT NULL DEFAULT 50,
 			risk_level TEXT NOT NULL DEFAULT 'low',
 			source TEXT NOT NULL DEFAULT 'system',
@@ -35,6 +36,9 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			completed_at TEXT,
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_until TEXT,
+			next_runnable_at TEXT,
 			FOREIGN KEY(parent_goal_id) REFERENCES agent_goals(id) ON DELETE SET NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_goals_status_priority ON agent_goals(status,priority DESC,created_at)`,
@@ -176,10 +180,27 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 	}{
 		{table: "agent_steps", name: "mutation_attempted_at"},
 		{table: "agent_scheduled_commands", name: "mutation_attempted_at"},
+		{table: "agent_goals", name: "lane"},
+		{table: "agent_goals", name: "lease_owner"},
+		{table: "agent_goals", name: "lease_until"},
+		{table: "agent_goals", name: "next_runnable_at"},
 	} {
-		if err := s.ensureColumn(ctx, column.table, column.name, "TEXT"); err != nil {
+		definition := "TEXT"
+		if column.table == "agent_goals" && column.name == "lane" {
+			definition = "TEXT NOT NULL DEFAULT 'background'"
+		}
+		if column.table == "agent_goals" && column.name == "lease_owner" {
+			definition = "TEXT NOT NULL DEFAULT ''"
+		}
+		if err := s.ensureColumn(ctx, column.table, column.name, definition); err != nil {
 			return err
 		}
+	}
+	if err := s.backfillAgentGoalLanes(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_agent_goals_claim ON agent_goals(lane,status,priority DESC,created_at,id,next_runnable_at)`); err != nil {
+		return fmt.Errorf("create agent goal claim index: %w", err)
 	}
 	if err := s.backfillAgentV2MutationAttempts(ctx); err != nil {
 		return err
@@ -187,6 +208,13 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 	now := formatTime(time.Now().UTC())
 	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_freeze_states(scope_type,scope_id,mode,reason,actor,created_at,updated_at)
 		VALUES('global','',?,'','system',?,?)`, model.AgentFreezeModeActive, now, now)
+	return err
+}
+
+func (s *Store) backfillAgentGoalLanes(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET lane=?
+		WHERE (lane='' OR lane IS NULL OR lane=?) AND (source='administrator' OR conversation_id IS NOT NULL)`,
+		model.AgentLaneInteractive, model.AgentLaneBackground)
 	return err
 }
 
@@ -313,6 +341,17 @@ func validAgentGoalStatus(value string) bool {
 	}
 }
 
+func validAgentGoalLane(value string) bool {
+	return value == model.AgentLaneInteractive || value == model.AgentLaneBackground
+}
+
+func agentGoalLane(source string, conversationID *int64) string {
+	if strings.EqualFold(strings.TrimSpace(source), "administrator") || conversationID != nil {
+		return model.AgentLaneInteractive
+	}
+	return model.AgentLaneBackground
+}
+
 func validAgentStepStatus(value string) bool {
 	switch value {
 	case model.AgentStepStatusPending, model.AgentStepStatusScheduled, model.AgentStepStatusRunning,
@@ -397,6 +436,12 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 	if item.Source == "" {
 		item.Source = "system"
 	}
+	if item.Lane == "" {
+		item.Lane = agentGoalLane(item.Source, item.ConversationID)
+	}
+	if !validAgentGoalLane(item.Lane) {
+		return errors.New("invalid agent goal lane")
+	}
 	if item.CreatedBy == "" {
 		item.CreatedBy = "system"
 	}
@@ -412,12 +457,13 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 	if terminalAgentGoal(item.Status) && item.CompletedAt == nil {
 		item.CompletedAt = &now
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_goals(parent_goal_id,conversation_id,title,objective,status,priority,
-		risk_level,source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective,
-		item.Status, item.Priority, item.RiskLevel, item.Source, string(item.Context), item.PlanHash, item.CreatedBy,
+	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_goals(parent_goal_id,conversation_id,title,objective,status,lane,priority,
+		risk_level,source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,
+		lease_owner,lease_until,next_runnable_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective,
+		item.Status, item.Lane, item.Priority, item.RiskLevel, item.Source, string(item.Context), item.PlanHash, item.CreatedBy,
 		formatOptionalTime(item.DeadlineAt), item.LastError, formatTime(item.CreatedAt), formatTime(item.UpdatedAt),
-		formatOptionalTime(item.CompletedAt))
+		formatOptionalTime(item.CompletedAt), item.LeaseOwner, formatOptionalTime(item.LeaseUntil), formatOptionalTime(item.NextRunnableAt))
 	if err != nil {
 		return err
 	}
@@ -426,8 +472,8 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 }
 
 func (s *Store) GetAgentGoal(ctx context.Context, id int64) (model.AgentGoal, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,parent_goal_id,conversation_id,title,objective,status,priority,risk_level,
-		source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at
+	row := s.db.QueryRowContext(ctx, `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,
+		source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
 		FROM agent_goals WHERE id=?`, id)
 	return scanAgentGoal(row)
 }
@@ -438,6 +484,12 @@ func (s *Store) UpdateAgentGoal(ctx context.Context, item model.AgentGoal) error
 	}
 	if item.Priority < 1 || item.Priority > 100 {
 		return errors.New("agent goal priority must be between 1 and 100")
+	}
+	if item.Lane == "" {
+		item.Lane = agentGoalLane(item.Source, item.ConversationID)
+	}
+	if !validAgentGoalLane(item.Lane) {
+		return errors.New("invalid agent goal lane")
 	}
 	var err error
 	if item.Title, err = requiredString(item.Title, "title"); err != nil {
@@ -457,12 +509,14 @@ func (s *Store) UpdateAgentGoal(ctx context.Context, item model.AgentGoal) error
 	}
 	if !terminalAgentGoal(item.Status) {
 		item.CompletedAt = nil
+	} else {
+		item.LeaseOwner, item.LeaseUntil, item.NextRunnableAt = "", nil, nil
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET parent_goal_id=?,conversation_id=?,title=?,objective=?,status=?,
-		priority=?,risk_level=?,source=?,context_json=?,plan_hash=?,created_by=?,deadline_at=?,last_error=?,updated_at=?,completed_at=?
-		WHERE id=?`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective, item.Status, item.Priority,
+	result, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET parent_goal_id=?,conversation_id=?,title=?,objective=?,status=?,lane=?,
+		priority=?,risk_level=?,source=?,context_json=?,plan_hash=?,created_by=?,deadline_at=?,last_error=?,updated_at=?,completed_at=?,lease_owner=?,lease_until=?,next_runnable_at=?
+		WHERE id=?`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective, item.Status, item.Lane, item.Priority,
 		item.RiskLevel, item.Source, string(item.Context), item.PlanHash, item.CreatedBy, formatOptionalTime(item.DeadlineAt),
-		item.LastError, formatTime(item.UpdatedAt), formatOptionalTime(item.CompletedAt), item.ID)
+		item.LastError, formatTime(item.UpdatedAt), formatOptionalTime(item.CompletedAt), item.LeaseOwner, formatOptionalTime(item.LeaseUntil), formatOptionalTime(item.NextRunnableAt), item.ID)
 	if err != nil {
 		return err
 	}
@@ -477,8 +531,8 @@ func (s *Store) ListAgentGoals(ctx context.Context, status string, limit int) ([
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
-	query := `SELECT id,parent_goal_id,conversation_id,title,objective,status,priority,risk_level,source,context_json,
-		plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at FROM agent_goals`
+	query := `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,source,context_json,
+		plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at FROM agent_goals`
 	args := make([]any, 0, 2)
 	if status = strings.TrimSpace(status); status != "" {
 		if !validAgentGoalStatus(status) {
@@ -505,6 +559,70 @@ func (s *Store) ListAgentGoals(ctx context.Context, status string, limit int) ([
 	return items, rows.Err()
 }
 
+// ClaimAgentGoal atomically leases one runnable goal from a single lane.
+// Ordering is deterministic and the expired lease repair is part of the same
+// transaction, so two lane workers cannot claim the same goal.
+func (s *Store) ClaimAgentGoal(ctx context.Context, lane, worker string, now time.Time, leaseDuration time.Duration) (*model.AgentGoal, error) {
+	if !validAgentGoalLane(lane) || strings.TrimSpace(worker) == "" || leaseDuration <= 0 {
+		return nil, errors.New("invalid agent goal claim")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	now = now.UTC()
+	nowText := formatTime(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_goals SET status=?,lease_owner='',lease_until=NULL,updated_at=?
+		WHERE status=? AND lease_until IS NOT NULL AND lease_until<=?`, model.AgentGoalStatusPlanned, nowText,
+		model.AgentGoalStatusRunning, nowText); err != nil {
+		return nil, err
+	}
+	query := `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,source,context_json,
+		plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
+		FROM agent_goals WHERE lane=? AND status=? AND (next_runnable_at IS NULL OR next_runnable_at<=?)
+		ORDER BY priority DESC,created_at,id LIMIT 1`
+	goal, err := scanAgentGoal(tx.QueryRowContext(ctx, query, lane, model.AgentGoalStatusPlanned, nowText))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	leaseUntil := now.Add(leaseDuration)
+	result, err := tx.ExecContext(ctx, `UPDATE agent_goals SET status=?,lease_owner=?,lease_until=?,next_runnable_at=NULL,updated_at=?
+		WHERE id=? AND lane=? AND status=?`, model.AgentGoalStatusRunning, worker, formatTime(leaseUntil), nowText,
+		goal.ID, lane, model.AgentGoalStatusPlanned)
+	if err != nil {
+		return nil, err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return nil, nil
+	}
+	goal.Status, goal.LeaseOwner, goal.LeaseUntil, goal.NextRunnableAt = model.AgentGoalStatusRunning, worker, &leaseUntil, nil
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &goal, nil
+}
+
+func (s *Store) ReleaseAgentGoalLease(ctx context.Context, goalID int64, worker, status string, nextRunnableAt *time.Time, lastError string) error {
+	if goalID <= 0 || strings.TrimSpace(worker) == "" || !validAgentGoalStatus(status) {
+		return errors.New("invalid agent goal lease release")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET status=?,lease_owner='',lease_until=NULL,next_runnable_at=?,last_error=?,updated_at=?
+		WHERE id=? AND lease_owner=?`, status, formatOptionalTime(nextRunnableAt), strings.TrimSpace(lastError), formatTime(time.Now().UTC()), goalID, strings.TrimSpace(worker))
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count != 1 {
+		return errors.New("agent goal lease not found")
+	}
+	return nil
+}
+
 type agentGoalScanner interface {
 	Scan(...any) error
 }
@@ -513,10 +631,10 @@ func scanAgentGoal(scanner agentGoalScanner) (model.AgentGoal, error) {
 	var item model.AgentGoal
 	var parentID, conversationID sql.NullInt64
 	var contextJSON, createdAt, updatedAt string
-	var deadlineAt, completedAt sql.NullString
+	var deadlineAt, completedAt, leaseUntil, nextRunnableAt sql.NullString
 	err := scanner.Scan(&item.ID, &parentID, &conversationID, &item.Title, &item.Objective, &item.Status,
-		&item.Priority, &item.RiskLevel, &item.Source, &contextJSON, &item.PlanHash, &item.CreatedBy,
-		&deadlineAt, &item.LastError, &createdAt, &updatedAt, &completedAt)
+		&item.Lane, &item.Priority, &item.RiskLevel, &item.Source, &contextJSON, &item.PlanHash, &item.CreatedBy,
+		&deadlineAt, &item.LastError, &createdAt, &updatedAt, &completedAt, &item.LeaseOwner, &leaseUntil, &nextRunnableAt)
 	if err != nil {
 		return item, err
 	}
@@ -526,6 +644,8 @@ func scanAgentGoal(scanner agentGoalScanner) (model.AgentGoal, error) {
 	item.DeadlineAt = parseNullableTime(deadlineAt)
 	item.CreatedAt, item.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
 	item.CompletedAt = parseNullableTime(completedAt)
+	item.LeaseUntil = parseNullableTime(leaseUntil)
+	item.NextRunnableAt = parseNullableTime(nextRunnableAt)
 	return item, nil
 }
 
@@ -1820,7 +1940,7 @@ func (s *Store) RecoverAgentV2State(ctx context.Context, now time.Time) (model.A
 			return summary, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agent_goals SET status=?,
+	if _, err := tx.ExecContext(ctx, `UPDATE agent_goals SET status=?,lease_owner='',lease_until=NULL,
 		last_error=CASE WHEN last_error='' THEN '服务重启，已从最近检查点恢复等待续跑' ELSE last_error END,
 		updated_at=?,completed_at=NULL WHERE status=?`, model.AgentGoalStatusPlanned, nowText, model.AgentGoalStatusRunning); err != nil {
 		return summary, err

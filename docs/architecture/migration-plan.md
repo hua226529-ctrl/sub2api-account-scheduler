@@ -23,4 +23,6 @@
 
 ## 当前状态
 
-阶段 1A、1B 和 1B.5 已完成领域模型、确定性仲裁、类型安全适配、Semantic Gap 和稳定 identity。核心阶段 A 已完成账号 `schedulable`/`load_factor` 的持久 Override、生产 Arbiter、账号 Safety Guard、唯一 Mutation Executor、keyed account lock、journal 与重启恢复；账号 Runtime Shadow 和旧直写已删除。分组 Mutation Executor、Event Bus、Agent lanes、Optimizer 及其他资源的旧路径删除均未开始。
+阶段 1A、1B 和 1B.5 已完成领域模型、确定性仲裁、类型安全适配、Semantic Gap 和稳定 identity。核心阶段 A 已完成账号 `schedulable`/`load_factor` 的持久 Override、生产 Arbiter、账号 Safety Guard、唯一 Mutation Executor、keyed account lock、journal 与重启恢复；账号 Runtime Shadow 和旧直写已删除。
+
+核心阶段 B 已完成：Reconcile Coordinator 是唯一生产 pass loop，保留周期 full fallback，并接入 Telemetry、策略发布、Override 到期、余额锁、成本锁和 startup recovery；Telemetry 支持最多 4 路有限并发及部分成功；Agent 使用持久 interactive/background lane、独立 worker 和独立模型 slot，旧全局 runtime lock 与单 worker 已删除。这里没有引入通用 Event Bus。分组 Mutation Executor、完整 Agent Optimizer、策略模拟和自动回滚、完整聊天意图分类及前端整体重构仍未开始，也不因本阶段标记完成。

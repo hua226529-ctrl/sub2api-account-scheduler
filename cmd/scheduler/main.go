@@ -65,7 +65,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	engine.Start(ctx)
-	telemetryManager := telemetry.NewManager(client, database, cfg.TelemetryPollInterval, logger)
+	telemetryManager := telemetry.NewManager(client, database, cfg.TelemetryPollInterval, logger,
+		telemetry.WithReconcileRequester(engine), telemetry.WithMonitorAccountResolver(engine))
 	telemetryManager.Start(ctx)
 	balanceManager := balance.NewManager(database, client, engine, balance.NewFetcher(cfg.RequestTimeout, cfg.AllowInsecureUpstream), secretBox, cfg.BalancePollInterval, logger)
 	balanceManager.Start(ctx)

@@ -24,6 +24,14 @@ type Trigger interface {
 	Trigger()
 }
 
+type accountRequester interface {
+	RequestAccounts(...int64)
+}
+
+type sourcedAccountRequester interface {
+	RequestAccountsFrom(string, ...int64)
+}
+
 type automationBoundary interface {
 	AutomationBarrier() *automation.Barrier
 	FreezeState(context.Context) (model.FreezeState, error)
@@ -464,7 +472,6 @@ func (m *Manager) refreshAll(ctx context.Context) {
 	m.lastRunMu.Lock()
 	m.lastRunAt = &now
 	m.lastRunMu.Unlock()
-	m.trigger.Trigger()
 }
 
 func (m *Manager) applySuccess(ctx context.Context, source *model.UpstreamSource, result model.UpstreamResult) error {
@@ -533,7 +540,8 @@ func (m *Manager) applySuccess(ctx context.Context, source *model.UpstreamSource
 			accountIDs = append(accountIDs, account.ID)
 		}
 	}
-	if err := m.store.SyncBalanceLocks(ctx, source.ID, accountIDs, source.Enabled && source.BalanceLocked); err != nil {
+	changedAccounts, err := m.store.SyncBalanceLocksChanged(ctx, source.ID, accountIDs, source.Enabled && source.BalanceLocked)
+	if err != nil {
 		return err
 	}
 	if !wasLocked && source.BalanceLocked {
@@ -542,8 +550,23 @@ func (m *Manager) applySuccess(ctx context.Context, source *model.UpstreamSource
 	if wasLocked && !source.BalanceLocked {
 		m.record(ctx, model.Event{Type: "balance_recovered", Severity: "info", Message: fmt.Sprintf("%s 余额连续达到恢复阈值，已解除余额锁", source.Name), BeforeState: "balance_locked", AfterState: "normal", Actor: "system", Details: fmt.Sprintf(`{"source_id":%d,"balance":%g,"unit":%q}`, source.ID, value, source.Unit)})
 	}
-	m.trigger.Trigger()
+	m.requestAccounts("balance_lock", changedAccounts)
 	return nil
+}
+
+func (m *Manager) requestAccounts(source string, accountIDs []int64) {
+	if len(accountIDs) == 0 {
+		return
+	}
+	if requester, ok := m.trigger.(sourcedAccountRequester); ok {
+		requester.RequestAccountsFrom(source, accountIDs...)
+		return
+	}
+	if requester, ok := m.trigger.(accountRequester); ok {
+		requester.RequestAccounts(accountIDs...)
+		return
+	}
+	m.trigger.Trigger()
 }
 
 type routingSource struct {
@@ -718,7 +741,8 @@ func (m *Manager) reconcileCostRouting(ctx context.Context) error {
 	if costLocksEqual(lockByAccount, desired) {
 		return nil
 	}
-	if err := m.store.SyncCostLocks(ctx, desiredItems); err != nil {
+	changedAccounts, err := m.store.SyncCostLocksChanged(ctx, desiredItems)
+	if err != nil {
 		return err
 	}
 	for accountID, item := range desired {
@@ -733,7 +757,7 @@ func (m *Manager) reconcileCostRouting(ctx context.Context) error {
 			m.record(ctx, model.Event{Type: "cost_tier_enabled", Severity: "warning", AccountID: &id, Message: fmt.Sprintf("倍率池 %s 的低倍率来源不可用，已启用备用倍率账号", item.Pool), BeforeState: "cost_locked", AfterState: "schedulable", Actor: "system", Details: fmt.Sprintf(`{"source_id":%d,"pool":%q,"rate":%g}`, item.SourceID, item.Pool, item.RateMultiplier)})
 		}
 	}
-	m.trigger.Trigger()
+	m.requestAccounts("cost_lock", changedAccounts)
 	return nil
 }
 

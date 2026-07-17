@@ -379,6 +379,7 @@ func (e *Engine) submitConverted(ctx context.Context, conversion controlplanebri
 }
 
 func (e *Engine) submitAccountMutation(ctx context.Context, submission accountcontrol.Submission) (accountcontrol.Result, error) {
+	defer e.notifyOverrideChanged()
 	command := accountcontrol.CommandContextFrom(ctx)
 	if command.AutomationLeaseHeld {
 		return e.accountControl.Submit(ctx, submission)

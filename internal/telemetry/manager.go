@@ -2,10 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
@@ -28,19 +30,79 @@ type Store interface {
 	AddEvent(context.Context, model.Event) error
 }
 
-// Manager continuously imports read-only evidence from Sub2API. The scheduler
-// can keep reconciling if this importer is unavailable; existing evidence and
-// control locks remain untouched until a later successful poll.
+type ReconcileRequester interface {
+	RequestAccounts(...int64)
+	RequestFull()
+}
+
+type MonitorAccountResolver interface {
+	AccountIDsForMonitors(...int64) []int64
+}
+
+type sourcedReconcileRequester interface {
+	RequestAccountsFrom(string, ...int64)
+	RequestFullFrom(string)
+}
+
+type Option func(*Manager)
+
+func WithReconcileRequester(requester ReconcileRequester) Option {
+	return func(manager *Manager) { manager.requester = requester }
+}
+
+func WithMonitorAccountResolver(resolver MonitorAccountResolver) Option {
+	return func(manager *Manager) { manager.resolver = resolver }
+}
+
+type TelemetryError struct {
+	Code string
+	Err  error
+}
+
+func (e *TelemetryError) Error() string {
+	if e == nil || e.Err == nil {
+		return e.Code
+	}
+	return e.Code + ": " + e.Err.Error()
+}
+
+func (e *TelemetryError) Unwrap() error { return e.Err }
+
+type MonitorIssue struct {
+	Code      string
+	MonitorID int64
+	Err       error
+}
+
+type PartialError struct {
+	Issues []MonitorIssue
+}
+
+func (e *PartialError) Error() string {
+	if e == nil || len(e.Issues) == 0 {
+		return "telemetry_partial_success"
+	}
+	return "telemetry_partial_success: " + e.Issues[0].Code
+}
+
+func (e *PartialError) Code() string { return "telemetry_partial_success" }
+
+// Manager imports evidence without holding a mutex across network or SQLite
+// work. The atomic running bit only prevents overlapping rounds.
 type Manager struct {
 	api      API
 	store    Store
 	interval time.Duration
 	logger   *slog.Logger
 
+	requester ReconcileRequester
+	resolver  MonitorAccountResolver
+
 	mu              sync.Mutex
 	lastSuccessAt   time.Time
 	lastError       string
 	lastMonitorKeys map[int64]time.Time
+	running         atomic.Bool
 }
 
 func (m *Manager) Status() (*time.Time, string) {
@@ -54,11 +116,20 @@ func (m *Manager) Status() (*time.Time, string) {
 	return last, m.lastError
 }
 
-func NewManager(api API, store Store, interval time.Duration, logger *slog.Logger) *Manager {
+func NewManager(api API, store Store, interval time.Duration, logger *slog.Logger, options ...Option) *Manager {
 	if interval < time.Minute {
 		interval = 2 * time.Minute
 	}
-	return &Manager{api: api, store: store, interval: interval, logger: logger, lastMonitorKeys: make(map[int64]time.Time)}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	manager := &Manager{api: api, store: store, interval: interval, logger: logger, lastMonitorKeys: make(map[int64]time.Time)}
+	for _, option := range options {
+		if option != nil {
+			option(manager)
+		}
+	}
+	return manager
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -78,56 +149,179 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 func (m *Manager) RunOnce(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !m.running.CompareAndSwap(false, true) {
+		return &TelemetryError{Code: "telemetry_run_in_progress"}
+	}
+	defer m.running.Store(false)
 
 	now := time.Now().UTC()
 	trafficSince := now.Add(-time.Hour)
-	if !m.lastSuccessAt.IsZero() {
-		trafficSince = m.lastSuccessAt.Add(-2 * time.Minute)
+	m.mu.Lock()
+	lastSuccessAt := m.lastSuccessAt
+	cursors := make(map[int64]time.Time, len(m.lastMonitorKeys))
+	for id, cursor := range m.lastMonitorKeys {
+		cursors[id] = cursor
+	}
+	m.mu.Unlock()
+	if !lastSuccessAt.IsZero() {
+		trafficSince = lastSuccessAt.Add(-2 * time.Minute)
 	}
 	query := sub2api.TelemetryQuery{Since: trafficSince, Until: now, PageSize: 200}
 	successes, err := m.api.ListSuccessfulRequests(ctx, query)
 	if err != nil {
-		return fmt.Errorf("读取真实请求记录失败: %w", err)
+		return &TelemetryError{Code: "traffic_fetch_failed", Err: fmt.Errorf("读取真实请求记录失败: %w", err)}
 	}
 	failures, err := m.api.ListRequestErrors(ctx, query)
 	if err != nil {
-		return fmt.Errorf("读取真实请求错误失败: %w", err)
+		return &TelemetryError{Code: "traffic_fetch_failed", Err: fmt.Errorf("读取真实请求错误失败: %w", err)}
 	}
-	if _, err := m.store.InsertTrafficBatch(ctx, successes, failures); err != nil {
-		return fmt.Errorf("保存真实请求证据失败: %w", err)
+	trafficInserted, err := m.store.InsertTrafficBatch(ctx, successes, failures)
+	if err != nil {
+		return &TelemetryError{Code: "monitor_store_failed", Err: fmt.Errorf("保存真实请求证据失败: %w", err)}
+	}
+	triggerAccounts := make(map[int64]struct{})
+	if trafficInserted > 0 {
+		for _, item := range successes {
+			if item.AccountID > 0 {
+				triggerAccounts[item.AccountID] = struct{}{}
+			}
+		}
+		for _, item := range failures {
+			if item.AccountID > 0 {
+				triggerAccounts[item.AccountID] = struct{}{}
+			}
+		}
 	}
 
 	monitors, err := m.api.ListMonitors(ctx)
 	if err != nil {
-		return fmt.Errorf("读取监控列表失败: %w", err)
+		return &TelemetryError{Code: "monitor_fetch_failed", Err: fmt.Errorf("读取监控列表失败: %w", err)}
+	}
+	type monitorResult struct {
+		monitorID int64
+		items     []model.MonitorHistoryRecord
+		inserted  bool
+		issue     *MonitorIssue
+	}
+	results := make(chan monitorResult, len(monitors))
+	jobs := make(chan model.Monitor)
+	workerCount := len(monitors)
+	if workerCount > 4 {
+		workerCount = 4
+	}
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case monitor, ok := <-jobs:
+					if !ok {
+						return
+					}
+					since := now.Add(-24 * time.Hour)
+					if cursor := cursors[monitor.ID]; !cursor.IsZero() {
+						since = cursor.Add(-2 * time.Minute)
+					}
+					items, historyErr := m.api.ListMonitorHistory(ctx, monitor.ID, sub2api.TelemetryQuery{Since: since, Until: now, PageSize: 200})
+					if historyErr != nil {
+						results <- monitorResult{monitorID: monitor.ID, issue: &MonitorIssue{Code: "monitor_fetch_failed", MonitorID: monitor.ID, Err: historyErr}}
+						continue
+					}
+					valid := true
+					for _, item := range items {
+						if (item.MonitorID != 0 && item.MonitorID != monitor.ID) || item.CheckedAt.IsZero() {
+							valid = false
+							break
+						}
+					}
+					if !valid {
+						results <- monitorResult{monitorID: monitor.ID, issue: &MonitorIssue{Code: "monitor_history_invalid", MonitorID: monitor.ID, Err: errors.New("monitor history contains an invalid monitor id or timestamp")}}
+						continue
+					}
+					inserted, storeErr := m.store.InsertMonitorHistoryBatch(ctx, items)
+					if storeErr != nil {
+						results <- monitorResult{monitorID: monitor.ID, issue: &MonitorIssue{Code: "monitor_store_failed", MonitorID: monitor.ID, Err: storeErr}}
+						continue
+					}
+					results <- monitorResult{monitorID: monitor.ID, items: items, inserted: inserted}
+				}
+			}
+		}()
 	}
 	for _, monitor := range monitors {
-		since := now.Add(-24 * time.Hour)
-		if cursor := m.lastMonitorKeys[monitor.ID]; !cursor.IsZero() {
-			since = cursor.Add(-2 * time.Minute)
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return ctx.Err()
+		case jobs <- monitor:
 		}
-		items, historyErr := m.api.ListMonitorHistory(ctx, monitor.ID, sub2api.TelemetryQuery{Since: since, Until: now, PageSize: 200})
-		if historyErr != nil {
-			return fmt.Errorf("读取监控 %d 历史失败: %w", monitor.ID, historyErr)
+	}
+	close(jobs)
+	workers.Wait()
+	close(results)
+	issues := make([]MonitorIssue, 0)
+	for result := range results {
+		if result.issue != nil {
+			issues = append(issues, *result.issue)
+			continue
 		}
-		if _, historyErr = m.store.InsertMonitorHistoryBatch(ctx, items); historyErr != nil {
-			return fmt.Errorf("保存监控 %d 历史失败: %w", monitor.ID, historyErr)
-		}
-		for _, item := range items {
-			if item.CheckedAt.After(m.lastMonitorKeys[monitor.ID]) {
-				m.lastMonitorKeys[monitor.ID] = item.CheckedAt
+		if result.inserted && m.resolver != nil {
+			for _, accountID := range m.resolver.AccountIDsForMonitors(result.monitorID) {
+				if accountID > 0 {
+					triggerAccounts[accountID] = struct{}{}
+				}
 			}
 		}
+		m.mu.Lock()
+		cursor := cursors[result.monitorID]
+		for _, item := range result.items {
+			if item.CheckedAt.After(cursor) {
+				cursor = item.CheckedAt
+			}
+		}
+		if !cursor.IsZero() {
+			m.lastMonitorKeys[result.monitorID] = cursor
+		}
+		m.mu.Unlock()
 	}
+
 	if err := m.refreshCapabilities(ctx, successes, failures, now); err != nil {
-		return err
+		issues = append(issues, MonitorIssue{Code: "monitor_store_failed", Err: err})
 	}
 	if err := m.store.DeleteTelemetryBefore(ctx, now.Add(-14*24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour)); err != nil {
-		return fmt.Errorf("清理过期证据失败: %w", err)
+		issues = append(issues, MonitorIssue{Code: "monitor_store_failed", Err: fmt.Errorf("清理过期证据失败: %w", err)})
 	}
-	m.lastSuccessAt = now
+	if trafficInserted > 0 || len(issues) < len(monitors) {
+		m.mu.Lock()
+		m.lastSuccessAt = now
+		m.mu.Unlock()
+	}
+	if len(triggerAccounts) > 0 && m.requester != nil {
+		ids := make([]int64, 0, len(triggerAccounts))
+		for accountID := range triggerAccounts {
+			ids = append(ids, accountID)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		if sourced, ok := m.requester.(sourcedReconcileRequester); ok {
+			sourced.RequestAccountsFrom("telemetry", ids...)
+		} else {
+			m.requester.RequestAccounts(ids...)
+		}
+	}
+	if len(issues) > 0 {
+		sort.Slice(issues, func(i, j int) bool {
+			if issues[i].MonitorID != issues[j].MonitorID {
+				return issues[i].MonitorID < issues[j].MonitorID
+			}
+			return issues[i].Code < issues[j].Code
+		})
+		return &PartialError{Issues: issues}
+	}
 	return nil
 }
 
@@ -173,13 +367,10 @@ func (m *Manager) refreshCapabilities(ctx context.Context, successes []model.Tra
 		if observedAt.IsZero() {
 			observedAt = now
 		}
-		capability := model.AccountModelCapability{
-			AccountID: current.accountID, Model: current.model,
-			Supported:    window.SuccessCount > 0 || window.CapabilityErrors == 0,
-			SuccessCount: window.SuccessCount, FailureCount: window.CapabilityErrors,
-			LastErrorClass: last.ErrorClass, LastReasonCode: last.ReasonCode,
-			LastObservedAt: observedAt, UpdatedAt: now,
-		}
+		capability := model.AccountModelCapability{AccountID: current.accountID, Model: current.model,
+			Supported: window.SuccessCount > 0 || window.CapabilityErrors == 0, SuccessCount: window.SuccessCount,
+			FailureCount: window.CapabilityErrors, LastErrorClass: last.ErrorClass, LastReasonCode: last.ReasonCode,
+			LastObservedAt: observedAt, UpdatedAt: now}
 		if err := m.store.UpsertAccountModelCapability(ctx, capability); err != nil {
 			return fmt.Errorf("保存账号 %d 模型 %s 能力失败: %w", current.accountID, current.model, err)
 		}
@@ -197,7 +388,12 @@ func (m *Manager) runLogged(ctx context.Context) {
 		m.lastError = message
 		m.mu.Unlock()
 		if changed {
-			_ = m.store.AddEvent(context.Background(), model.Event{Type: "telemetry_sync_failed", Severity: "error", Message: message, Actor: "system"})
+			eventType := "telemetry_sync_failed"
+			var partial *PartialError
+			if errors.As(err, &partial) {
+				eventType = "telemetry_partial_success"
+			}
+			_ = m.store.AddEvent(context.Background(), model.Event{Type: eventType, Severity: "error", Message: message, Actor: "system"})
 		}
 		return
 	}

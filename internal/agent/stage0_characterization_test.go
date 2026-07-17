@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,8 @@ func stage0AgentManager(t *testing.T) (*Manager, *testsupport.TempDatabase) {
 func TestCharacterizationChatAsyncPersistsPlannedGoalWithoutModelCall(t *testing.T) {
 	manager, database := stage0AgentManager(t)
 	ctx := context.Background()
+	manager.interactiveWake <- struct{}{}
+	started := time.Now()
 	conversationID, goalID, runID, status, err := manager.ChatAsync(ctx, 0, "分析当前账号状态")
 	if err != nil {
 		t.Fatal(err)
@@ -34,11 +37,16 @@ func TestCharacterizationChatAsyncPersistsPlannedGoalWithoutModelCall(t *testing
 	if conversationID <= 0 || goalID <= 0 || runID != 0 || status != model.AgentGoalStatusPlanned {
 		t.Fatalf("ChatAsync result = conversation:%d goal:%d run:%d status:%q", conversationID, goalID, runID, status)
 	}
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Fatalf("ChatAsync blocked instead of returning after durable enqueue: %v", elapsed)
+	} else {
+		t.Logf("ChatAsync durable return: %v", elapsed)
+	}
 	goal, err := database.Store.GetAgentGoal(ctx, goalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if goal.Status != model.AgentGoalStatusPlanned || goal.Source != "administrator" || goal.ConversationID == nil || *goal.ConversationID != conversationID {
+	if goal.Status != model.AgentGoalStatusPlanned || goal.Lane != model.AgentLaneInteractive || goal.Source != "administrator" || goal.ConversationID == nil || *goal.ConversationID != conversationID {
 		t.Fatalf("persisted goal changed: %+v", goal)
 	}
 	messages, err := database.Store.ListAgentMessages(ctx, conversationID, 10)
@@ -50,47 +58,150 @@ func TestCharacterizationChatAsyncPersistsPlannedGoalWithoutModelCall(t *testing
 	}
 }
 
-func TestCurrentBehaviorInteractiveGoalWaitsForOccupiedRuntimeMutex(t *testing.T) {
+func TestInteractiveGoalDoesNotWaitForBackgroundLane(t *testing.T) {
 	manager, database := stage0AgentManager(t)
 	ctx := context.Background()
 	_, goalID, _, _, err := manager.ChatAsync(ctx, 0, "分析当前账号状态")
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.runtimeMu.Lock()
-	done := make(chan bool, 1)
-	go func() { done <- manager.processNextRuntimeGoal(ctx) }()
-	select {
-	case <-done:
-		manager.runtimeMu.Unlock()
-		t.Fatal("interactive goal bypassed the occupied runtime mutex")
-	case <-time.After(20 * time.Millisecond):
+	if !manager.processNextRuntimeGoalLane(ctx, model.AgentLaneInteractive) {
+		t.Fatal("interactive worker did not select the queued goal")
 	}
 	goal, err := database.Store.GetAgentGoal(ctx, goalID)
 	if err != nil {
-		manager.runtimeMu.Unlock()
 		t.Fatal(err)
 	}
 	if goal.Status != model.AgentGoalStatusPlanned {
-		manager.runtimeMu.Unlock()
-		t.Fatalf("goal advanced while runtime mutex was occupied: %+v", goal)
+		t.Fatalf("goal status after missing model provider = %q, want planned retry", goal.Status)
 	}
-	manager.runtimeMu.Unlock()
-	select {
-	case processed := <-done:
-		if !processed {
-			t.Fatal("worker did not select the queued interactive goal")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("interactive goal did not resume after runtime mutex release")
-	}
-	goal, err = database.Store.GetAgentGoal(ctx, goalID)
+}
+
+func TestInteractiveAndBackgroundUseIndependentSingleModelSlots(t *testing.T) {
+	manager := &Manager{interactiveModelSlot: make(chan struct{}, 1), backgroundModelSlot: make(chan struct{}, 1)}
+	backgroundRelease, err := manager.acquireModelSlot(context.Background(), model.AgentLaneBackground)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if goal.Status != model.AgentGoalStatusWaiting {
-		t.Fatalf("goal status after missing model provider = %q, want waiting", goal.Status)
+	interactiveRelease, err := manager.acquireModelSlot(context.Background(), model.AgentLaneInteractive)
+	if err != nil {
+		t.Fatalf("interactive slot waited for the occupied background slot: %v", err)
 	}
+	interactiveRelease()
+
+	var acquired atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		release, acquireErr := manager.acquireModelSlot(context.Background(), model.AgentLaneBackground)
+		if acquireErr == nil {
+			acquired.Store(true)
+			release()
+		}
+		close(done)
+	}()
+	if len(manager.backgroundModelSlot) != 1 {
+		t.Fatalf("background lane did not retain exactly one occupied model slot: %d", len(manager.backgroundModelSlot))
+	}
+	if acquired.Load() {
+		t.Fatal("two background model calls acquired the single lane slot")
+	}
+	backgroundRelease()
+	<-done
+	if !acquired.Load() {
+		t.Fatal("second background model call did not resume after slot release")
+	}
+}
+
+func TestAgentLaneWorkerRecoversPanicsAtGoalBoundary(t *testing.T) {
+	manager := &Manager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if manager.processRuntimeLaneSafely(context.Background(), model.AgentLaneInteractive) {
+		t.Fatal("panicking lane iteration was reported as successful work")
+	}
+}
+
+func TestIdleInteractiveGoalClaimWithinLatencyTarget(t *testing.T) {
+	manager, _ := stage0AgentManager(t)
+	claimed := make(chan struct{}, 1)
+	manager.onGoalClaimed = func(lane string, _ int64) {
+		if lane == model.AgentLaneInteractive {
+			claimed <- struct{}{}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go manager.runtimeWorker(ctx, model.AgentLaneInteractive)
+	started := time.Now()
+	if _, _, _, _, err := manager.ChatAsync(ctx, 0, "idle interactive claim"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-claimed:
+		latency := time.Since(started)
+		t.Logf("idle interactive claim: %v", latency)
+		if latency >= 500*time.Millisecond {
+			t.Fatalf("idle interactive claim exceeded target: %v", latency)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("idle interactive goal was not claimed within 500ms")
+	}
+}
+
+func TestBackgroundModelWaitDoesNotDelayInteractiveClaim(t *testing.T) {
+	manager, database := stage0AgentManager(t)
+	settings, err := database.Store.GetAgentSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Enabled = true
+	if err := database.Store.UpdateAgentSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	backgroundRelease, err := manager.acquireModelSlot(context.Background(), model.AgentLaneBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := make(chan string, 2)
+	waiting := make(chan string, 2)
+	manager.onGoalClaimed = func(lane string, _ int64) { claimed <- lane }
+	manager.onModelSlotWait = func(lane string) { waiting <- lane }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go manager.runtimeWorker(ctx, model.AgentLaneBackground)
+	go manager.runtimeWorker(ctx, model.AgentLaneInteractive)
+	if _, err := manager.EnqueueAnalysisGoal(ctx, model.AgentRunScheduled, "lane barrier", 50); err != nil {
+		backgroundRelease()
+		t.Fatal(err)
+	}
+	if lane := <-claimed; lane != model.AgentLaneBackground {
+		backgroundRelease()
+		t.Fatalf("unexpected first claimed lane: %q", lane)
+	}
+	if lane := <-waiting; lane != model.AgentLaneBackground {
+		backgroundRelease()
+		t.Fatalf("background worker did not reach its occupied model slot: %q", lane)
+	}
+	started := time.Now()
+	if _, _, _, _, err := manager.ChatAsync(ctx, 0, "interactive while background is blocked"); err != nil {
+		backgroundRelease()
+		t.Fatal(err)
+	}
+	select {
+	case lane := <-claimed:
+		if lane != model.AgentLaneInteractive {
+			backgroundRelease()
+			t.Fatalf("background worker claimed interactive goal: %q", lane)
+		}
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			backgroundRelease()
+			t.Fatalf("interactive claim waited for background model slot: %v", elapsed)
+		} else {
+			t.Logf("background-blocked interactive claim: %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		backgroundRelease()
+		t.Fatal("interactive goal was not claimed while background model slot was blocked")
+	}
+	backgroundRelease()
 }
 
 func TestCharacterizationMissingModelProviderDoesNotStopDeterministicReconcile(t *testing.T) {

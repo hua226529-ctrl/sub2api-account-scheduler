@@ -961,6 +961,73 @@ func (s *Store) AddAgentMessage(ctx context.Context, item *model.AgentMessage) e
 	return err
 }
 
+// EnqueueChatGoal commits the conversation (when new), user message and
+// interactive goal in one SQLite transaction. The caller wakes the worker
+// only after this method returns successfully.
+func (s *Store) EnqueueChatGoal(ctx context.Context, conversationID int64, message string, goal *model.AgentGoal) (int64, error) {
+	if goal == nil || strings.TrimSpace(message) == "" {
+		return 0, errors.New("chat goal is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if conversationID <= 0 {
+		result, err := tx.ExecContext(ctx, `INSERT INTO agent_conversations(title,created_at,updated_at) VALUES(?,?,?)`,
+			strings.TrimSpace(message), formatTime(now), formatTime(now))
+		if err != nil {
+			return 0, err
+		}
+		conversationID, err = result.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE agent_conversations SET updated_at=? WHERE id=?`, formatTime(now), conversationID); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_messages(conversation_id,role,content,run_id,created_at) VALUES(?,?,?,?,?)`,
+		conversationID, "user", message, nil, formatTime(now)); err != nil {
+		return 0, err
+	}
+	goal.ConversationID = &conversationID
+	if goal.CreatedAt.IsZero() {
+		goal.CreatedAt = now
+	}
+	goal.UpdatedAt = now
+	if goal.Lane == "" {
+		goal.Lane = agentGoalLane(goal.Source, goal.ConversationID)
+	}
+	if !validAgentGoalLane(goal.Lane) || !validAgentGoalStatus(goal.Status) {
+		return 0, errors.New("invalid chat goal")
+	}
+	contextJSON, err := normalizedJSON(goal.Context)
+	if err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO agent_goals(parent_goal_id,conversation_id,title,objective,status,lane,priority,
+		risk_level,source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,
+		lease_owner,lease_until,next_runnable_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		goal.ParentGoalID, conversationID, goal.Title, goal.Objective, goal.Status, goal.Lane, goal.Priority, goal.RiskLevel,
+		goal.Source, string(contextJSON), goal.PlanHash, goal.CreatedBy, formatOptionalTime(goal.DeadlineAt), goal.LastError,
+		formatTime(goal.CreatedAt), formatTime(goal.UpdatedAt), formatOptionalTime(goal.CompletedAt), goal.LeaseOwner,
+		formatOptionalTime(goal.LeaseUntil), formatOptionalTime(goal.NextRunnableAt))
+	if err != nil {
+		return 0, err
+	}
+	goal.ID, err = result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return conversationID, nil
+}
+
 func (s *Store) ListAgentMessages(ctx context.Context, conversationID int64, limit int) ([]model.AgentMessage, error) {
 	if limit < 1 || limit > 200 {
 		limit = 60

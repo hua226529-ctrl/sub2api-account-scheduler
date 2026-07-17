@@ -68,21 +68,26 @@ type Engine struct {
 	startedAt      time.Time
 	accountControl *accountcontrol.Service
 
-	runMu      sync.Mutex
-	barrier    *automation.Barrier
-	snapshotMu sync.RWMutex
-	snapshot   model.Snapshot
-	trigger    chan struct{}
-	conflicts  map[string]bool
+	runMu        sync.Mutex
+	barrier      *automation.Barrier
+	snapshotMu   sync.RWMutex
+	snapshot     model.Snapshot
+	conflicts    map[string]bool
+	coordinator  *Coordinator
+	expiryWorker *OverrideExpiryWorker
 }
 
 func NewEngine(api Sub2API, store Repository, pollInterval time.Duration, logger *slog.Logger, options ...EngineOption) *Engine {
 	started := time.Now().UTC()
 	engine := &Engine{
 		api: api, store: store, pollInterval: pollInterval, logger: logger, startedAt: started,
-		barrier: automation.NewBarrier(), snapshot: model.Snapshot{ServiceStarted: started}, trigger: make(chan struct{}, 1), conflicts: make(map[string]bool),
+		barrier: automation.NewBarrier(), snapshot: model.Snapshot{ServiceStarted: started}, conflicts: make(map[string]bool),
 	}
 	engine.accountControl = accountcontrol.New(store, api)
+	engine.coordinator = NewCoordinator(engine, logger, WithReconcileInterval(pollInterval))
+	if expiryRepository, ok := store.(overrideExpiryRepository); ok {
+		engine.expiryWorker = NewOverrideExpiryWorker(expiryRepository, engine, logger)
+	}
 	for _, option := range options {
 		if option != nil {
 			option(engine)
@@ -98,6 +103,10 @@ func (e *Engine) AutomationBarrier() *automation.Barrier {
 }
 
 func (e *Engine) Start(ctx context.Context) {
+	pending, pendingErr := e.store.ListPendingAccountMutations(ctx, 100)
+	if pendingErr != nil {
+		e.logger.Warn("account_mutation_pending_read_failed", "error", pendingErr)
+	}
 	release, barrierErr := e.barrier.EnterMutation(ctx)
 	if barrierErr != nil {
 		e.logger.Error("account_mutation_startup_recovery_blocked", "error", barrierErr)
@@ -108,27 +117,55 @@ func (e *Engine) Start(ctx context.Context) {
 			e.logger.Error("account_mutation_startup_recovery_failed", "error", err)
 		}
 	}
-	go func() {
-		e.reconcileLogged(ctx)
-		ticker := time.NewTicker(e.pollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				e.reconcileLogged(ctx)
-			case <-e.trigger:
-				e.reconcileLogged(ctx)
-			}
+	seenPending := make(map[int64]struct{}, len(pending))
+	for _, mutation := range pending {
+		if mutation.AccountID > 0 {
+			seenPending[mutation.AccountID] = struct{}{}
 		}
-	}()
+	}
+	go e.coordinator.Run(ctx)
+	if len(seenPending) > 0 {
+		ids := make([]int64, 0, len(seenPending))
+		for accountID := range seenPending {
+			ids = append(ids, accountID)
+		}
+		e.RequestAccountsFrom("startup_recovery", ids...)
+	}
+	e.RequestFullFrom("startup")
+	if e.expiryWorker != nil {
+		go e.expiryWorker.Run(ctx)
+	}
 }
 
 func (e *Engine) Trigger() {
-	select {
-	case e.trigger <- struct{}{}:
-	default:
+	e.RequestFullFrom("legacy_trigger")
+}
+
+func (e *Engine) RequestAccounts(accountIDs ...int64) {
+	e.RequestAccountsFrom("external", accountIDs...)
+}
+
+func (e *Engine) RequestAccountsFrom(source string, accountIDs ...int64) {
+	if e.coordinator != nil {
+		e.coordinator.RequestAccountsFrom(source, accountIDs...)
+		return
+	}
+	e.RequestFullFrom(source)
+}
+
+func (e *Engine) RequestFull() {
+	e.RequestFullFrom("external")
+}
+
+func (e *Engine) RequestFullFrom(source string) {
+	if e.coordinator != nil {
+		e.coordinator.RequestFullFrom(source)
+	}
+}
+
+func (e *Engine) notifyOverrideChanged() {
+	if e.expiryWorker != nil {
+		e.expiryWorker.Wake()
 	}
 }
 
@@ -140,6 +177,34 @@ func (e *Engine) Snapshot() model.Snapshot {
 	copy.Unmatched = append([]model.Monitor{}, e.snapshot.Unmatched...)
 	copy.Conflicts = append([]string{}, e.snapshot.Conflicts...)
 	return copy
+}
+
+// AccountIDsForMonitors resolves the monitor/account association already held
+// in the latest scheduler snapshot. Telemetry uses it after a successful
+// history commit and therefore does not issue an extra database query.
+func (e *Engine) AccountIDsForMonitors(monitorIDs ...int64) []int64 {
+	requested := make(map[int64]struct{}, len(monitorIDs))
+	for _, monitorID := range monitorIDs {
+		if monitorID > 0 {
+			requested[monitorID] = struct{}{}
+		}
+	}
+	seen := make(map[int64]struct{})
+	e.snapshotMu.RLock()
+	for _, binding := range e.snapshot.Bindings {
+		if binding.Monitor != nil {
+			if _, ok := requested[binding.Monitor.ID]; ok {
+				seen[binding.Account.ID] = struct{}{}
+			}
+		}
+	}
+	e.snapshotMu.RUnlock()
+	ids := make([]int64, 0, len(seen))
+	for accountID := range seen {
+		ids = append(ids, accountID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func (e *Engine) Events(ctx context.Context, limit int) ([]model.Event, error) {
@@ -195,7 +260,7 @@ func (e *Engine) UpdateFreezeState(ctx context.Context, state model.FreezeState,
 	e.snapshotMu.Unlock()
 	e.record(ctx, model.Event{Type: "automation_freeze_updated", Severity: "warning", Message: "自动化冻结状态已更新", Actor: actor,
 		Details: mustJSON(current)})
-	e.Trigger()
+	e.RequestFullFrom("freeze_update")
 	return nil
 }
 
@@ -209,7 +274,7 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings model.Settings, ac
 		return err
 	}
 	e.record(ctx, model.Event{Type: "settings_updated", Severity: "info", Message: "调度策略已更新", Actor: actor, Details: mustJSON(settings)})
-	e.Trigger()
+	e.RequestFullFrom("settings_update")
 	return nil
 }
 
@@ -228,7 +293,7 @@ func (e *Engine) UpdatePolicy(ctx context.Context, policy model.Policy, actor st
 	}
 	accountID := policy.AccountID
 	e.record(ctx, model.Event{Type: "binding_updated", Severity: "info", AccountID: &accountID, Message: "账号绑定规则已更新", Actor: actor, Details: mustJSON(policy)})
-	e.Trigger()
+	e.RequestAccountsFrom("policy_update", accountID)
 	return nil
 }
 
@@ -259,17 +324,19 @@ func (e *Engine) UpdatePolicies(ctx context.Context, policies []model.Policy, ac
 	if err := batch.UpsertPolicies(ctx, policies); err != nil {
 		return err
 	}
+	accountIDs := make([]int64, 0, len(policies))
 	for _, policy := range policies {
 		accountID := policy.AccountID
+		accountIDs = append(accountIDs, accountID)
 		e.record(ctx, model.Event{Type: "binding_updated", Severity: "info", AccountID: &accountID,
 			Message: "账号池策略已原子更新", Actor: actor, Details: mustJSON(policy)})
 	}
-	e.Trigger()
+	e.RequestAccountsFrom("policy_update", accountIDs...)
 	return nil
 }
 
-// RunExclusive serializes a local policy publication with the 50-second
-// reconcile cycle. The callback must only use store operations; calling an
+// RunExclusive serializes local policy publications and other short control
+// plane store updates. The callback must only use store operations; calling an
 // Engine mutation method from it would attempt to acquire runMu again.
 func (e *Engine) RunExclusive(ctx context.Context, action func() error) error {
 	if action == nil {
@@ -423,21 +490,38 @@ func (e *Engine) ClearOverride(ctx context.Context, accountID int64, actor strin
 	return legacyMutationResult(result, err)
 }
 
-func (e *Engine) reconcileLogged(ctx context.Context) {
-	if err := e.Reconcile(ctx); err != nil {
-		e.logger.Error("reconcile_failed", "error", err)
-	}
+func (e *Engine) Reconcile(ctx context.Context) error {
+	return e.ReconcileFull(ctx)
 }
 
-func (e *Engine) Reconcile(ctx context.Context) error {
-	releaseRecovery, err := e.barrier.EnterMutation(ctx)
-	if err != nil {
-		return e.syncFailed(fmt.Errorf("等待账号恢复屏障: %w", err))
+func (e *Engine) ReconcileFull(ctx context.Context) error {
+	return e.reconcilePass(ctx, nil)
+}
+
+func (e *Engine) ReconcileAccounts(ctx context.Context, accountIDs []int64) error {
+	targets := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID > 0 {
+			targets[accountID] = struct{}{}
+		}
 	}
-	recoveryErr := e.accountControl.ReconcilePendingAccountMutations(ctx)
-	releaseRecovery()
-	if recoveryErr != nil {
-		e.logger.Warn("account_mutation_runtime_recovery_incomplete", "error", recoveryErr)
+	if len(targets) == 0 {
+		return nil
+	}
+	return e.reconcilePass(ctx, targets)
+}
+
+func (e *Engine) reconcilePass(ctx context.Context, targets map[int64]struct{}) error {
+	if targets == nil {
+		releaseRecovery, err := e.barrier.EnterMutation(ctx)
+		if err != nil {
+			return e.syncFailed(fmt.Errorf("等待账号恢复屏障: %w", err))
+		}
+		recoveryErr := e.accountControl.ReconcilePendingAccountMutations(ctx)
+		releaseRecovery()
+		if recoveryErr != nil {
+			e.logger.Warn("account_mutation_runtime_recovery_incomplete", "error", recoveryErr)
+		}
 	}
 
 	settings, err := e.store.GetSettings(ctx)
@@ -484,8 +568,16 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	bindings, unmatched, conflicts := ResolveBindings(monitors, accounts, policies)
 	e.auditConflicts(ctx, conflicts)
 	accountIssues := make([]AccountReconcileIssue, 0)
+	seenTargets := make(map[int64]struct{}, len(targets))
 	for i := range bindings {
 		binding := &bindings[i]
+		_, targeted := targets[binding.Account.ID]
+		if targets == nil {
+			targeted = true
+		}
+		if targeted {
+			seenTargets[binding.Account.ID] = struct{}{}
+		}
 		accountErr := func() error {
 			binding.FailureThreshold = settings.FailureThreshold
 			binding.BaseRecoveryThreshold = settings.RecoveryThreshold
@@ -543,7 +635,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 				control.CostSourceID = nil
 				control.CostPool = ""
 			}
-			if control.FlapActive && !flap.Enabled {
+			if targeted && control.FlapActive && !flap.Enabled {
 				clearFlapState(&control)
 				event := flapClearedEvent(&binding.Account.ID, control.MonitorID, "system", "账号策略已关闭抖动保护", now)
 				if err := e.store.CommitControlEvents(ctx, control, event); err != nil {
@@ -551,7 +643,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 				}
 				e.logEvent(event)
 			}
-			if flap.Enabled && !control.FlapActive && control.HealthLocked && recentPauses >= flap.PauseThreshold {
+			if targeted && flap.Enabled && !control.FlapActive && control.HealthLocked && recentPauses >= flap.PauseThreshold {
 				triggeredAt := now
 				control.FlapActive = true
 				control.FlapTriggeredAt = &triggeredAt
@@ -568,42 +660,44 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			}
 			binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
 			binding.Control = control
-			if err := e.reconcileAccount(ctx, binding, settings, now); err != nil {
-				return err
+			if targeted {
+				if err := e.reconcileAccount(ctx, binding, settings, now); err != nil {
+					return err
+				}
+				control, err = e.store.GetControl(ctx, binding.Account.ID)
+				if err != nil {
+					return err
+				}
+				recentPauses, err = e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
+				if err != nil {
+					return err
+				}
+				control.RecentAutomaticPauses = recentPauses
+				balanceLock, err = e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
+				if err != nil {
+					return err
+				}
+				control.BalanceLocked = balanceLock != nil
+				if balanceLock != nil {
+					control.BalanceSourceID = &balanceLock.SourceID
+				} else {
+					control.BalanceSourceID = nil
+				}
+				costLock, err = e.store.GetActiveCostLock(ctx, binding.Account.ID)
+				if err != nil {
+					return err
+				}
+				control.CostLocked = costLock != nil
+				if costLock != nil {
+					control.CostSourceID = &costLock.SourceID
+					control.CostPool = costLock.Pool
+				} else {
+					control.CostSourceID = nil
+					control.CostPool = ""
+				}
+				binding.Control = control
+				binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
 			}
-			control, err = e.store.GetControl(ctx, binding.Account.ID)
-			if err != nil {
-				return err
-			}
-			recentPauses, err = e.store.CountAutomaticPauses(ctx, binding.Account.ID, now.Add(-time.Duration(flap.WindowMinutes)*time.Minute), now)
-			if err != nil {
-				return err
-			}
-			control.RecentAutomaticPauses = recentPauses
-			balanceLock, err = e.store.GetActiveBalanceLock(ctx, binding.Account.ID)
-			if err != nil {
-				return err
-			}
-			control.BalanceLocked = balanceLock != nil
-			if balanceLock != nil {
-				control.BalanceSourceID = &balanceLock.SourceID
-			} else {
-				control.BalanceSourceID = nil
-			}
-			costLock, err = e.store.GetActiveCostLock(ctx, binding.Account.ID)
-			if err != nil {
-				return err
-			}
-			control.CostLocked = costLock != nil
-			if costLock != nil {
-				control.CostSourceID = &costLock.SourceID
-				control.CostPool = costLock.Pool
-			} else {
-				control.CostSourceID = nil
-				control.CostPool = ""
-			}
-			binding.Control = control
-			binding.RecoveryThreshold = effectiveRecoveryThreshold(binding.BaseRecoveryThreshold, control)
 			return nil
 		}()
 		if accountErr != nil {
@@ -615,6 +709,13 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 				AccountID: &binding.Account.ID, Message: accountErr.Error(), Details: details, Actor: "system"})
 			e.logger.Error("account_reconcile_failed", "account_id", binding.Account.ID, "status", issue.Status,
 				"code", issue.Code, "error", accountErr)
+		}
+	}
+	if targets != nil {
+		for accountID := range targets {
+			if _, ok := seenTargets[accountID]; !ok {
+				e.logger.Info("reconcile_target_account_not_found", "account_id", accountID)
+			}
 		}
 	}
 

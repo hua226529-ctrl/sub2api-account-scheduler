@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/balance"
@@ -52,29 +51,13 @@ type Manager struct {
 	builder   packetBuilder
 	client    completionClient
 
-	mu          sync.Mutex
-	running     bool
-	runtimeMu   sync.Mutex
-	runtimeWake chan struct{}
-	workerID    string
-}
-
-var errAgentAlreadyRunning = errors.New("智能体正在执行另一项目标")
-
-func (m *Manager) beginRun() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.running {
-		return false
-	}
-	m.running = true
-	return true
-}
-
-func (m *Manager) endRun() {
-	m.mu.Lock()
-	m.running = false
-	m.mu.Unlock()
+	interactiveWake      chan struct{}
+	backgroundWake       chan struct{}
+	interactiveModelSlot chan struct{}
+	backgroundModelSlot  chan struct{}
+	workerID             string
+	onGoalClaimed        func(string, int64)
+	onModelSlotWait      func(string)
 }
 
 func NewManager(database *store.Store, engine *reconcile.Engine, balances *balance.Manager, box *balance.SecretBox, logger *slog.Logger, telemetryManagers ...*telemetry.Manager) *Manager {
@@ -83,7 +66,9 @@ func NewManager(database *store.Store, engine *reconcile.Engine, balances *balan
 		telemetryManager = telemetryManagers[0]
 	}
 	manager := &Manager{store: database, engine: engine, balances: balances, telemetry: telemetryManager, box: box, logger: logger,
-		runtimeWake: make(chan struct{}, 1), workerID: fmt.Sprintf("agent-%d", time.Now().UTC().UnixNano())}
+		interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1),
+		interactiveModelSlot: make(chan struct{}, 1), backgroundModelSlot: make(chan struct{}, 1),
+		workerID: fmt.Sprintf("agent-%d", time.Now().UTC().UnixNano())}
 	manager.builder = packetBuilder{store: database, engine: engine, balances: balances, telemetry: telemetryManager}
 	return manager
 }
@@ -94,7 +79,8 @@ func (m *Manager) Start(ctx context.Context) {
 	} else if summary.ReconcilingSteps+summary.ReconcilingCommands+summary.ExpiredCommands+summary.FailedCommands > 0 {
 		m.logger.Warn("agent_v2_recovered", "summary", summary)
 	}
-	go m.runtimeWorker(ctx)
+	go m.runtimeWorker(ctx, model.AgentLaneInteractive)
+	go m.runtimeWorker(ctx, model.AgentLaneBackground)
 	go m.scheduledCommandWorker(ctx)
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -246,11 +232,9 @@ func (m *Manager) Overview(ctx context.Context) (Overview, error) {
 	if len(runs) > 0 {
 		toolCalls, _ = m.store.ListAgentToolCalls(ctx, runs[0].ID)
 	}
-	m.mu.Lock()
-	running := m.running
-	m.mu.Unlock()
+	runningGoals, _ := m.store.ListAgentGoals(ctx, model.AgentGoalStatusRunning, 1)
 	result = Overview{Settings: settings, Providers: providers, Runs: runs, Assessments: assessments,
-		Reports: reports, Policies: policies, Packets: packets, ToolCalls: toolCalls, Running: running}
+		Reports: reports, Policies: policies, Packets: packets, ToolCalls: toolCalls, Running: len(runningGoals) > 0}
 	if settings.LastScheduledAt != nil {
 		next := settings.LastScheduledAt.Add(time.Duration(settings.AnalysisIntervalMinutes) * time.Minute)
 		result.NextRunAt = &next
@@ -392,11 +376,6 @@ func (m *Manager) Run(ctx context.Context, kind, trigger string, conversationID 
 }
 
 func (m *Manager) run(ctx context.Context, kind, trigger string, conversationID *int64, userMessage string, cutoff *time.Time, reportDate string) (model.AgentRun, error) {
-	if !m.beginRun() {
-		return model.AgentRun{}, errors.New("智能体正在执行另一项分析")
-	}
-	defer m.endRun()
-
 	settings, err := m.store.GetAgentSettings(ctx)
 	if err != nil {
 		return model.AgentRun{}, err
@@ -422,7 +401,7 @@ func (m *Manager) run(ctx context.Context, kind, trigger string, conversationID 
 	if kind == model.AgentRunDaily {
 		userMessage = "根据数据包中截至北京时间日界的最近24小时统计生成上一自然日总结，包含可用率、延迟、成本、容量、动作效果、预测准确度和迭代建议；只生成报告，不返回任何执行动作。"
 	}
-	decision, provider, err := m.callModel(ctx, run.ID, packet, settings, userMessage, conversationID)
+	decision, provider, err := m.callModelInteractive(ctx, run.ID, packet, settings, userMessage, conversationID)
 	if err != nil {
 		completedAt := time.Now().UTC()
 		run.CompletedAt = &completedAt
@@ -483,6 +462,18 @@ func (m *Manager) run(ctx context.Context, kind, trigger string, conversationID 
 	m.advanceSchedule(ctx, settings, kind, completedAt)
 	m.recordEvent(ctx, "agent_run_completed", "info", 0, decision.Summary, run.ID)
 	return run, nil
+}
+
+func (m *Manager) callModelInteractive(ctx context.Context, runID int64, packet model.AnalysisPacket, settings model.AgentSettings, userMessage string, conversationID *int64) (ModelDecision, model.AgentProvider, error) {
+	release, err := m.acquireModelSlot(ctx, model.AgentLaneInteractive)
+	if err != nil {
+		return ModelDecision{}, model.AgentProvider{}, err
+	}
+	if release == nil {
+		return m.callModel(ctx, runID, packet, settings, userMessage, conversationID)
+	}
+	defer release()
+	return m.callModel(ctx, runID, packet, settings, userMessage, conversationID)
 }
 
 func (m *Manager) Chat(ctx context.Context, conversationID int64, message string) (model.AgentRun, int64, error) {

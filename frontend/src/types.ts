@@ -574,6 +574,7 @@ export interface AgentGoal {
   title: string;
   objective: string;
   status: string;
+  lane: "interactive" | "background";
   priority: number;
   risk_level: string;
   source: string;
@@ -585,6 +586,9 @@ export interface AgentGoal {
   created_at: string;
   updated_at: string;
   completed_at?: string;
+  lease_owner?: string;
+  lease_until?: string;
+  next_runnable_at?: string;
   steps?: AgentStep[];
 }
 

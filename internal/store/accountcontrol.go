@@ -27,6 +27,60 @@ const mutationColumns = `id,command_id,intent_id,idempotency_key,semantic_signat
 	after_load_factor,after_load_factor_set,last_error_code,override_id,revoke_override_id,telemetry_fresh,
 	cooldown_active,created_at,updated_at,completed_at`
 
+// NextActiveAccountOverrideExpiry returns the nearest durable temporary
+// override deadline. It is intentionally a single read for the process-local
+// expiry worker; account arbitration still expires rows transactionally.
+func (s *Store) NextActiveAccountOverrideExpiry(ctx context.Context) (*time.Time, error) {
+	var value sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT MIN(expires_at) FROM account_overrides
+		WHERE status=? AND expires_at IS NOT NULL`, accountcontrol.OverrideActive).Scan(&value)
+	if err != nil {
+		return nil, err
+	}
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil, nil
+	}
+	parsed := parseTime(value.String)
+	return &parsed, nil
+}
+
+// ExpireActiveAccountOverrides atomically marks all due active overrides and
+// returns the affected accounts only after commit. It never writes upstream.
+func (s *Store) ExpireActiveAccountOverrides(ctx context.Context, now time.Time) ([]int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT account_id FROM account_overrides
+		WHERE status=? AND expires_at IS NOT NULL AND expires_at<=? ORDER BY account_id`,
+		accountcontrol.OverrideActive, formatTime(now.UTC()))
+	if err != nil {
+		return nil, err
+	}
+	accountIDs := make([]int64, 0)
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		accountIDs = append(accountIDs, accountID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE account_overrides SET status=?,updated_at=?
+		WHERE status=? AND expires_at IS NOT NULL AND expires_at<=?`, accountcontrol.OverrideExpired,
+		formatTime(now.UTC()), accountcontrol.OverrideActive, formatTime(now.UTC())); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return accountIDs, nil
+}
+
 func (s *Store) ListActiveAccountOverrides(ctx context.Context, accountID int64, operation controlplane.Operation, now time.Time) ([]accountcontrol.Override, error) {
 	if err := s.expireAccountOverrides(ctx, accountID, operation, now); err != nil {
 		return nil, err

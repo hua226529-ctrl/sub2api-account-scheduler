@@ -13,6 +13,9 @@ const (
 	AgentGoalStatusFailed    = "failed"
 	AgentGoalStatusCancelled = "cancelled"
 
+	AgentLaneInteractive = "interactive"
+	AgentLaneBackground  = "background"
+
 	AgentStepStatusPending      = "pending"
 	AgentStepStatusScheduled    = "scheduled"
 	AgentStepStatusRunning      = "running"
@@ -60,6 +63,7 @@ type AgentGoal struct {
 	Title          string          `json:"title"`
 	Objective      string          `json:"objective"`
 	Status         string          `json:"status"`
+	Lane           string          `json:"lane"`
 	Priority       int             `json:"priority"`
 	RiskLevel      string          `json:"risk_level"`
 	Source         string          `json:"source"`
@@ -71,6 +75,9 @@ type AgentGoal struct {
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"`
 	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
+	LeaseOwner     string          `json:"lease_owner,omitempty"`
+	LeaseUntil     *time.Time      `json:"lease_until,omitempty"`
+	NextRunnableAt *time.Time      `json:"next_runnable_at,omitempty"`
 }
 
 // AgentStep is one typed capability invocation in a goal plan. IdempotencyKey

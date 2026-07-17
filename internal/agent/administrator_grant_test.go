@@ -16,9 +16,11 @@ import (
 )
 
 type administratorTestAPI struct {
-	accounts []model.Account
-	monitors []model.Monitor
-	actions  []bool
+	accounts        []model.Account
+	monitors        []model.Monitor
+	actions         []bool
+	scheduleStarted chan struct{}
+	scheduleRelease chan struct{}
 }
 
 func (api *administratorTestAPI) ListAccounts(context.Context) ([]model.Account, error) {
@@ -30,6 +32,12 @@ func (api *administratorTestAPI) ListMonitors(context.Context) ([]model.Monitor,
 }
 
 func (api *administratorTestAPI) SetSchedulable(_ context.Context, accountID int64, value bool) (model.Account, error) {
+	if api.scheduleStarted != nil {
+		api.scheduleStarted <- struct{}{}
+	}
+	if api.scheduleRelease != nil {
+		<-api.scheduleRelease
+	}
 	api.actions = append(api.actions, value)
 	for index := range api.accounts {
 		if api.accounts[index].ID == accountID {

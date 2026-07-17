@@ -261,9 +261,10 @@ func (m *Manager) resumeGoalAfterReconciliation(ctx context.Context, goalID int6
 		return
 	}
 	goal.Status = model.AgentGoalStatusPlanned
+	goal.NextRunnableAt = nil
 	goal.LastError = truncateRunes("不明确动作已完成只读核对："+reason, 1000)
 	if m.store.UpdateAgentGoal(ctx, goal) == nil {
-		m.wakeRuntime()
+		m.wakeLane(goal.Lane)
 	}
 }
 

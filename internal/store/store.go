@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1462,23 +1464,71 @@ func (s *Store) ListUpstreamGroups(ctx context.Context, sourceID int64) ([]model
 }
 
 func (s *Store) SyncBalanceLocks(ctx context.Context, sourceID int64, accountIDs []int64, active bool) error {
+	_, err := s.SyncBalanceLocksChanged(ctx, sourceID, accountIDs, active)
+	return err
+}
+
+func (s *Store) SyncBalanceLocksChanged(ctx context.Context, sourceID int64, accountIDs []int64, active bool) ([]int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM balance_account_locks WHERE source_id=?`, sourceID); err != nil {
-		return err
+	rows, err := tx.QueryContext(ctx, `SELECT account_id FROM balance_account_locks WHERE source_id=? ORDER BY account_id`, sourceID)
+	if err != nil {
+		return nil, err
 	}
+	previous := make(map[int64]struct{})
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		previous[accountID] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	desired := make(map[int64]struct{})
 	if active {
-		now := formatTime(time.Now().UTC())
 		for _, accountID := range accountIDs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO balance_account_locks(source_id,account_id,created_at) VALUES(?,?,?)`, sourceID, accountID, now); err != nil {
-				return err
+			if accountID > 0 {
+				desired[accountID] = struct{}{}
 			}
 		}
 	}
-	return tx.Commit()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM balance_account_locks WHERE source_id=?`, sourceID); err != nil {
+		return nil, err
+	}
+	if active {
+		now := formatTime(time.Now().UTC())
+		for accountID := range desired {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO balance_account_locks(source_id,account_id,created_at) VALUES(?,?,?)`, sourceID, accountID, now); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	changed := make(map[int64]struct{})
+	for accountID := range previous {
+		if _, ok := desired[accountID]; !ok {
+			changed[accountID] = struct{}{}
+		}
+	}
+	for accountID := range desired {
+		if _, ok := previous[accountID]; !ok {
+			changed[accountID] = struct{}{}
+		}
+	}
+	result := make([]int64, 0, len(changed))
+	for accountID := range changed {
+		result = append(result, accountID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, nil
 }
 
 func (s *Store) GetActiveBalanceLock(ctx context.Context, accountID int64) (*model.BalanceLock, error) {
@@ -1515,25 +1565,72 @@ func (s *Store) ListCostLocks(ctx context.Context) ([]model.CostLock, error) {
 }
 
 func (s *Store) SyncCostLocks(ctx context.Context, locks []model.CostLock) error {
+	_, err := s.SyncCostLocksChanged(ctx, locks)
+	return err
+}
+
+func (s *Store) SyncCostLocksChanged(ctx context.Context, locks []model.CostLock) ([]int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT account_id,source_id,pool,rate_multiplier FROM cost_account_locks`)
+	if err != nil {
+		return nil, err
+	}
+	previous := make(map[int64]model.CostLock)
+	for rows.Next() {
+		var item model.CostLock
+		if err := rows.Scan(&item.AccountID, &item.SourceID, &item.Pool, &item.RateMultiplier); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		previous[item.AccountID] = item
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	desired := make(map[int64]model.CostLock, len(locks))
+	for _, item := range locks {
+		if item.AccountID > 0 {
+			desired[item.AccountID] = item
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cost_account_locks`); err != nil {
-		return err
+		return nil, err
 	}
 	now := time.Now().UTC()
-	for _, item := range locks {
+	for _, item := range desired {
 		if item.CreatedAt.IsZero() {
 			item.CreatedAt = now
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cost_account_locks(account_id,source_id,pool,rate_multiplier,created_at) VALUES(?,?,?,?,?)`,
 			item.AccountID, item.SourceID, item.Pool, item.RateMultiplier, formatTime(item.CreatedAt)); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	changed := make(map[int64]struct{})
+	for accountID, item := range previous {
+		right, ok := desired[accountID]
+		if !ok || item.SourceID != right.SourceID || item.Pool != right.Pool || math.Abs(item.RateMultiplier-right.RateMultiplier) > 0.000001 {
+			changed[accountID] = struct{}{}
+		}
+	}
+	for accountID := range desired {
+		if _, ok := previous[accountID]; !ok {
+			changed[accountID] = struct{}{}
+		}
+	}
+	result := make([]int64, 0, len(changed))
+	for accountID := range changed {
+		result = append(result, accountID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, nil
 }
 
 func (s *Store) GetActiveCostLock(ctx context.Context, accountID int64) (*model.CostLock, error) {

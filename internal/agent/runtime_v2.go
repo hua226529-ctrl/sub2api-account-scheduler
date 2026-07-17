@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -15,9 +15,8 @@ import (
 )
 
 const (
-	runtimePollInterval = 15 * time.Second
-	runtimeLease        = 8 * time.Minute
-	commandLease        = 2 * time.Minute
+	runtimeLease = 8 * time.Minute
+	commandLease = 2 * time.Minute
 )
 
 type runtimeGoalContext struct {
@@ -49,27 +48,19 @@ func (m *Manager) ChatAsync(ctx context.Context, conversationID int64, message s
 	}
 	message = redactAgentText(message)
 	adminIntent := m.parseAdministratorIntent(ctx, message)
-	if conversationID <= 0 {
-		conversation, err := m.store.CreateConversation(ctx, message)
-		if err != nil {
-			return 0, 0, 0, "", err
-		}
-		conversationID = conversation.ID
-	}
-	if err := m.store.AddAgentMessage(ctx, &model.AgentMessage{ConversationID: conversationID, Role: "user", Content: message}); err != nil {
-		return conversationID, 0, 0, "", err
-	}
 	contextPayload, _ := json.Marshal(runtimeGoalContext{Kind: model.AgentRunChat, Trigger: "管理员对话命令",
 		UserMessage: message, AdminIntent: adminIntent})
 	goal := model.AgentGoal{ConversationID: &conversationID, Title: truncateRunes(message, 80), Objective: message,
-		Status: model.AgentGoalStatusPlanned, Priority: 100, RiskLevel: model.AgentRiskHigh, Source: "administrator",
+		Status: model.AgentGoalStatusPlanned, Lane: model.AgentLaneInteractive, Priority: 100, RiskLevel: model.AgentRiskHigh, Source: "administrator",
 		Context: contextPayload, CreatedBy: "administrator"}
-	if err := m.store.CreateAgentGoal(ctx, &goal); err != nil {
+	committedConversationID, err := m.store.EnqueueChatGoal(ctx, conversationID, message, &goal)
+	if err != nil {
 		return conversationID, 0, 0, "", err
 	}
+	conversationID = committedConversationID
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, "administrator_goal_created", "info", "administrator",
-		map[string]any{"conversation_id": conversationID, "objective": goal.Objective})
-	m.wakeRuntime()
+		map[string]any{"conversation_id": conversationID, "lane": goal.Lane})
+	m.wakeLane(model.AgentLaneInteractive)
 	return conversationID, goal.ID, 0, goal.Status, nil
 }
 
@@ -93,12 +84,12 @@ func (m *Manager) EnqueueAnalysisGoal(ctx context.Context, kind, trigger string,
 	}
 	contextPayload, _ := json.Marshal(runtimeGoalContext{Kind: kind, Trigger: trigger})
 	goal := model.AgentGoal{Title: trigger, Objective: trigger, Status: model.AgentGoalStatusPlanned, Priority: priority,
-		RiskLevel: model.AgentRiskMedium, Source: "scheduler", Context: contextPayload, CreatedBy: "scheduler"}
+		Lane: model.AgentLaneBackground, RiskLevel: model.AgentRiskMedium, Source: "scheduler", Context: contextPayload, CreatedBy: "scheduler"}
 	if err := m.store.CreateAgentGoal(ctx, &goal); err != nil {
 		return goal, err
 	}
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, "analysis_goal_created", "info", "scheduler", map[string]any{"kind": kind, "trigger": trigger})
-	m.wakeRuntime()
+	m.wakeLane(model.AgentLaneBackground)
 	return goal, nil
 }
 
@@ -118,12 +109,12 @@ func (m *Manager) enqueueDailyGoal(ctx context.Context, reportDate string, cutof
 	trigger := "生成 " + reportDate + " 每日总结"
 	payload, _ := json.Marshal(runtimeGoalContext{Kind: model.AgentRunDaily, Trigger: trigger, ReportDate: reportDate, Cutoff: &cutoff})
 	goal := model.AgentGoal{Title: trigger, Objective: "总结上一自然日运行、动作效果、预测准确度并提出迭代意见，只生成报告不执行写入",
-		Status: model.AgentGoalStatusPlanned, Priority: 65, RiskLevel: model.AgentRiskReadOnly, Source: "daily", Context: payload, CreatedBy: "scheduler"}
+		Status: model.AgentGoalStatusPlanned, Lane: model.AgentLaneBackground, Priority: 65, RiskLevel: model.AgentRiskReadOnly, Source: "daily", Context: payload, CreatedBy: "scheduler"}
 	if err := m.store.CreateAgentGoal(ctx, &goal); err != nil {
 		return goal, err
 	}
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, "daily_goal_created", "info", "scheduler", map[string]any{"report_date": reportDate})
-	m.wakeRuntime()
+	m.wakeLane(model.AgentLaneBackground)
 	return goal, nil
 }
 
@@ -155,9 +146,13 @@ func (m *Manager) Memories(ctx context.Context, scopeType, scopeID string, limit
 	return m.store.ListAgentMemories(ctx, scopeType, scopeID, limit)
 }
 
-func (m *Manager) wakeRuntime() {
+func (m *Manager) wakeLane(lane string) {
+	wake := m.backgroundWake
+	if lane == model.AgentLaneInteractive {
+		wake = m.interactiveWake
+	}
 	select {
-	case m.runtimeWake <- struct{}{}:
+	case wake <- struct{}{}:
 	default:
 	}
 }
@@ -183,24 +178,30 @@ func (m *Manager) bridgeOperationalEvents(ctx context.Context) {
 				trigger := fmt.Sprintf("严重运行事件：%s，账号 %d", item.Type, derefInt64(item.AccountID))
 				_, _ = m.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, trigger, 95)
 			} else {
-				m.wakeRuntime()
+				m.wakeLane(model.AgentLaneBackground)
 			}
 		}
 	}
 }
 
-func (m *Manager) runtimeWorker(ctx context.Context) {
-	ticker := time.NewTicker(runtimePollInterval)
+func (m *Manager) runtimeWorker(ctx context.Context, lane string) {
+	fallback := 10 * time.Second
+	wake := m.backgroundWake
+	if lane == model.AgentLaneInteractive {
+		fallback = time.Second
+		wake = m.interactiveWake
+	}
+	ticker := time.NewTicker(fallback)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		case <-m.runtimeWake:
+		case <-wake:
 		}
 		m.bridgeOperationalEvents(ctx)
-		for m.processNextRuntimeGoal(ctx) {
+		for m.processRuntimeLaneSafely(ctx, lane) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -208,77 +209,75 @@ func (m *Manager) runtimeWorker(ctx context.Context) {
 	}
 }
 
+func (m *Manager) processRuntimeLaneSafely(ctx context.Context, lane string) (processed bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger := m.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Error("agent_lane_worker_panic", "lane", lane, "panic", recovered)
+			processed = false
+		}
+	}()
+	return m.processNextRuntimeGoalLane(ctx, lane)
+}
+
 func (m *Manager) processNextRuntimeGoal(ctx context.Context) bool {
+	return m.processNextRuntimeGoalLane(ctx, model.AgentLaneInteractive)
+}
+
+func (m *Manager) processNextRuntimeGoalLane(ctx context.Context, lane string) bool {
 	freeze, err := m.engine.FreezeState(ctx)
 	if err != nil || freeze.Agent || freeze.AllAutomation {
 		return false
 	}
-	goals, err := m.store.ListAgentGoals(ctx, model.AgentGoalStatusPlanned, 100)
+	worker := m.workerID + ":" + lane
+	goal, err := m.store.ClaimAgentGoal(ctx, lane, worker, time.Now().UTC(), runtimeLease)
+	if err != nil || goal == nil {
+		return false
+	}
+	if m.onGoalClaimed != nil {
+		m.onGoalClaimed(lane, goal.ID)
+	}
+	err = m.runRuntimeGoalLease(ctx, *goal, lane)
 	if err != nil {
-		return false
-	}
-	if len(goals) == 0 {
-		waiting, listErr := m.store.ListAgentGoals(ctx, model.AgentGoalStatusWaiting, 100)
-		if listErr != nil {
-			return false
-		}
-		for _, goal := range waiting {
-			if time.Since(goal.UpdatedAt) >= 5*time.Minute {
-				goal.Status, goal.LastError = model.AgentGoalStatusPlanned, ""
-				if m.store.UpdateAgentGoal(ctx, goal) == nil {
-					goals = append(goals, goal)
-					break
-				}
-			}
-		}
-	}
-	if len(goals) == 0 {
-		return false
-	}
-	sort.SliceStable(goals, func(i, j int) bool {
-		if goals[i].Priority != goals[j].Priority {
-			return goals[i].Priority > goals[j].Priority
-		}
-		return goals[i].CreatedAt.Before(goals[j].CreatedAt)
-	})
-	var next *model.AgentGoal
-	for i := range goals {
-		steps, listErr := m.store.ListAgentSteps(ctx, goals[i].ID)
-		if listErr != nil {
-			continue
-		}
-		blocked := false
-		for _, step := range steps {
-			if step.Status == model.AgentStepStatusReconciling {
-				blocked = true
-				break
-			}
-		}
-		if !blocked {
-			next = &goals[i]
-			break
-		}
-	}
-	if next == nil {
-		return false
-	}
-	m.runtimeMu.Lock()
-	err = m.runRuntimeGoalLease(ctx, *next)
-	m.runtimeMu.Unlock()
-	if errors.Is(err, errAgentAlreadyRunning) {
-		return false
-	}
-	if err != nil {
-		m.logger.Warn("agent_runtime_goal_yielded", "goal_id", next.ID, "error", err)
+		m.releaseRuntimeGoalAfterError(ctx, goal.ID, worker, lane, err)
 	}
 	return true
 }
 
-func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGoal) error {
-	if !m.beginRun() {
-		return errAgentAlreadyRunning
+func (m *Manager) releaseRuntimeGoalAfterError(ctx context.Context, goalID int64, worker, lane string, cause error) {
+	status := model.AgentGoalStatusPlanned
+	next := time.Now().UTC().Add(time.Second)
+	if lane == model.AgentLaneBackground {
+		next = time.Now().UTC().Add(5 * time.Second)
 	}
-	defer m.endRun()
+	nextRunnable := &next
+	if current, err := m.store.GetAgentGoal(ctx, goalID); err == nil {
+		switch current.Status {
+		case model.AgentGoalStatusCompleted, model.AgentGoalStatusFailed, model.AgentGoalStatusCancelled:
+			return
+		case model.AgentGoalStatusWaiting:
+			status, nextRunnable = model.AgentGoalStatusWaiting, nil
+		case model.AgentGoalStatusPlanned:
+			if current.NextRunnableAt != nil {
+				nextRunnable = current.NextRunnableAt
+			}
+		}
+	}
+	_ = m.store.ReleaseAgentGoalLease(ctx, goalID, worker, status, nextRunnable, cause.Error())
+	logger := m.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("agent_runtime_goal_yielded", "lane", lane, "goal_id", goalID, "status", status, "error", cause)
+}
+
+func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGoal, lane string) error {
+	if goal.Lane == "" {
+		goal.Lane = lane
+	}
 	leaseCtx, cancel := context.WithTimeout(parent, runtimeLease)
 	defer cancel()
 	settings, err := m.store.GetAgentSettings(leaseCtx)
@@ -299,7 +298,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 	if err := m.store.UpdateAgentGoal(leaseCtx, goal); err != nil {
 		return err
 	}
-	m.appendRuntimeEvent(leaseCtx, &goal.ID, nil, "goal_started", "info", "agent", map[string]any{"title": goal.Title})
+	m.appendRuntimeEvent(leaseCtx, &goal.ID, nil, "goal_started", "info", "agent", map[string]any{"lane": goal.Lane})
 
 	packet, err := m.buildGoalPacket(leaseCtx, goalContext, settings)
 	if err != nil {
@@ -326,7 +325,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			return m.checkpointRuntimeYield(parent, &goal, &run, messages, sequence, lastFailure, failureCount,
 				"waiting", model.AgentGoalStatusWaiting, "goal_paused_by_freeze", freezeErr, false)
 		}
-		turn, provider, err := m.completeRuntimeTurn(leaseCtx, messages)
+		turn, provider, err := m.completeRuntimeTurn(leaseCtx, messages, lane)
 		if leaseCtx.Err() != nil {
 			return m.checkpointRuntimeYield(parent, &goal, &run, messages, sequence, lastFailure, failureCount,
 				"checkpointed", model.AgentGoalStatusPlanned, "goal_checkpointed",
@@ -637,7 +636,38 @@ func (m *Manager) recentRuntimeContext(ctx context.Context) json.RawMessage {
 		"memories": memories, "decision_outcomes": outcomes})
 }
 
-func (m *Manager) completeRuntimeTurn(ctx context.Context, messages []RuntimeMessage) (RuntimeTurn, model.AgentProvider, error) {
+func (m *Manager) completeRuntimeTurn(ctx context.Context, messages []RuntimeMessage, lane string) (RuntimeTurn, model.AgentProvider, error) {
+	release, err := m.acquireModelSlot(ctx, lane)
+	if err != nil {
+		return RuntimeTurn{}, model.AgentProvider{}, err
+	}
+	if release == nil {
+		return m.completeRuntimeTurnWithoutSlot(ctx, messages)
+	}
+	defer release()
+	return m.completeRuntimeTurnWithoutSlot(ctx, messages)
+}
+
+func (m *Manager) acquireModelSlot(ctx context.Context, lane string) (func(), error) {
+	slot := m.backgroundModelSlot
+	if lane == model.AgentLaneInteractive {
+		slot = m.interactiveModelSlot
+	}
+	if slot == nil {
+		return nil, nil
+	}
+	if m.onModelSlotWait != nil {
+		m.onModelSlotWait(lane)
+	}
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (m *Manager) completeRuntimeTurnWithoutSlot(ctx context.Context, messages []RuntimeMessage) (RuntimeTurn, model.AgentProvider, error) {
 	providers, err := m.store.ListAgentProviders(ctx)
 	if err != nil {
 		return RuntimeTurn{}, model.AgentProvider{}, err
@@ -763,7 +793,11 @@ func (m *Manager) completeRuntimeGoal(ctx context.Context, goal *model.AgentGoal
 }
 
 func (m *Manager) waitGoal(ctx context.Context, goal *model.AgentGoal, cause error) error {
-	goal.Status, goal.LastError = model.AgentGoalStatusWaiting, truncateRunes(cause.Error(), 1000)
+	next := time.Now().UTC().Add(5 * time.Second)
+	if goal.Lane == model.AgentLaneInteractive {
+		next = time.Now().UTC().Add(time.Second)
+	}
+	goal.Status, goal.LastError, goal.NextRunnableAt = model.AgentGoalStatusPlanned, truncateRunes(cause.Error(), 1000), &next
 	_ = m.store.UpdateAgentGoal(ctx, *goal)
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, "goal_waiting", "warning", "agent", map[string]any{"reason": goal.LastError})
 	return cause
@@ -814,7 +848,7 @@ func (m *Manager) checkpointRuntimeYield(ctx context.Context, goal *model.AgentG
 	_ = m.store.UpdateAgentGoal(ctx, *goal)
 	m.appendRuntimeEvent(ctx, &goal.ID, nil, eventType, "warning", "agent", map[string]any{"reason": reason})
 	if wake {
-		m.wakeRuntime()
+		m.wakeLane(goal.Lane)
 	}
 	return cause
 }

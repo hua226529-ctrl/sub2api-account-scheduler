@@ -385,7 +385,15 @@ func (m *Manager) publishPolicyVersion(ctx context.Context, version model.ScoreP
 	}
 	m.recordEvent(ctx, "dispatch_policy_published", "warning", 0,
 		fmt.Sprintf("策略版本 %d 已由 %s 原子发布", version.ID, actor), 0)
-	m.engine.Trigger()
+	if version.ScopeType == "account" {
+		if accountID, parseErr := strconv.ParseInt(strings.TrimSpace(version.ScopeID), 10, 64); parseErr == nil && accountID > 0 {
+			m.engine.RequestAccountsFrom("policy_activation", accountID)
+		} else {
+			m.engine.RequestFullFrom("policy_activation")
+		}
+	} else {
+		m.engine.RequestFullFrom("policy_activation")
+	}
 	return nil
 }
 
