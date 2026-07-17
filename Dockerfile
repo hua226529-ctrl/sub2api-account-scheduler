@@ -16,6 +16,7 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY cmd ./cmd
 COPY internal ./internal
+COPY docs ./docs
 COPY --from=frontend-builder /src/internal/webui/dist ./internal/webui/dist
 RUN test -z "$(gofmt -l cmd internal)" \
     && go test -buildvcs=false -count=1 ./... \

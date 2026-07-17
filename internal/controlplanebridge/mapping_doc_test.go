@@ -2,14 +2,16 @@ package controlplanebridge
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestLegacyWritePathMappingDocumentsAllKnownMutationPoints(t *testing.T) {
-	contents, err := os.ReadFile("../../docs/architecture/legacy-write-path-mapping.md")
+	documentPath := filepath.Join("..", "..", "docs", "architecture", "legacy-write-path-mapping.md")
+	contents, err := os.ReadFile(documentPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read legacy write-path mapping %q (build contexts running Go tests must include docs): %v", documentPath, err)
 	}
 	required := []string{
 		"## StableSourceID 审计",
