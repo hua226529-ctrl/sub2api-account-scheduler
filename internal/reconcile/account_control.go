@@ -350,13 +350,11 @@ func agentCommandMetadata(ctx context.Context, actor, reason string) (controlpla
 
 func (e *Engine) submitConverted(ctx context.Context, conversion controlplanebridge.ConversionResult,
 	submission accountcontrol.Submission) (accountcontrol.Result, error) {
-	if err := conversion.Validate(); err != nil {
+	intent, err := conversion.MappedIntent()
+	if err != nil {
 		return accountcontrol.Result{}, err
 	}
-	if conversion.Intent == nil {
-		return accountcontrol.Result{}, fmt.Errorf("account intent conversion failed: %s", conversion.Detail)
-	}
-	submission.Intent = *conversion.Intent
+	submission.Intent = intent
 	lookupKey := strings.TrimSpace(submission.RequestIdempotencyKey)
 	if lookupKey == "" {
 		lookupKey = submission.Intent.IdempotencyKey
@@ -398,10 +396,11 @@ func (e *Engine) policySchedulableIntent(ctx context.Context, binding *model.Res
 		return controlplane.Intent{}, safety, err
 	}
 	conversion := controlplanebridge.AdaptPolicyAccountSchedulable(controlplanebridge.AccountSchedulableInput{AccountID: binding.Account.ID, Schedulable: desired, Context: legacy})
-	if err := conversion.Validate(); err != nil {
+	intent, err := conversion.MappedIntent()
+	if err != nil {
 		return controlplane.Intent{}, safety, err
 	}
-	return *conversion.Intent, safety, nil
+	return intent, safety, nil
 }
 
 func (e *Engine) policyLoadIntent(ctx context.Context, binding *model.ResolvedBinding, desired *int, reason string) (controlplane.Intent, accountcontrol.SafetyContext, error) {
@@ -410,10 +409,11 @@ func (e *Engine) policyLoadIntent(ctx context.Context, binding *model.ResolvedBi
 		return controlplane.Intent{}, safety, err
 	}
 	conversion := controlplanebridge.AdaptPolicyAccountLoadFactor(controlplanebridge.AccountLoadFactorInput{AccountID: binding.Account.ID, LoadFactor: cloneIntPointer(desired), Context: legacy})
-	if err := conversion.Validate(); err != nil {
+	intent, err := conversion.MappedIntent()
+	if err != nil {
 		return controlplane.Intent{}, safety, err
 	}
-	return *conversion.Intent, safety, nil
+	return intent, safety, nil
 }
 
 func (e *Engine) policyContext(ctx context.Context, binding *model.ResolvedBinding, operation controlplane.Operation, reason string) (controlplanebridge.LegacyContext, accountcontrol.SafetyContext, error) {

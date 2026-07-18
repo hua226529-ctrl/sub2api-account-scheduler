@@ -107,8 +107,8 @@ func adaptAccountLoadFactor(input AccountLoadFactorInput, producer controlplane.
 		return result
 	}
 	if input.LoadFactor != nil {
-		if *input.LoadFactor < 1 || *input.LoadFactor > 100 {
-			return failed(ConversionInvalid, GapInvalidDesiredState, "load factor must be nil or between 1 and 100")
+		if *input.LoadFactor < 1 {
+			return failed(ConversionInvalid, GapInvalidDesiredState, "load factor must be nil or positive")
 		}
 	}
 	resource, err := controlplane.NewAccountResource(input.AccountID)

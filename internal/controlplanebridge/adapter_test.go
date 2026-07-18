@@ -28,7 +28,7 @@ func TestPolicyAccountDecisionsMapToActivePolicy(t *testing.T) {
 		t.Fatalf("resume desired state = %v, %v", desired, ok)
 	}
 
-	loadFactor := 25
+	loadFactor := 125
 	load := assertMapped(t, AdaptPolicyAccountLoadFactor(AccountLoadFactorInput{
 		Context: policyContext("policy-load"), AccountID: 123, LoadFactor: &loadFactor,
 	}), controlplane.ProducerPolicyScheduler, controlplane.AuthorityActivePolicy)
@@ -228,7 +228,7 @@ func TestAdaptersDoNotModifyInput(t *testing.T) {
 }
 
 func TestFailedConversionsNeverReturnPartialIntent(t *testing.T) {
-	invalidLoad := 101
+	invalidLoad := 0
 	autonomous := contextWithTTL("failure-agent")
 	autonomous.StableSourceNamespace = SourceAgentAction
 	autonomous.SnapshotVersion = "packet:failure"
@@ -310,15 +310,28 @@ func TestConversionEnumsHandleUnknownValuesSafely(t *testing.T) {
 	}
 }
 
+func TestMappedIntentRejectsStructurallyValidSemanticGap(t *testing.T) {
+	context := policyContext("missing-snapshot-execution")
+	context.SnapshotVersion = ""
+	result := AdaptPolicyAccountSchedulable(AccountSchedulableInput{Context: context, AccountID: 123})
+	if err := result.Validate(); err != nil {
+		t.Fatalf("semantic gap should remain structurally valid: %v", err)
+	}
+	if _, err := result.MappedIntent(); err == nil {
+		t.Fatal("semantic gap was accepted as an executable intent")
+	}
+}
+
 func assertMapped(t *testing.T, result ConversionResult, producer controlplane.Producer, authority controlplane.Authority) controlplane.Intent {
 	t.Helper()
-	if err := result.Validate(); err != nil {
+	intent, err := result.MappedIntent()
+	if err != nil {
 		t.Fatalf("mapped result validation failed: %v; result=%+v", err, result)
 	}
-	if result.Status != ConversionMapped || result.Intent == nil || result.Intent.Producer != producer || result.Intent.Authority != authority {
+	if result.Status != ConversionMapped || result.Intent == nil || intent.Producer != producer || intent.Authority != authority {
 		t.Fatalf("mapped result = %+v, want %s/%s", result, producer, authority)
 	}
-	return *result.Intent
+	return intent
 }
 
 func assertGap(t *testing.T, result ConversionResult, status ConversionStatus, gap GapCode) {

@@ -288,3 +288,16 @@ func (r ConversionResult) Validate() error {
 	}
 	return nil
 }
+
+// MappedIntent distinguishes a structurally valid semantic gap from a
+// successful conversion. Callers that intend to execute an action must use
+// this method instead of treating Validate as proof that Intent is non-nil.
+func (r ConversionResult) MappedIntent() (controlplane.Intent, error) {
+	if err := r.Validate(); err != nil {
+		return controlplane.Intent{}, err
+	}
+	if r.Status != ConversionMapped {
+		return controlplane.Intent{}, fmt.Errorf("intent conversion %s (%s): %s", r.Status.String(), r.GapCode.String(), r.Detail)
+	}
+	return *r.Intent, nil
+}

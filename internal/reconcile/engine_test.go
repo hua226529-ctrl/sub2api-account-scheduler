@@ -1400,6 +1400,45 @@ func TestAdaptiveLoadDoesNotWriteWhenJournalIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestAdaptiveRecoverySupportsUpstreamLoadFactorAboveOneHundred(t *testing.T) {
+	ctx := context.Background()
+	engine, database, api := newEngineTest(t, false)
+	settings, err := database.GetSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.HealthMode = model.HealthModeAdaptive
+	settings.HealthTrialPercent = 25
+
+	now := time.Now().UTC()
+	currentLoad := 500
+	api.mu.Lock()
+	api.accounts[0].Concurrency = currentLoad
+	api.accounts[0].LoadFactor = &currentLoad
+	account := api.accounts[0]
+	api.loadActions = nil
+	api.mu.Unlock()
+	control := model.AccountControl{
+		AccountID: account.ID,
+		LoadStage: model.HealthStageRecovering25,
+		UpdatedAt: now,
+	}
+	binding := model.ResolvedBinding{
+		Account:      account,
+		Monitor:      &model.Monitor{ID: 2, Enabled: true, LastCheckedAt: &now, IntervalSeconds: 60},
+		State:        "bound",
+		MonitorState: model.MonitorState{MonitorID: 2, UpdatedAt: now},
+		Control:      control,
+	}
+
+	if err := engine.reconcileAdaptiveLoad(ctx, &binding, &control, settings, now); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.loadActions) != 1 || api.loadActions[0] == nil || *api.loadActions[0] != 125 {
+		t.Fatalf("25%% recovery from upstream load factor 500 = %v, want 125", api.loadActions)
+	}
+}
+
 func TestAdaptiveLoadAlreadyAppliedDoesNotGrowMutationJournalAcrossFiftyPasses(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)

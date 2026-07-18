@@ -178,11 +178,19 @@ func TestIntentRejectsMismatchedOperationAndDesiredState(t *testing.T) {
 }
 
 func TestIntentRejectsIllegalLoadFactor(t *testing.T) {
-	for _, value := range []int{0, 101} {
+	for _, value := range []int{-1, 0} {
 		metadata := metadataFor(AuthorityActivePolicy, "bad-load", fixedNow)
 		if _, err := NewAccountLoadFactorIntent(metadata, 123, &value); !errors.Is(err, ErrInvalidIntent) {
 			t.Fatalf("load factor %d error = %v", value, err)
 		}
+	}
+}
+
+func TestIntentAllowsUpstreamLoadFactorAboveOneHundred(t *testing.T) {
+	value := 500
+	intent := mustLoadFactorIntent(t, AuthorityActivePolicy, "large-load", 123, &value, fixedNow)
+	if actual, configured, ok := intent.DesiredState.LoadFactor(); !ok || !configured || actual != value {
+		t.Fatalf("large load state = %d, %v, %v", actual, configured, ok)
 	}
 }
 

@@ -32,7 +32,7 @@ Producer 与 Authority 彼此独立。例如，管理员通过聊天要求执行
 | 资源 | 动作 | Desired State |
 |---|---|---|
 | Account | `SetAccountSchedulable` | `bool` |
-| Account | `SetAccountLoadFactor` | `1..100`，或显式恢复默认值 |
+| Account | `SetAccountLoadFactor` | 正整数，或显式恢复默认值；该值是 Sub2API 的实际并发负载上限，不是百分比 |
 | Upstream Key | `SetUpstreamKeyGroupTier` | `main`、`backup`、`emergency` |
 
 资源、动作和目标状态通过构造函数创建。Intent 不接受任意 JSON payload，也不会把未知字段延迟到执行阶段解释。

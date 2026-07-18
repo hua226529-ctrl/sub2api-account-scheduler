@@ -193,8 +193,8 @@ func loadFactorState(value *int) (DesiredState, error) {
 	if value == nil {
 		return state, nil
 	}
-	if *value < 1 || *value > 100 {
-		return DesiredState{}, invalidIntent("desired_state.load_factor", "load factor must be nil or between 1 and 100")
+	if *value < 1 {
+		return DesiredState{}, invalidIntent("desired_state.load_factor", "load factor must be nil or positive")
 	}
 	state.loadFactor = *value
 	state.loadFactorSet = true
@@ -238,8 +238,8 @@ func (s DesiredState) validateFor(resource Resource, operation Operation) error 
 		if resource.kind != ResourceAccount || s.kind != desiredStateLoadFactor {
 			return invalidIntent("desired_state", "load-factor operation requires account and load-factor state")
 		}
-		if s.loadFactorSet && (s.loadFactor < 1 || s.loadFactor > 100) {
-			return invalidIntent("desired_state.load_factor", "load factor must be nil or between 1 and 100")
+		if s.loadFactorSet && s.loadFactor < 1 {
+			return invalidIntent("desired_state.load_factor", "load factor must be nil or positive")
 		}
 	case OperationSetUpstreamKeyGroupTier:
 		if resource.kind != ResourceUpstreamKey || s.kind != desiredStateGroupTier {
