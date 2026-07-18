@@ -27,8 +27,8 @@ export async function restoreSession(): Promise<boolean> {
   }
 }
 
-export async function login(apiKey: string): Promise<void> {
-  const result = await request<{ csrf_token: string }>("session", { method: "POST", body: JSON.stringify({ api_key: apiKey }) });
+export async function login(adminSecret: string): Promise<void> {
+  const result = await request<{ csrf_token: string }>("session", { method: "POST", body: JSON.stringify({ api_key: adminSecret }) });
   csrfToken = result.csrf_token;
 }
 

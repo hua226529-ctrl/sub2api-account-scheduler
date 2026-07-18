@@ -83,12 +83,51 @@ describe("App", () => {
     api.getUpstreamFailoverTransitions.mockResolvedValue({ items: [] });
   });
 
-  it("requires the administrator key when there is no session", async () => {
+  it("requires the scheduler administrator secret when there is no session", async () => {
     api.restoreSession.mockResolvedValue(false);
     const wrapper = mount(App);
     await flushPromises();
-    expect(wrapper.text()).toContain("账号调度中心");
-    expect(wrapper.text()).toContain("管理员密钥");
+    expect(wrapper.text()).toContain("调度中心管理员登录");
+    expect(wrapper.text()).toContain("调度中心管理员密钥");
+    expect(wrapper.text()).toContain("请输入部署时配置的 SCHEDULER_ADMIN_SECRET");
+    expect(wrapper.text()).toContain("不要在浏览器中输入 SUB2API_ADMIN_API_KEY");
+    expect(wrapper.text()).not.toContain("Sub2API 全局管理员密钥");
+    expect(wrapper.text()).not.toContain("上游管理员密钥登录");
+    const input = wrapper.get<HTMLInputElement>("#admin-secret");
+    expect(input.attributes("type")).toBe("password");
+    expect(input.attributes("autocomplete")).toBe("current-password");
+    expect(input.attributes("placeholder")).toBe("SCHEDULER_ADMIN_SECRET");
+    wrapper.unmount();
+  });
+
+  it("submits the scheduler secret and clears it after login", async () => {
+    mockAuthenticatedConsole(populatedAgentOverview());
+    api.restoreSession.mockResolvedValue(false);
+    api.login.mockResolvedValue(undefined);
+    api.logout.mockResolvedValue(undefined);
+    const wrapper = mount(App);
+    await flushPromises();
+    await wrapper.get("#admin-secret").setValue("scheduler-login-secret");
+    await wrapper.get("form").trigger("submit");
+    await flushPromises();
+    expect(api.login).toHaveBeenCalledOnce();
+    expect(api.login).toHaveBeenCalledWith("scheduler-login-secret");
+    await wrapper.get('button[title="退出登录"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.get<HTMLInputElement>("#admin-secret").element.value).toBe("");
+    wrapper.unmount();
+  });
+
+  it("shows login errors without echoing the submitted secret", async () => {
+    api.restoreSession.mockResolvedValue(false);
+    api.login.mockRejectedValue(new Error("管理员密钥无效"));
+    const wrapper = mount(App);
+    await flushPromises();
+    await wrapper.get("#admin-secret").setValue("do-not-echo-this-secret");
+    await wrapper.get("form").trigger("submit");
+    await flushPromises();
+    expect(wrapper.text()).toContain("管理员密钥无效");
+    expect(wrapper.text()).not.toContain("do-not-echo-this-secret");
     wrapper.unmount();
   });
 

@@ -16,7 +16,7 @@ type BalanceRow = UpstreamSource & { row_key: string; discovered: boolean };
 
 const authenticated = ref(false);
 const booting = ref(true);
-const apiKey = ref("");
+const adminSecret = ref("");
 const loginError = ref("");
 const loading = ref(false);
 const snapshot = ref<Awaited<ReturnType<typeof getOverview>> | null>(null);
@@ -227,8 +227,8 @@ async function submitLogin() {
   loginError.value = "";
   loading.value = true;
   try {
-    await login(apiKey.value);
-    apiKey.value = "";
+    await login(adminSecret.value);
+    adminSecret.value = "";
     authenticated.value = true;
     await refreshAll();
   } catch (error) {
@@ -1189,16 +1189,16 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
       <div class="brand-mark"><ShieldCheck :size="24" /></div>
       <div>
         <p class="eyebrow">SUB2API CONTROL</p>
-        <h1>账号调度中心</h1>
-        <p class="login-copy">输入 Sub2API 全局管理员密钥以进入独立调度控制台。</p>
+        <h1>调度中心管理员登录</h1>
+        <p class="login-copy">请输入部署时配置的 SCHEDULER_ADMIN_SECRET。不要在浏览器中输入 SUB2API_ADMIN_API_KEY；上游管理员密钥仅由调度中心服务端使用。</p>
       </div>
       <form @submit.prevent="submitLogin" class="login-form">
-        <label for="api-key">管理员密钥</label>
-        <div class="secret-input"><LockKeyhole :size="18" /><input id="api-key" v-model="apiKey" type="password" autocomplete="off" autofocus required /></div>
+        <label for="admin-secret">调度中心管理员密钥</label>
+        <div class="secret-input"><LockKeyhole :size="18" /><input id="admin-secret" v-model="adminSecret" type="password" autocomplete="current-password" placeholder="SCHEDULER_ADMIN_SECRET" autofocus required /></div>
         <p v-if="loginError" class="form-error">{{ loginError }}</p>
         <button class="primary-button" :disabled="loading"><LoaderCircle v-if="loading" class="spin" :size="17" /><ArrowRight v-else :size="17" />进入控制台</button>
       </form>
-      <p class="security-note">密钥仅用于本次登录验证，不会保存在浏览器中。</p>
+      <p class="security-note">调度中心管理员密钥仅用于本次登录验证，不会保存在浏览器中。</p>
     </section>
   </main>
 
