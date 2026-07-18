@@ -4,12 +4,156 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
+
+func TestRuntimeDecisionJSONSchemaClosesAndRequiresEveryObjectProperty(t *testing.T) {
+	payload, err := json.Marshal(runtimeDecisionJSONSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema any
+	if err := json.Unmarshal(payload, &schema); err != nil {
+		t.Fatal(err)
+	}
+	assertStrictSchemaNode(t, "$", schema)
+}
+
+func TestDecodeRuntimeDecisionNormalizesEncodedActionArguments(t *testing.T) {
+	content, err := json.Marshal(map[string]any{
+		"summary": "需要暂停账号", "conclusion": "证据满足暂停条件", "confidence": .95, "no_change": false,
+		"actions": []any{map[string]any{
+			"type": "pause_account", "arguments": `{"account_id":225,"reason":"连续失败超过阈值"}`,
+			"reason": "连续失败超过阈值", "prediction": map[string]any{
+				"success_rate_delta": 10, "latency_delta_ms": int64(0), "cost_delta": 0,
+			},
+		}},
+		"advice": []string{}, "data_limitations": []string{}, "evidence_requests": []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decision, err := decodeRuntimeDecision(string(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decision.Actions) != 1 || decision.Actions[0].AccountID != 225 {
+		t.Fatalf("encoded arguments were not hydrated: %+v", decision.Actions)
+	}
+	call, err := decisionActionToolCall(decision.Actions[0], decision.Confidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.Function.Arguments != `{"account_id":225,"reason":"连续失败超过阈值"}` {
+		t.Fatalf("normalized arguments = %s", call.Function.Arguments)
+	}
+}
+
+func TestDecodeRuntimeDecisionHydratesConfigFromEncodedArguments(t *testing.T) {
+	content, err := json.Marshal(map[string]any{
+		"summary": "创建策略提案", "conclusion": "生成待审核版本", "confidence": .9, "no_change": false,
+		"actions": []any{map[string]any{
+			"type":      "propose_dispatch_policy",
+			"arguments": `{"scope_type":"global","config":{"minimum_samples":10},"reason":"使用当前证据创建低风险提案"}`,
+			"reason":    "使用当前证据创建低风险提案",
+			"prediction": map[string]any{
+				"success_rate_delta": 0, "latency_delta_ms": int64(0), "cost_delta": 0,
+			},
+		}},
+		"advice": []string{}, "data_limitations": []string{}, "evidence_requests": []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decision, err := decodeRuntimeDecision(string(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := decision.Actions[0]
+	if action.ScopeType != "global" || string(action.Config) != `{"minimum_samples":10}` {
+		t.Fatalf("encoded policy arguments were not hydrated: %+v", action)
+	}
+	if err := ValidateRuntimeDecision(model.AnalysisPacket{}, runtimeGoalContext{}, decision); err != nil {
+		t.Fatalf("hydrated policy action rejected: %v", err)
+	}
+}
+
+func TestDecodeRuntimeDecisionRejectsConflictingEncodedActionTarget(t *testing.T) {
+	_, err := decodeRuntimeDecision(`{"summary":"暂停账号","conclusion":"执行暂停","confidence":0.95,"no_change":false,` +
+		`"actions":[{"type":"pause_account","arguments":"{\"account_id\":226}","account_id":225,` +
+		`"reason":"连续失败超过阈值","prediction":{"success_rate_delta":10,"latency_delta_ms":0,"cost_delta":0}}],` +
+		`"advice":[],"data_limitations":[],"evidence_requests":[]}`)
+	if runtimeErrorClassOf(err) != runtimeErrorModelContractInvalid {
+		t.Fatalf("conflicting target class=%s err=%v", runtimeErrorClassOf(err), err)
+	}
+}
+
+func assertStrictSchemaNode(t *testing.T, path string, node any) {
+	t.Helper()
+	switch value := node.(type) {
+	case map[string]any:
+		if schemaContainsType(value["type"], "object") {
+			closed, ok := value["additionalProperties"].(bool)
+			if !ok || closed {
+				t.Fatalf("%s additionalProperties = %#v, want false", path, value["additionalProperties"])
+			}
+			properties, ok := value["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s object has no properties map", path)
+			}
+			requiredValues, ok := value["required"].([]any)
+			if !ok {
+				t.Fatalf("%s object has no required array", path)
+			}
+			required := make(map[string]bool, len(requiredValues))
+			for _, item := range requiredValues {
+				name, ok := item.(string)
+				if !ok {
+					t.Fatalf("%s required contains non-string %#v", path, item)
+				}
+				required[name] = true
+			}
+			for name := range properties {
+				if !required[name] {
+					t.Fatalf("%s.properties.%s is not required", path, name)
+				}
+			}
+			if len(required) != len(properties) {
+				t.Fatalf("%s required/property count mismatch: %d/%d", path, len(required), len(properties))
+			}
+		}
+		for key, child := range value {
+			assertStrictSchemaNode(t, path+"."+key, child)
+		}
+	case []any:
+		for index, child := range value {
+			assertStrictSchemaNode(t, fmt.Sprintf("%s[%d]", path, index), child)
+		}
+	}
+}
+
+func schemaContainsType(value any, expected string) bool {
+	if value == expected {
+		return true
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		if item == expected {
+			return true
+		}
+	}
+	return false
+}
 
 func TestCompleteRuntimeNativeParsesToolCall(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

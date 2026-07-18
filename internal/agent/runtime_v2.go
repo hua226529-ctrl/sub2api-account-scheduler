@@ -1072,7 +1072,7 @@ func (m *Manager) completeRuntimeFallback(ctx context.Context, provider model.Ag
 		return RuntimeTurn{}, fmt.Errorf("构造兼容模式上下文失败: %w", err)
 	}
 	system := runtimeSystemPrompt() + "\n当前模型不支持原生工具。若需要工具，只返回一个 actions 元素：" +
-		`{"type":"能力名","arguments":{...},"reason":"原因"}；一次只请求一个能力。可用能力：` + string(capabilityCatalogJSON())
+		`{"type":"能力名","arguments":"JSON 对象序列化后的字符串","reason":"原因","prediction":{"success_rate_delta":0,"latency_delta_ms":0,"cost_delta":0}}；一次只请求一个能力。可用能力：` + string(capabilityCatalogJSON())
 	decision, err := m.client.Complete(ctx, provider, apiKey, system, string(transcript))
 	if err != nil {
 		return RuntimeTurn{}, err

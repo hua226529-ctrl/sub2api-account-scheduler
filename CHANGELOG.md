@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Enforced one strict Runtime V2 final-decision schema, including typed evidence requests, and bounded contract repair to one retry.
+- Closed every object in the Runtime V2 strict response schema and encoded fallback capability arguments without exposing arbitrary JSON properties.
+- Enforced one strict Runtime V2 final-decision schema, including an empty final evidence-request field, and bounded contract repair to one retry.
 - Added terminal no-progress detection and bounded provider retry/backoff with stable error classes and dead-letter observability.
 - Closed the Runtime V2 safety-validation loop for read-only intent, `no_change`, immutable resource scope, TTL, evidence, snapshots, grants, and confirmations.
 - Prevented autonomous Agent token-group transitions from bypassing administrator confirmation while retaining deterministic emergency failover.
