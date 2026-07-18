@@ -311,7 +311,7 @@ func (m *Manager) ValidateProvider(ctx context.Context, input ProviderInput) (mo
 	if err != nil {
 		return provider, err
 	}
-	validationPrompt := `你是接口能力测试器。只返回 JSON：{"summary":"连接正常","conclusion":"模型支持结构化输出","confidence":1,"no_change":true,"actions":[],"advice":[],"data_limitations":[]}`
+	validationPrompt := `你是接口能力测试器。只返回 JSON：{"summary":"连接正常","conclusion":"模型支持结构化输出","confidence":1,"no_change":true,"actions":[],"advice":[],"data_limitations":[],"evidence_requests":[]}`
 	decision, err := m.client.Complete(ctx, provider, key, validationPrompt, "执行一次结构化输出能力测试。")
 	if err != nil {
 		return provider, err
@@ -344,6 +344,14 @@ func (m *Manager) SaveProvider(ctx context.Context, input ProviderInput) (model.
 		return model.AgentProvider{}, err
 	}
 	validated.CredentialNonce, validated.CredentialCiphertext = nonce, ciphertext
+	if previousErr == nil {
+		validated.RecentError = previous.RecentError
+		validated.LastErrorClass = previous.LastErrorClass
+		validated.LastErrorAt = previous.LastErrorAt
+		validated.ErrorCount24h = previous.ErrorCount24h
+		validated.ErrorWindowStartedAt = previous.ErrorWindowStartedAt
+		validated.ConsecutiveFailures = 0
+	}
 	if err := m.store.UpsertAgentProvider(ctx, validated); err != nil {
 		return model.AgentProvider{}, err
 	}
@@ -601,12 +609,18 @@ func (m *Manager) evaluateOutcomes(ctx context.Context, now time.Time) {
 		if item.AccountID == nil {
 			continue
 		}
-		packetID, err := m.store.GetAgentRunPacketID(ctx, item.RunID)
-		if err != nil {
-			continue
+		packetID := item.PacketID
+		if packetID <= 0 {
+			packetID, err = m.store.GetAgentRunPacketID(ctx, item.RunID)
+			if err != nil {
+				continue
+			}
 		}
 		packet, err := m.store.GetAnalysisPacket(ctx, packetID)
 		if err != nil {
+			continue
+		}
+		if item.PacketHash != "" && item.PacketHash != packet.Hash {
 			continue
 		}
 		var baseline model.AgentWindowStats
@@ -644,8 +658,14 @@ func sameDirection(predicted, actual float64) bool {
 }
 
 func (m *Manager) recordEvent(ctx context.Context, eventType, severity string, accountID int64, message string, runID int64) {
+	m.recordEventWithProvenance(ctx, eventType, severity, accountID, message, runID, 0, 0)
+}
+
+func (m *Manager) recordEventWithProvenance(ctx context.Context, eventType, severity string, accountID int64, message string,
+	runID, goalID, stepID int64) {
 	details, _ := json.Marshal(map[string]any{"agent_run_id": runID})
-	event := model.Event{Type: eventType, Severity: severity, Message: message, Details: string(details), Actor: "agent", CreatedAt: time.Now().UTC()}
+	event := model.Event{GoalID: goalID, StepID: stepID, Type: eventType, Severity: severity, Message: message,
+		Details: string(details), Actor: "agent", CreatedAt: time.Now().UTC()}
 	if accountID > 0 {
 		event.AccountID = &accountID
 	}

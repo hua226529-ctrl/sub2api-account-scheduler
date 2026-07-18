@@ -546,7 +546,7 @@ func (s *Server) runAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"goal_id": goal.ID, "run_id": 0, "status": goal.Status})
+	writeJSON(w, http.StatusAccepted, map[string]any{"goal_id": goal.ID, "status": goal.Status})
 }
 
 func (s *Server) chatAgent(w http.ResponseWriter, r *http.Request) {

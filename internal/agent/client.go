@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,7 +23,7 @@ type ModelDecision struct {
 	Actions          []AgentAction     `json:"actions"`
 	Advice           []string          `json:"advice"`
 	DataLimitations  []string          `json:"data_limitations"`
-	EvidenceRequests []EvidenceRequest `json:"evidence_requests,omitempty"`
+	EvidenceRequests []EvidenceRequest `json:"evidence_requests"`
 }
 
 type EvidenceRequest struct {
@@ -91,7 +90,7 @@ func (completionClient) Complete(ctx context.Context, provider model.AgentProvid
 	request := chatRequest{
 		Model: provider.Model, Temperature: provider.Temperature, MaxTokens: provider.MaxOutputTokens,
 		Messages:       []chatMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: userPrompt}},
-		ResponseFormat: map[string]string{"type": "json_object"},
+		ResponseFormat: runtimeDecisionResponseFormat(true),
 	}
 	var decision ModelDecision
 	payload, err := json.Marshal(request)
@@ -100,18 +99,18 @@ func (completionClient) Complete(ctx context.Context, provider model.AgentProvid
 	}
 	response, status, err := doCompletion(ctx, provider, apiKey, payload)
 	if err != nil {
-		return decision, err
+		return decision, classifyProviderError(err)
 	}
-	if status == http.StatusBadRequest {
-		request.ResponseFormat = nil
+	if status == http.StatusBadRequest && responseFormatUnsupported(response) {
+		request.ResponseFormat = runtimeDecisionResponseFormat(false)
 		payload, _ = json.Marshal(request)
 		response, status, err = doCompletion(ctx, provider, apiKey, payload)
 		if err != nil {
-			return decision, err
+			return decision, classifyProviderError(err)
 		}
 	}
 	if status < 200 || status >= 300 {
-		return decision, fmt.Errorf("模型接口返回 %d: %s", status, safeResponseMessage(response))
+		return decision, classifyProviderStatus(status, safeResponseMessage(response))
 	}
 	var envelope chatResponse
 	if err := json.Unmarshal(response, &envelope); err != nil {
@@ -123,27 +122,13 @@ func (completionClient) Complete(ctx context.Context, provider model.AgentProvid
 	if len(envelope.Choices) == 0 {
 		return decision, errors.New("模型没有返回分析结果")
 	}
-	content := contentText(envelope.Choices[0].Message.Content)
-	content = extractJSONObject(content)
-	if err := json.Unmarshal([]byte(content), &decision); err != nil {
-		return decision, fmt.Errorf("模型结构化结果无效: %w", err)
-	}
-	if strings.TrimSpace(decision.Summary) == "" && strings.TrimSpace(decision.Conclusion) == "" {
-		return decision, errors.New("模型分析结果为空")
-	}
-	if decision.Confidence < 0 {
-		decision.Confidence = 0
-	}
-	if decision.Confidence > 1 {
-		decision.Confidence = 1
-	}
-	return decision, nil
+	return decodeRuntimeDecision(contentText(envelope.Choices[0].Message.Content))
 }
 
 func doCompletion(ctx context.Context, provider model.AgentProvider, apiKey string, payload []byte) ([]byte, int, error) {
 	endpoint, err := completionEndpoint(provider.BaseURL)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, &providerConfigurationError{err: err}
 	}
 	timeout := time.Duration(provider.TimeoutSeconds) * time.Second
 	if timeout < 10*time.Second {
@@ -234,19 +219,6 @@ func contentText(content any) string {
 		payload, _ := json.Marshal(content)
 		return string(payload)
 	}
-}
-
-func extractJSONObject(content string) string {
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
-	start, end := strings.Index(content, "{"), strings.LastIndex(content, "}")
-	if start >= 0 && end > start {
-		return content[start : end+1]
-	}
-	return content
 }
 
 func safeResponseMessage(payload []byte) string {

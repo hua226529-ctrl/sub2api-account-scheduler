@@ -183,7 +183,7 @@ func defaultEvent(mutation Mutation, status MutationStatus, reason BlockReason, 
 		message += ": " + string(reason)
 	}
 	return model.Event{Type: "account_mutation_" + string(status), Severity: "info", AccountID: &mutation.AccountID,
-		Message: message, Actor: mutation.Actor, CreatedAt: now}
+		GoalID: mutation.GoalID, StepID: mutation.StepID, Message: message, Actor: mutation.Actor, CreatedAt: now}
 }
 
 func formatState(state *AccountState) string {

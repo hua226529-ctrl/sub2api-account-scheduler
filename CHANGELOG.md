@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforced one strict Runtime V2 final-decision schema, including typed evidence requests, and bounded contract repair to one retry.
+- Added terminal no-progress detection and bounded provider retry/backoff with stable error classes and dead-letter observability.
+- Closed the Runtime V2 safety-validation loop for read-only intent, `no_change`, immutable resource scope, TTL, evidence, snapshots, grants, and confirmations.
+- Prevented autonomous Agent token-group transitions from bypassing administrator confirmation while retaining deterministic emergency failover.
+- Corrected severe-event resource scopes and emergency goal deduplication without inventing account zero.
+- Filtered invalid Telemetry targeted-reconcile accounts and stopped repeated automatic `applied_noop` mutation growth.
+- Preserved Runtime V2 Goal/Step and Packet/hash provenance without writing legacy Agent runs.
+
+### Changed
+
+- Added additive SQLite columns for bounded goal attempts, provider error history, and Runtime V2 mutation, transition, policy, outcome, and audit-event provenance.
+- Agent goal status now distinguishes clean completion, completion after retries, terminal failure, and dead-lettered failure.
+
 ## [1.0.0] - 2026-07-16
 
 ### Added

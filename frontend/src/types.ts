@@ -425,6 +425,11 @@ export interface AgentProvider {
   temperature: number;
   last_validated_at?: string;
   last_error?: string;
+  recent_error?: string;
+  last_error_class?: string;
+  last_error_at?: string;
+  error_count_24h: number;
+  consecutive_failure_count: number;
   updated_at?: string;
 }
 
@@ -640,6 +645,17 @@ export interface AgentGoal {
   created_by: string;
   deadline_at?: string;
   last_error?: string;
+  attempt_count: number;
+  max_attempts: number;
+  model_attempt_count: number;
+  contract_failure_count: number;
+  no_progress_count: number;
+  last_error_class?: string;
+  last_error_at?: string;
+  completed_with_warnings: boolean;
+  dead_lettered_at?: string;
+  dead_lettered: boolean;
+  terminal_failed: boolean;
   created_at: string;
   updated_at: string;
   completed_at?: string;

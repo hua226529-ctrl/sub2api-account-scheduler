@@ -57,27 +57,38 @@ const (
 // AgentGoal is a durable objective. It contains no credentials and points to
 // immutable evidence through Context rather than embedding raw request data.
 type AgentGoal struct {
-	ID             int64           `json:"id"`
-	ParentGoalID   *int64          `json:"parent_goal_id,omitempty"`
-	ConversationID *int64          `json:"conversation_id,omitempty"`
-	Title          string          `json:"title"`
-	Objective      string          `json:"objective"`
-	Status         string          `json:"status"`
-	Lane           string          `json:"lane"`
-	Priority       int             `json:"priority"`
-	RiskLevel      string          `json:"risk_level"`
-	Source         string          `json:"source"`
-	Context        json.RawMessage `json:"context"`
-	PlanHash       string          `json:"plan_hash,omitempty"`
-	CreatedBy      string          `json:"created_by"`
-	DeadlineAt     *time.Time      `json:"deadline_at,omitempty"`
-	LastError      string          `json:"last_error,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
-	LeaseOwner     string          `json:"lease_owner,omitempty"`
-	LeaseUntil     *time.Time      `json:"lease_until,omitempty"`
-	NextRunnableAt *time.Time      `json:"next_runnable_at,omitempty"`
+	ID                    int64           `json:"id"`
+	ParentGoalID          *int64          `json:"parent_goal_id,omitempty"`
+	ConversationID        *int64          `json:"conversation_id,omitempty"`
+	Title                 string          `json:"title"`
+	Objective             string          `json:"objective"`
+	Status                string          `json:"status"`
+	Lane                  string          `json:"lane"`
+	Priority              int             `json:"priority"`
+	RiskLevel             string          `json:"risk_level"`
+	Source                string          `json:"source"`
+	Context               json.RawMessage `json:"context"`
+	PlanHash              string          `json:"plan_hash,omitempty"`
+	CreatedBy             string          `json:"created_by"`
+	DeadlineAt            *time.Time      `json:"deadline_at,omitempty"`
+	LastError             string          `json:"last_error,omitempty"`
+	AttemptCount          int             `json:"attempt_count"`
+	MaxAttempts           int             `json:"max_attempts"`
+	ModelAttemptCount     int             `json:"model_attempt_count"`
+	ContractFailureCount  int             `json:"contract_failure_count"`
+	NoProgressCount       int             `json:"no_progress_count"`
+	LastErrorClass        string          `json:"last_error_class,omitempty"`
+	LastErrorAt           *time.Time      `json:"last_error_at,omitempty"`
+	CompletedWithWarnings bool            `json:"completed_with_warnings"`
+	DeadLetteredAt        *time.Time      `json:"dead_lettered_at,omitempty"`
+	DeadLettered          bool            `json:"dead_lettered"`
+	TerminalFailed        bool            `json:"terminal_failed"`
+	CreatedAt             time.Time       `json:"created_at"`
+	UpdatedAt             time.Time       `json:"updated_at"`
+	CompletedAt           *time.Time      `json:"completed_at,omitempty"`
+	LeaseOwner            string          `json:"lease_owner,omitempty"`
+	LeaseUntil            *time.Time      `json:"lease_until,omitempty"`
+	NextRunnableAt        *time.Time      `json:"next_runnable_at,omitempty"`
 }
 
 // AgentStep is one typed capability invocation in a goal plan. IdempotencyKey

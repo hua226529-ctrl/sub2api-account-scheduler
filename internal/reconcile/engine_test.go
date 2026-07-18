@@ -1400,6 +1400,90 @@ func TestAdaptiveLoadDoesNotWriteWhenJournalIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestAdaptiveLoadAlreadyAppliedDoesNotGrowMutationJournalAcrossFiftyPasses(t *testing.T) {
+	ctx := context.Background()
+	engine, database, api := newEngineTest(t, false)
+	settings, err := database.GetSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.HealthMode = model.HealthModeAdaptive
+	settings.HealthTrialPercent = 8
+	load := 8
+	api.mu.Lock()
+	api.accounts[0].Concurrency = 100
+	api.accounts[0].LoadFactor = &load
+	account := api.accounts[0]
+	api.loadActions = nil
+	api.mu.Unlock()
+	original, expected := 100, 8
+	control := model.AccountControl{AccountID: account.ID, OwnsLoadFactor: true, OriginalLoadFactor: &original,
+		ExpectedLoadFactor: &expected, LoadStage: model.HealthStageLimited25, UpdatedAt: time.Now().UTC()}
+	if err := database.UpsertControl(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	binding := model.ResolvedBinding{Account: account, Monitor: &model.Monitor{ID: 2, Enabled: true}, State: "bound", Control: control}
+	before, err := database.ListAccountMutations(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 50; index++ {
+		if err := engine.reconcileAdaptiveLoad(ctx, &binding, &control, settings, time.Now().UTC().Add(time.Duration(index)*time.Second)); err != nil {
+			t.Fatalf("pass %d: %v", index+1, err)
+		}
+	}
+	after, err := database.ListAccountMutations(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("automatic no-op grew mutation journal across 50 passes: %d -> %d", len(before), len(after))
+	}
+	if len(api.loadActions) != 0 {
+		t.Fatalf("automatic no-op reached upstream writes: %v", api.loadActions)
+	}
+}
+
+func TestAdaptiveLoadAlreadyAppliedRepairsProjectionWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	engine, database, api := newEngineTest(t, false)
+	settings, err := database.GetSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.HealthMode = model.HealthModeAdaptive
+	settings.HealthTrialPercent = 8
+	load := 8
+	api.mu.Lock()
+	api.accounts[0].Concurrency = 100
+	api.accounts[0].LoadFactor = &load
+	account := api.accounts[0]
+	api.loadActions = nil
+	api.mu.Unlock()
+	original, staleExpected := 100, 25
+	control := model.AccountControl{AccountID: account.ID, OwnsLoadFactor: true, OriginalLoadFactor: &original,
+		ExpectedLoadFactor: &staleExpected, LoadStage: model.HealthStageLimited25, UpdatedAt: time.Now().UTC()}
+	if err := database.UpsertControl(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	binding := model.ResolvedBinding{Account: account, Monitor: &model.Monitor{ID: 2, Enabled: true}, State: "bound", Control: control}
+	before, _ := database.ListAccountMutations(ctx, account.ID)
+	if err := engine.reconcileAdaptiveLoad(ctx, &binding, &control, settings, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := database.ListAccountMutations(ctx, account.ID)
+	persisted, err := database.GetControl(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) || len(api.loadActions) != 0 || persisted.ExpectedLoadFactor == nil ||
+		*persisted.ExpectedLoadFactor != load || !persisted.OwnsLoadFactor || persisted.OriginalLoadFactor == nil ||
+		*persisted.OriginalLoadFactor != original {
+		t.Fatalf("projection repair was not local-only: before=%d after=%d writes=%v control=%+v",
+			len(before), len(after), api.loadActions, persisted)
+	}
+}
+
 func TestObserveModeNeverWritesAccountState(t *testing.T) {
 	ctx := context.Background()
 	engine, database, api := newEngineTest(t, false)

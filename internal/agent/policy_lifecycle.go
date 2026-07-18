@@ -48,6 +48,9 @@ type PolicyProposalInput struct {
 	Actor          string
 	RunID          int64
 	GoalID         int64
+	StepID         int64
+	PacketID       int64
+	PacketHash     string
 	IdempotencyKey string
 }
 
@@ -114,6 +117,7 @@ func (m *Manager) ProposeDispatchPolicy(ctx context.Context, input PolicyProposa
 	}
 	version := model.ScorePolicyVersion{ScopeType: input.ScopeType, ScopeID: input.ScopeID, Config: normalized, Patch: normalized,
 		Reason: strings.TrimSpace(input.Reason), AgentRunID: optionalPositiveInt64(input.RunID), SourceGoalID: optionalPositiveInt64(input.GoalID),
+		SourceStepID: optionalPositiveInt64(input.StepID), SourcePacketID: optionalPositiveInt64(input.PacketID), SourcePacketHash: strings.TrimSpace(input.PacketHash),
 		BaseVersionID: baseID, CreatedBy: strings.TrimSpace(input.Actor), IdempotencyKey: strings.TrimSpace(input.IdempotencyKey)}
 	if version.CreatedBy == "" {
 		version.CreatedBy = "agent:optimizer"
@@ -140,8 +144,8 @@ func (m *Manager) ProposeDispatchPolicy(ctx context.Context, input PolicyProposa
 	if err := m.store.CreatePolicyProposal(ctx, &version); err != nil {
 		return version, err
 	}
-	m.recordEvent(ctx, "dispatch_policy_proposed", "info", 0,
-		fmt.Sprintf("策略提案 %d 已完成类型校验、模拟和风险评级", version.ID), input.RunID)
+	m.recordEventWithProvenance(ctx, "dispatch_policy_proposed", "info", 0,
+		fmt.Sprintf("策略提案 %d 已完成类型校验、模拟和风险评级", version.ID), input.RunID, input.GoalID, input.StepID)
 	return version, nil
 }
 
@@ -338,7 +342,9 @@ func (m *Manager) ActivatePolicyProposal(ctx context.Context, id int64, actor st
 	if err := m.store.PublishPolicyProposal(ctx, id, actor, projectionSettings, policies); err != nil {
 		return err
 	}
-	m.recordEvent(ctx, "dispatch_policy_activated", "warning", 0, fmt.Sprintf("策略版本 %d 已受控激活", id), 0)
+	m.recordEventWithProvenance(ctx, "dispatch_policy_activated", "warning", 0,
+		fmt.Sprintf("策略版本 %d 已受控激活", id), optionalInt64Value(version.AgentRunID),
+		optionalInt64Value(version.SourceGoalID), optionalInt64Value(version.SourceStepID))
 	if version.ScopeType == "account" {
 		accountID, parseErr := strconv.ParseInt(version.ScopeID, 10, 64)
 		if parseErr == nil && accountID > 0 {
@@ -375,8 +381,9 @@ func (m *Manager) RollbackPolicy(ctx context.Context, activeID int64, actor, rea
 	if err := m.store.RollbackPolicyProposal(ctx, active.ID, previous.ID, actor, reason, projectionSettings, policies); err != nil {
 		return err
 	}
-	m.recordEvent(ctx, "dispatch_policy_rolled_back", "error", 0,
-		fmt.Sprintf("策略版本 %d 已确定性回滚到 %d：%s", active.ID, previous.ID, reason), 0)
+	m.recordEventWithProvenance(ctx, "dispatch_policy_rolled_back", "error", 0,
+		fmt.Sprintf("策略版本 %d 已确定性回滚到 %d：%s", active.ID, previous.ID, reason), optionalInt64Value(active.AgentRunID),
+		optionalInt64Value(active.SourceGoalID), optionalInt64Value(active.SourceStepID))
 	if active.ScopeType == "account" {
 		if accountID, parseErr := strconv.ParseInt(active.ScopeID, 10, 64); parseErr == nil && accountID > 0 {
 			m.engine.RequestAccountsFrom("policy_rollback", accountID)
@@ -385,6 +392,13 @@ func (m *Manager) RollbackPolicy(ctx context.Context, activeID int64, actor, rea
 	}
 	m.engine.RequestFullFrom("policy_rollback")
 	return nil
+}
+
+func optionalInt64Value(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (m *Manager) evaluatePolicyRollbacks(ctx context.Context, now time.Time) {

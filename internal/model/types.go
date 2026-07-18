@@ -710,7 +710,10 @@ type GroupTierTransitionRequest struct {
 	SnapshotVersion  string     `json:"snapshot_version,omitempty"`
 	Trigger          string     `json:"trigger,omitempty"`
 	PacketID         int64      `json:"packet_id,omitempty"`
+	PacketHash       string     `json:"packet_hash,omitempty"`
 	RunID            int64      `json:"run_id,omitempty"`
+	GoalID           int64      `json:"goal_id,omitempty"`
+	StepID           int64      `json:"step_id,omitempty"`
 	Manual           bool       `json:"manual"`
 	DryRun           bool       `json:"dry_run"`
 	ExpectedPool     string     `json:"-"`
@@ -740,7 +743,10 @@ type GroupTierTransition struct {
 	SnapshotVersion string     `json:"snapshot_version,omitempty"`
 	Trigger         string     `json:"trigger,omitempty"`
 	PacketID        int64      `json:"packet_id,omitempty"`
+	PacketHash      string     `json:"packet_hash,omitempty"`
 	RunID           int64      `json:"run_id,omitempty"`
+	GoalID          int64      `json:"goal_id,omitempty"`
+	StepID          int64      `json:"step_id,omitempty"`
 	Error           string     `json:"error,omitempty"`
 	AttemptCount    int        `json:"attempt_count"`
 	BeforeState     string     `json:"before_state,omitempty"`
@@ -831,6 +837,8 @@ type ResolvedBinding struct {
 
 type Event struct {
 	ID          int64     `json:"id"`
+	GoalID      int64     `json:"goal_id,omitempty"`
+	StepID      int64     `json:"step_id,omitempty"`
 	Type        string    `json:"type"`
 	Severity    string    `json:"severity"`
 	MonitorID   *int64    `json:"monitor_id,omitempty"`

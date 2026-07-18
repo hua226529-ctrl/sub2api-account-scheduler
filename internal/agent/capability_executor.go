@@ -25,6 +25,8 @@ type CapabilityInvocation struct {
 	RunID              int64
 	GoalID             int64
 	StepID             int64
+	PacketID           int64
+	PacketHash         string
 	Actor              string
 	IdempotencyKey     string
 	AdministratorGrant *AdministratorGrant
@@ -77,27 +79,44 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		// injected or legacy administrator actor receives ordinary agent rules.
 		invocation.Actor = "agent:v2"
 	}
+	if err := applyExecutionPolicyDefaults(&invocation, spec); err != nil {
+		return CapabilityExecution{}, err
+	}
 	if spec.Mutating && invocation.AdministratorGrant == nil {
+		if spec.ExecutionPolicy.RequiresConfirmation {
+			return CapabilityExecution{}, errors.New("该写能力需要载荷精确绑定的管理员确认")
+		}
 		if !spec.ExecutionPolicy.SupportsAutonomous {
 			return CapabilityExecution{}, errors.New("该写能力不支持自主执行")
 		}
+	}
+	if spec.Mutating {
 		if spec.ExecutionPolicy.RequiresEvidence && len(invocation.EvidenceRefs) == 0 {
-			return CapabilityExecution{}, errors.New("自主写能力缺少 EvidenceRefs")
+			return CapabilityExecution{}, errors.New("写能力缺少 EvidenceRefs")
 		}
 		if spec.ExecutionPolicy.RequiresFreshSnapshot && strings.TrimSpace(invocation.SnapshotVersion) == "" {
-			return CapabilityExecution{}, errors.New("自主写能力缺少 SnapshotVersion")
+			return CapabilityExecution{}, errors.New("写能力缺少 SnapshotVersion")
+		}
+		if spec.ExecutionPolicy.MaxScope > 0 {
+			count, scopeErr := capabilityInvocationScopeCount(invocation.Name, invocation.Arguments)
+			if scopeErr != nil {
+				return CapabilityExecution{}, scopeErr
+			}
+			if count > spec.ExecutionPolicy.MaxScope {
+				return CapabilityExecution{}, fmt.Errorf("写能力作用域超过上限 %d", spec.ExecutionPolicy.MaxScope)
+			}
 		}
 		if spec.ExecutionPolicy.MaxTTLSeconds > 0 {
 			if invocation.ExpiresAt == nil {
-				return CapabilityExecution{}, errors.New("自主写能力缺少 TTL")
+				return CapabilityExecution{}, errors.New("写能力缺少 TTL")
 			}
 			createdAt := invocation.CreatedAt.UTC()
 			if createdAt.IsZero() {
-				return CapabilityExecution{}, errors.New("自主写能力缺少创建时间")
+				return CapabilityExecution{}, errors.New("写能力缺少创建时间")
 			}
 			ttl := invocation.ExpiresAt.Sub(createdAt)
 			if ttl <= 0 || ttl > time.Duration(spec.ExecutionPolicy.MaxTTLSeconds)*time.Second {
-				return CapabilityExecution{}, errors.New("自主写能力 TTL 超出执行策略")
+				return CapabilityExecution{}, errors.New("写能力 TTL 超出执行策略")
 			}
 		}
 	}
@@ -145,7 +164,8 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 			_ = m.store.RecordAgentObservation(ctx, 1, 0, 0, 0)
 		}
 		execution.Status, execution.Message = "failed", err.Error()
-		m.recordEvent(ctx, "agent_capability_failed", "error", capabilityAccountID(invocation.Arguments), invocation.Name+" 执行失败: "+err.Error(), invocation.RunID)
+		m.recordEventWithProvenance(ctx, "agent_capability_failed", "error", capabilityAccountID(invocation.Arguments),
+			invocation.Name+" 执行失败: "+err.Error(), invocation.RunID, invocation.GoalID, invocation.StepID)
 		return execution, err
 	}
 	if invocation.DryRun && spec.Mutating {
@@ -155,6 +175,74 @@ func (m *Manager) ExecuteCapability(ctx context.Context, invocation CapabilityIn
 		execution.Status, execution.Message = "completed", "已执行并回读确认"
 	}
 	return execution, nil
+}
+
+func applyExecutionPolicyDefaults(invocation *CapabilityInvocation, spec CapabilitySpec) error {
+	if invocation == nil || !spec.Mutating {
+		return nil
+	}
+	argumentExpiry, err := capabilityArgumentExpiry(invocation.Arguments)
+	if err != nil {
+		return err
+	}
+	if argumentExpiry != nil {
+		if invocation.ExpiresAt != nil && !invocation.ExpiresAt.Equal(*argumentExpiry) {
+			return errors.New("能力参数 TTL 与目标授权 TTL 不一致")
+		}
+		invocation.ExpiresAt = argumentExpiry
+	}
+	if invocation.ExpiresAt != nil || spec.ExecutionPolicy.DefaultTTLSeconds <= 0 {
+		return nil
+	}
+	if invocation.CreatedAt.IsZero() {
+		return errors.New("写能力缺少创建时间，无法应用默认 TTL")
+	}
+	expiresAt := invocation.CreatedAt.UTC().Add(time.Duration(spec.ExecutionPolicy.DefaultTTLSeconds) * time.Second)
+	invocation.ExpiresAt = &expiresAt
+	return nil
+}
+
+func capabilityArgumentExpiry(arguments json.RawMessage) (*time.Time, error) {
+	if len(arguments) == 0 {
+		return nil, nil
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &values); err != nil {
+		return nil, fmt.Errorf("能力参数无效: %w", err)
+	}
+	var result *time.Time
+	for _, key := range []string{"expires_at", "until"} {
+		raw, exists := values[key]
+		if !exists || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		var value time.Time
+		if err := json.Unmarshal(raw, &value); err != nil || value.IsZero() {
+			return nil, fmt.Errorf("能力参数 %s 不是有效时间", key)
+		}
+		value = value.UTC()
+		if result != nil && !result.Equal(value) {
+			return nil, errors.New("能力参数包含冲突的 TTL")
+		}
+		result = &value
+	}
+	return result, nil
+}
+
+func capabilityInvocationScopeCount(name string, arguments json.RawMessage) (int, error) {
+	var values map[string]any
+	if err := json.Unmarshal(arguments, &values); err != nil {
+		return 0, fmt.Errorf("能力参数无效: %w", err)
+	}
+	for _, key := range []string{"account_id", "source_id", "policy_id", "command_id", "scope_id"} {
+		if value, exists := values[key]; exists && value != nil && fmt.Sprint(value) != "" && fmt.Sprint(value) != "0" {
+			return 1, nil
+		}
+	}
+	if name == "trigger_reconcile" || name == "schedule_command" {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 func (m *Manager) executeCapabilityBody(ctx context.Context, invocation CapabilityInvocation) (any, bool, error) {
@@ -590,7 +678,8 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 			KeyID: args.KeyID, TargetTier: args.TargetTier, IdempotencyKey: nonEmptyIdempotency(invocation), Actor: actor,
 			Producer: groupCapabilityProducer(invocation), Authority: groupCapabilityAuthority(invocation), Reason: args.Reason,
 			Evidence: strings.Join(invocation.EvidenceRefs, ","), SnapshotVersion: invocation.SnapshotVersion,
-			Trigger: "agent_v2", Manual: administratorGrantedInvocation(invocation), RunID: invocation.RunID,
+			Trigger: "agent_v2", Manual: administratorGrantedInvocation(invocation), PacketID: invocation.PacketID, PacketHash: invocation.PacketHash, RunID: invocation.RunID,
+			GoalID: invocation.GoalID, StepID: invocation.StepID,
 			ExpectedPool: expectedPool, ExpectedFromTier: expectedTier, EvidenceCutoffAt: evidenceCutoff, AutomationLeaseHeld: true})
 		return transition, retryableExternal(err), err
 	case "update_dispatch_policy", "propose_dispatch_policy":
@@ -611,6 +700,7 @@ func (m *Manager) executeMutationCapability(ctx context.Context, invocation Capa
 		}
 		version, err := m.ProposeDispatchPolicy(ctx, PolicyProposalInput{ScopeType: args.ScopeType, ScopeID: args.ScopeID,
 			Patch: args.Config, Reason: args.Reason, Actor: actor, RunID: invocation.RunID, GoalID: invocation.GoalID,
+			StepID: invocation.StepID, PacketID: invocation.PacketID, PacketHash: invocation.PacketHash,
 			IdempotencyKey: nonEmptyIdempotency(invocation)})
 		return version, false, err
 	case "activate_policy_version":

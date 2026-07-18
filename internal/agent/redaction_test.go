@@ -153,7 +153,7 @@ func TestCompletionClientRedactsStructuredPromptsAtHTTPBoundary(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"完成\",\"conclusion\":\"完成\",\"confidence\":1,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[]}"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"完成\",\"conclusion\":\"完成\",\"confidence\":1,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[],\"evidence_requests\":[]}"}}]}`))
 	}))
 	defer server.Close()
 
@@ -187,7 +187,7 @@ func TestCompleteRuntimeFallbackRedactsMessagesAndToolDataAtHTTPBoundary(t *test
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"完成\",\"conclusion\":\"完成\",\"confidence\":1,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[]}"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"完成\",\"conclusion\":\"完成\",\"confidence\":1,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[],\"evidence_requests\":[]}"}}]}`))
 	}))
 	defer server.Close()
 

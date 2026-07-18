@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +23,7 @@ func TestPolicyProposalSimulatesWithoutActivationAndIsIdempotent(t *testing.T) {
 	insertPolicySimulationSamples(t, database.Store, accountID, 30)
 	input := PolicyProposalInput{ScopeType: "account", ScopeID: fmt.Sprint(accountID),
 		Patch: []byte(`{"failure_threshold":4}`), Reason: "reduce flapping", Actor: "agent:optimizer",
-		GoalID: 9, IdempotencyKey: "proposal-idempotent-1"}
+		GoalID: 9, StepID: 10, PacketID: 11, PacketHash: "packet-hash", IdempotencyKey: "proposal-idempotent-1"}
 	proposal, err := manager.ProposeDispatchPolicy(ctx, input)
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +34,20 @@ func TestPolicyProposalSimulatesWithoutActivationAndIsIdempotent(t *testing.T) {
 	}
 	if _, err := database.Store.FindActivePolicyVersion(ctx, "account", fmt.Sprint(accountID)); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("proposal was activated during creation: %v", err)
+	}
+	events, err := database.Store.ListEvents(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proposalAudit *model.Event
+	for index := range events {
+		if events[index].Type == "dispatch_policy_proposed" {
+			proposalAudit = &events[index]
+			break
+		}
+	}
+	if proposalAudit == nil || proposalAudit.GoalID != 9 || proposalAudit.StepID != 10 {
+		t.Fatalf("V2 policy audit provenance missing: %+v", proposalAudit)
 	}
 	replay, err := manager.ProposeDispatchPolicy(ctx, input)
 	if err != nil || replay.ID != proposal.ID {
@@ -63,7 +78,8 @@ func TestPolicyActivationChecksBaseAndAutoBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, err := manager.ProposeDispatchPolicy(ctx, PolicyProposalInput{ScopeType: "account", ScopeID: fmt.Sprint(accountID),
-		Patch: []byte(`{"failure_threshold":4}`), Reason: "first", Actor: "agent:optimizer", IdempotencyKey: "proposal-first"})
+		Patch: []byte(`{"failure_threshold":4}`), Reason: "first", Actor: "agent:optimizer", GoalID: 101, StepID: 201,
+		PacketID: 301, PacketHash: "first-packet", IdempotencyKey: "proposal-first"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,6 +94,20 @@ func TestPolicyActivationChecksBaseAndAutoBudget(t *testing.T) {
 	activated, err := database.Store.GetPolicyLifecycle(ctx, first.ID)
 	if err != nil || activated.Status != model.PolicyStatusActive {
 		t.Fatalf("activated proposal = %+v err=%v", activated, err)
+	}
+	events, err := database.Store.ListEvents(ctx, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var activationAudit *model.Event
+	for index := range events {
+		if events[index].Type == "dispatch_policy_activated" {
+			activationAudit = &events[index]
+			break
+		}
+	}
+	if activationAudit == nil || activationAudit.GoalID != 101 || activationAudit.StepID != 201 {
+		t.Fatalf("V2 policy activation audit provenance missing: %+v", activationAudit)
 	}
 	if err := manager.ActivatePolicyProposal(ctx, stale.ID, "administrator", false); !errors.Is(err, store.ErrPolicyBaseChanged) {
 		t.Fatalf("stale proposal activation = %v", err)
@@ -128,7 +158,7 @@ func TestPolicyActivationCapabilityRejectsAutonomousExecution(t *testing.T) {
 		DryRun:    true,
 	}
 	result, err := manager.ExecuteCapability(context.Background(), invocation)
-	if err == nil || err.Error() != "该写能力不支持自主执行" {
+	if err == nil || (!strings.Contains(err.Error(), "自主执行") && !strings.Contains(err.Error(), "管理员确认")) {
 		t.Fatalf("autonomous policy activation result=%+v err=%v", result, err)
 	}
 }

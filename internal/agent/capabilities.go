@@ -137,7 +137,7 @@ func executionPolicyFor(name string, mutating, administratorDirect bool) Executi
 		policy.Risk, policy.SupportsAutonomous, policy.RequiresConfirmation = model.AgentRiskCritical, false, true
 		policy.SupportsScheduling = false
 	case "transition_token_group_tier":
-		policy.Risk, policy.SupportsAutonomous, policy.RequiresEvidence, policy.RequiresConfirmation = model.AgentRiskCritical, true, true, true
+		policy.Risk, policy.SupportsAutonomous, policy.RequiresEvidence, policy.RequiresConfirmation = model.AgentRiskCritical, false, true, true
 		policy.DefaultTTLSeconds, policy.MaxTTLSeconds = int64((15*time.Minute)/time.Second), int64((2*time.Hour)/time.Second)
 	case "schedule_command":
 		policy.Risk, policy.RequiresConfirmation, policy.SupportsScheduling = model.AgentRiskCritical, true, false

@@ -48,6 +48,12 @@ type AgentProvider struct {
 	Temperature          float64    `json:"temperature"`
 	LastValidatedAt      *time.Time `json:"last_validated_at,omitempty"`
 	LastError            string     `json:"last_error,omitempty"`
+	RecentError          string     `json:"recent_error,omitempty"`
+	LastErrorClass       string     `json:"last_error_class,omitempty"`
+	LastErrorAt          *time.Time `json:"last_error_at,omitempty"`
+	ErrorCount24h        int        `json:"error_count_24h"`
+	ErrorWindowStartedAt *time.Time `json:"-"`
+	ConsecutiveFailures  int        `json:"consecutive_failure_count"`
 	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
@@ -302,6 +308,9 @@ type ScorePolicyVersion struct {
 	Reason                  string           `json:"reason"`
 	AgentRunID              *int64           `json:"agent_run_id,omitempty"`
 	SourceGoalID            *int64           `json:"source_goal_id,omitempty"`
+	SourceStepID            *int64           `json:"source_step_id,omitempty"`
+	SourcePacketID          *int64           `json:"source_packet_id,omitempty"`
+	SourcePacketHash        string           `json:"source_packet_hash,omitempty"`
 	BaseVersionID           *int64           `json:"base_version_id,omitempty"`
 	PreviousActiveVersionID *int64           `json:"previous_active_version_id,omitempty"`
 	CreatedBy               string           `json:"created_by"`
@@ -332,7 +341,11 @@ type PolicySimulation struct {
 
 type DecisionOutcome struct {
 	ID                        int64      `json:"id"`
-	RunID                     int64      `json:"run_id"`
+	RunID                     int64      `json:"run_id,omitempty"`
+	GoalID                    int64      `json:"goal_id,omitempty"`
+	StepID                    int64      `json:"step_id,omitempty"`
+	PacketID                  int64      `json:"packet_id,omitempty"`
+	PacketHash                string     `json:"packet_hash,omitempty"`
 	ToolCallID                *int64     `json:"tool_call_id,omitempty"`
 	AccountID                 *int64     `json:"account_id,omitempty"`
 	PredictedSuccessRateDelta float64    `json:"predicted_success_rate_delta"`

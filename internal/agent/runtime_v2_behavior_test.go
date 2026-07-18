@@ -100,6 +100,81 @@ func TestCharacterizationTransitionTokenGroupTierRequiresAgentConfidenceButAllow
 	}
 }
 
+func TestTransitionTokenGroupTierPolicyRequiresAdministratorConfirmation(t *testing.T) {
+	spec, ok := capabilitySpec("transition_token_group_tier")
+	if !ok {
+		t.Fatal("transition capability missing")
+	}
+	if spec.ExecutionPolicy.SupportsAutonomous || !spec.ExecutionPolicy.RequiresConfirmation ||
+		spec.RiskLevel != model.AgentRiskCritical {
+		t.Fatalf("unsafe transition policy: %+v", spec.ExecutionPolicy)
+	}
+
+	manager := &Manager{}
+	_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{
+		Name: "transition_token_group_tier", Actor: "agent:v2", DryRun: true,
+		Arguments: json.RawMessage(`{"source_id":9,"key_id":"token-7","target_tier":"backup","confidence":0.99,"reason":"confirmed outage evidence"}`),
+		CreatedAt: time.Now().UTC(), SnapshotVersion: "packet:1", EvidenceRefs: []string{"packet:1"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "管理员确认") {
+		t.Fatalf("autonomous critical transition was not blocked: %v", err)
+	}
+}
+
+func TestExecutionPolicyDefaultTTLIsAppliedAtCapabilityBoundary(t *testing.T) {
+	spec, ok := capabilitySpec("pause_account")
+	if !ok {
+		t.Fatal("pause capability missing")
+	}
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	invocation := CapabilityInvocation{Name: "pause_account", CreatedAt: createdAt}
+	if err := applyExecutionPolicyDefaults(&invocation, spec); err != nil {
+		t.Fatal(err)
+	}
+	if invocation.ExpiresAt == nil || invocation.ExpiresAt.Sub(createdAt) != time.Duration(spec.ExecutionPolicy.DefaultTTLSeconds)*time.Second {
+		t.Fatalf("default TTL was not applied: invocation=%+v policy=%+v", invocation, spec.ExecutionPolicy)
+	}
+	missingTime := CapabilityInvocation{Name: "pause_account"}
+	if err := applyExecutionPolicyDefaults(&missingTime, spec); err == nil {
+		t.Fatal("default TTL was invented without an auditable creation time")
+	}
+	explicit := createdAt.Add(time.Hour)
+	invocation = CapabilityInvocation{Name: "pause_account", CreatedAt: createdAt,
+		Arguments: json.RawMessage(fmt.Sprintf(`{"account_id":1,"expires_at":%q,"reason":"test"}`, explicit.Format(time.RFC3339)))}
+	if err := applyExecutionPolicyDefaults(&invocation, spec); err != nil || invocation.ExpiresAt == nil || !invocation.ExpiresAt.Equal(explicit) {
+		t.Fatalf("explicit capability TTL was not preserved: invocation=%+v err=%v", invocation, err)
+	}
+	tooLong := createdAt.Add(time.Duration(spec.ExecutionPolicy.MaxTTLSeconds+1) * time.Second)
+	invocation = CapabilityInvocation{Name: "pause_account", CreatedAt: createdAt,
+		Arguments: json.RawMessage(fmt.Sprintf(`{"account_id":1,"expires_at":%q,"reason":"test"}`, tooLong.Format(time.RFC3339)))}
+	if err := applyExecutionPolicyDefaults(&invocation, spec); err != nil {
+		t.Fatal(err)
+	}
+	if ttl := invocation.ExpiresAt.Sub(createdAt); ttl <= time.Duration(spec.ExecutionPolicy.MaxTTLSeconds)*time.Second {
+		t.Fatalf("test TTL did not exceed policy: %s", ttl)
+	}
+	_, err := (&Manager{}).ExecuteCapability(context.Background(), CapabilityInvocation{Name: "pause_account",
+		Arguments: invocation.Arguments, Actor: "agent:v2", CreatedAt: createdAt,
+		SnapshotVersion: "packet:ttl", EvidenceRefs: []string{"packet:ttl"}})
+	if err == nil || !strings.Contains(err.Error(), "TTL") {
+		t.Fatalf("execution boundary accepted TTL above maximum: %v", err)
+	}
+}
+
+func TestConfirmedCapabilityStillRequiresEvidenceAndSnapshot(t *testing.T) {
+	arguments := json.RawMessage(`{"source_id":9,"key_id":"token-7","target_tier":"backup","confidence":1,"reason":"administrator confirmed"}`)
+	arguments, _ = normalizedArguments(arguments)
+	grant := mintAdministratorGrant(administratorCommandHash("confirmed-policy-scope"), administratorCommandHash("切换令牌分组"),
+		"immediate", "transition_token_group_tier", arguments, []string{"source:9", "key:token-7"}, "", nil, nil)
+	manager := &Manager{}
+	_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{Name: "transition_token_group_tier",
+		Arguments: arguments, Actor: "administrator:agent", AdministratorGrant: grant, GoalID: 1, StepID: 2,
+		CreatedAt: time.Now().UTC(), SnapshotVersion: "packet:1"})
+	if err == nil || !strings.Contains(err.Error(), "EvidenceRefs") {
+		t.Fatalf("administrator confirmation bypassed evidence policy: %v", err)
+	}
+}
+
 func TestCharacterizationScheduledCommandPersistsExactAdministratorGrant(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -192,7 +267,7 @@ func TestExplicitAdministratorCommandSeparatesQuestionsFromCommands(t *testing.T
 	}
 }
 
-func TestEnqueueAnalysisGoalDeduplicatesActiveEmergencyAcrossTriggers(t *testing.T) {
+func TestEmergencyGoalDeduplicationUsesEventTypeScopeAndWindow(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
@@ -205,35 +280,85 @@ func TestEnqueueAnalysisGoalDeduplicatesActiveEmergencyAcrossTriggers(t *testing
 	t.Cleanup(func() { _ = database.Close() })
 
 	manager := &Manager{store: database, interactiveWake: make(chan struct{}, 1), backgroundWake: make(chan struct{}, 1)}
-	first, err := manager.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, "账号池清空", 95)
+	window := time.Now().UTC().Truncate(emergencyAggregationWindow).Format(time.RFC3339)
+	firstContext := runtimeGoalContext{Kind: model.AgentRunEmergency, Trigger: "严重运行事件", EventType: "health_stage_changed",
+		ResourceScope: "account:1", AggregationWindow: window, AuditEventRefs: []int64{10}}
+	first, err := manager.enqueueAnalysisGoal(ctx, firstContext, emergencyObjective(firstContext.EventType, firstContext.ResourceScope, firstContext.AuditEventRefs), 95)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := manager.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, "失败率骤升", 90)
+	mergedContext := firstContext
+	mergedContext.AuditEventRefs = []int64{11}
+	second, err := manager.enqueueAnalysisGoal(ctx, mergedContext, emergencyObjective(mergedContext.EventType, mergedContext.ResourceScope, mergedContext.AuditEventRefs), 90)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.ID != first.ID {
-		t.Fatalf("different emergency triggers created concurrent active goals: first=%d second=%d", first.ID, second.ID)
+		t.Fatalf("same scoped emergency was not merged: first=%d second=%d", first.ID, second.ID)
+	}
+	second, err = database.GetAgentGoal(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged runtimeGoalContext
+	if err := json.Unmarshal(second.Context, &merged); err != nil || len(merged.AuditEventRefs) != 2 {
+		t.Fatalf("merged emergency did not retain audit references: context=%s err=%v", second.Context, err)
+	}
+	different := firstContext
+	different.ResourceScope = "account:2"
+	different.AuditEventRefs = []int64{12}
+	third, err := manager.enqueueAnalysisGoal(ctx, different, emergencyObjective(different.EventType, different.ResourceScope, different.AuditEventRefs), 95)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.ID == first.ID {
+		t.Fatal("different emergency accounts were incorrectly merged")
 	}
 	active, err := database.ListAgentGoals(ctx, model.AgentGoalStatusPlanned, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(active) != 1 {
-		t.Fatalf("expected one active emergency goal, got %d: %+v", len(active), active)
+	if len(active) != 2 {
+		t.Fatalf("expected two scoped emergency goals, got %d: %+v", len(active), active)
 	}
 
-	first.Status = model.AgentGoalStatusCompleted
-	if err := database.UpdateAgentGoal(ctx, first); err != nil {
+	second.Status = model.AgentGoalStatusCompleted
+	if err := database.UpdateAgentGoal(ctx, second); err != nil {
 		t.Fatal(err)
 	}
-	third, err := manager.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, "新的池清空事件", 95)
+	newWindow := firstContext
+	newWindow.AggregationWindow = time.Now().UTC().Add(emergencyAggregationWindow).Truncate(emergencyAggregationWindow).Format(time.RFC3339)
+	fourth, err := manager.enqueueAnalysisGoal(ctx, newWindow, emergencyObjective(newWindow.EventType, newWindow.ResourceScope, []int64{13}), 95)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third.ID == first.ID {
+	if fourth.ID == first.ID {
 		t.Fatal("completed emergency goal incorrectly blocked a new emergency goal")
+	}
+}
+
+func TestOperationalEventScopeNeverInventsAccountZero(t *testing.T) {
+	manager, _ := stage0AgentManager(t)
+	if err := manager.engine.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	accountID := int64(9)
+	monitorID := int64(10_000)
+	if got := manager.operationalEventScope(model.Event{AccountID: &accountID}); got != "account:9" {
+		t.Fatalf("account scope=%q", got)
+	}
+	if got := manager.operationalEventScope(model.Event{MonitorID: &monitorID}); got != "account:1" {
+		t.Fatalf("unique monitor binding scope=%q", got)
+	}
+	unbound := int64(99_999)
+	if got := manager.operationalEventScope(model.Event{MonitorID: &unbound}); got != "monitor:99999" {
+		t.Fatalf("unbound monitor scope=%q", got)
+	}
+	if got := manager.operationalEventScope(model.Event{}); got != "global" {
+		t.Fatalf("global scope=%q", got)
+	}
+	if objective := emergencyObjective("health_stage_changed", "monitor:99999", []int64{7}); strings.Contains(objective, "账号 0") {
+		t.Fatalf("objective invented account zero: %s", objective)
 	}
 }
 

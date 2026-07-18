@@ -22,7 +22,7 @@ const mutationColumns = `id,command_id,intent_id,idempotency_key,semantic_signat
 	requested_schedulable,requested_load_factor,requested_load_factor_set,winning_intent_id,winning_idempotency_key,
 	winning_producer,winning_authority,winning_actor,winning_reason,winning_evidence_refs,winning_policy_version,
 	winning_snapshot_version,winning_created_at,winning_expires_at,winning_schedulable,winning_load_factor,
-	winning_load_factor_set,winning_override_kind,producer,authority,actor,reason_code,reason,policy_version,snapshot_version,expires_at,
+	winning_load_factor_set,winning_override_kind,producer,authority,actor,reason_code,reason,policy_version,snapshot_version,run_id,goal_id,step_id,expires_at,
 	status,attempt_count,before_schedulable,before_load_factor,before_load_factor_set,after_schedulable,
 	after_load_factor,after_load_factor_set,last_error_code,override_id,revoke_override_id,telemetry_fresh,
 	cooldown_active,created_at,updated_at,completed_at`
@@ -101,6 +101,13 @@ func (s *Store) ListActiveAccountOverrides(ctx context.Context, accountID int64,
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (s *Store) HasPendingAccountOverrideTransition(ctx context.Context, accountID int64, operation controlplane.Operation) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_overrides
+		WHERE account_id=? AND operation=? AND status=?`, accountID, operation.String(), accountcontrol.OverridePending).Scan(&count)
+	return count > 0, err
 }
 
 func (s *Store) expireAccountOverrides(ctx context.Context, accountID int64, operation controlplane.Operation, now time.Time) error {
@@ -286,7 +293,7 @@ func insertOverride(ctx context.Context, exec sqlExecer, item accountcontrol.Ove
 }
 
 func insertMutation(ctx context.Context, exec sqlExecer, item accountcontrol.Mutation) error {
-	_, err := exec.ExecContext(ctx, `INSERT INTO account_mutations(`+mutationColumns+`) VALUES(`+placeholders(49)+`)`, mutationInsertArguments(item)...)
+	_, err := exec.ExecContext(ctx, `INSERT INTO account_mutations(`+mutationColumns+`) VALUES(`+placeholders(52)+`)`, mutationInsertArguments(item)...)
 	return err
 }
 
@@ -300,7 +307,7 @@ func mutationUpdateSQL() string {
 		requested_schedulable=?,requested_load_factor=?,requested_load_factor_set=?,winning_intent_id=?,winning_idempotency_key=?,
 		winning_producer=?,winning_authority=?,winning_actor=?,winning_reason=?,winning_evidence_refs=?,winning_policy_version=?,
 		winning_snapshot_version=?,winning_created_at=?,winning_expires_at=?,winning_schedulable=?,winning_load_factor=?,
-		winning_load_factor_set=?,winning_override_kind=?,producer=?,authority=?,actor=?,reason_code=?,reason=?,policy_version=?,snapshot_version=?,expires_at=?,
+		winning_load_factor_set=?,winning_override_kind=?,producer=?,authority=?,actor=?,reason_code=?,reason=?,policy_version=?,snapshot_version=?,run_id=?,goal_id=?,step_id=?,expires_at=?,
 		status=?,attempt_count=?,before_schedulable=?,before_load_factor=?,before_load_factor_set=?,after_schedulable=?,after_load_factor=?,
 		after_load_factor_set=?,last_error_code=?,override_id=?,revoke_override_id=?,telemetry_fresh=?,cooldown_active=?,created_at=?,updated_at=?,completed_at=? WHERE id=?`
 }
@@ -316,7 +323,8 @@ func mutationArguments(item accountcontrol.Mutation) []any {
 		item.WinningActor, item.WinningReason, string(winningEvidence), item.WinningPolicyVersion, item.WinningSnapshotVersion,
 		formatTime(item.WinningCreatedAt), nullableTime(item.WinningExpiresAt), nullableBool(item.WinningSchedulable),
 		nullableInt(item.WinningLoadFactor), boolInt(item.WinningLoadSet), item.WinningOverrideKind, item.Producer.String(), item.Authority.String(), item.Actor,
-		item.ReasonCode, item.Reason, item.PolicyVersion, item.SnapshotVersion, nullableTime(item.ExpiresAt), item.Status, item.AttemptCount,
+		item.ReasonCode, item.Reason, item.PolicyVersion, item.SnapshotVersion, item.RunID, item.GoalID, item.StepID,
+		nullableTime(item.ExpiresAt), item.Status, item.AttemptCount,
 		beforeSched, beforeLoad, beforeLoadSet, afterSched, afterLoad, afterLoadSet, item.LastErrorCode, item.OverrideID,
 		item.RevokeOverrideID, boolInt(item.TelemetryFresh), boolInt(item.CooldownActive), formatTime(item.CreatedAt),
 		formatTime(item.UpdatedAt), nullableTime(item.CompletedAt), item.ID,
@@ -370,7 +378,7 @@ func scanMutation(row scanner) (accountcontrol.Mutation, error) {
 		&winningProducer, &winningAuthority, &item.WinningActor, &item.WinningReason, &winningEvidence,
 		&item.WinningPolicyVersion, &item.WinningSnapshotVersion, &winningCreated, &winningExpires, &winningSched, &winningLoad,
 		&winningLoadSet, &item.WinningOverrideKind, &producer, &authority, &item.Actor, &item.ReasonCode, &item.Reason, &item.PolicyVersion,
-		&item.SnapshotVersion, &expires, &status, &item.AttemptCount, &beforeSched, &beforeLoad, &beforeLoadSet,
+		&item.SnapshotVersion, &item.RunID, &item.GoalID, &item.StepID, &expires, &status, &item.AttemptCount, &beforeSched, &beforeLoad, &beforeLoadSet,
 		&afterSched, &afterLoad, &afterLoadSet, &item.LastErrorCode, &item.OverrideID, &item.RevokeOverrideID,
 		&telemetryFresh, &cooldownActive, &created, &updated, &completed)
 	if err != nil {

@@ -25,6 +25,7 @@ func TestAdministratorCapabilityWaitsForFreezePublication(t *testing.T) {
 		_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{
 			Name: "pause_account", Arguments: arguments, GoalID: 101, StepID: 201,
 			Actor: "administrator:agent", AdministratorGrant: grant,
+			CreatedAt: time.Now().UTC(), SnapshotVersion: "packet:101", EvidenceRefs: []string{"packet:101"},
 		})
 		done <- err
 	}()
@@ -66,6 +67,7 @@ func TestBlockedCapabilityDoesNotOccupyInteractiveModelSlot(t *testing.T) {
 		_, err := manager.ExecuteCapability(context.Background(), CapabilityInvocation{
 			Name: "pause_account", Arguments: arguments, GoalID: 501, StepID: 601,
 			Actor: "administrator:agent", AdministratorGrant: grant,
+			CreatedAt: time.Now().UTC(), SnapshotVersion: "packet:501", EvidenceRefs: []string{"packet:501"},
 		})
 		done <- err
 	}()

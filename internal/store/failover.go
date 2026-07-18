@@ -14,7 +14,7 @@ import (
 
 var ErrGroupTransitionIdempotencyConflict = errors.New("group transition idempotency conflict")
 
-const groupTierTransitionColumns = `id,idempotency_key,source_id,key_id,from_tier,to_tier,from_group_id,to_group_id,status,actor,producer,authority,reason,evidence,snapshot_version,trigger,packet_id,run_id,error,attempt_count,before_state,verified_after_state,uncertain,manual,dry_run,created_at,completed_at`
+const groupTierTransitionColumns = `id,idempotency_key,source_id,key_id,from_tier,to_tier,from_group_id,to_group_id,status,actor,producer,authority,reason,evidence,snapshot_version,trigger,packet_id,packet_hash,run_id,goal_id,step_id,error,attempt_count,before_state,verified_after_state,uncertain,manual,dry_run,created_at,completed_at`
 
 const groupFailoverStateColumns = `source_id,key_id,current_tier,observed_group_id,previous_tier,previous_stable_tier,previous_group_id,frozen,freeze_reason,last_error,manual_hold_until,manual_override_until,cooldown_until,return_blocked_until,recovery_since,last_switch_at,last_transition_at,verification_started_at,healthy_since,recovery_healthy_count,last_confirmed_at,validation_status,validation_mode,validation_transition_id,validation_from_tier,validation_target_tier,validation_from_group_id,validation_target_group_id,switch_requested_at,switch_verified_at,validation_not_before,evidence_deadline,monitor_watermark,traffic_watermark,monitor_evidence_cursor,traffic_evidence_cursor,active_probe_attempts,successful_evidence_count,failed_evidence_count,last_evidence_id,last_evidence_source,last_evidence_reason,last_evidence_at,updated_at`
 
@@ -300,8 +300,8 @@ func (s *Store) BeginGroupTierTransition(ctx context.Context, item model.GroupTi
 	item.Status = model.GroupTransitionPending
 	item.AttemptCount = 1
 	item.BeforeState = item.FromGroupID
-	result, err := s.db.ExecContext(ctx, `INSERT INTO upstream_group_transitions(idempotency_key,source_id,key_id,from_tier,to_tier,from_group_id,to_group_id,status,actor,producer,authority,reason,evidence,snapshot_version,trigger,packet_id,run_id,error,attempt_count,before_state,verified_after_state,uncertain,manual,dry_run,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		strings.TrimSpace(item.IdempotencyKey), item.SourceID, strings.TrimSpace(item.KeyID), item.FromTier, item.ToTier, item.FromGroupID, item.ToGroupID, item.Status, item.Actor, item.Producer, item.Authority, item.Reason, item.Evidence, item.SnapshotVersion, item.Trigger, item.PacketID, item.RunID, "", item.AttemptCount, item.BeforeState, "", 0, boolInt(item.Manual), boolInt(item.DryRun), formatTime(item.CreatedAt))
+	result, err := s.db.ExecContext(ctx, `INSERT INTO upstream_group_transitions(idempotency_key,source_id,key_id,from_tier,to_tier,from_group_id,to_group_id,status,actor,producer,authority,reason,evidence,snapshot_version,trigger,packet_id,packet_hash,run_id,goal_id,step_id,error,attempt_count,before_state,verified_after_state,uncertain,manual,dry_run,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		strings.TrimSpace(item.IdempotencyKey), item.SourceID, strings.TrimSpace(item.KeyID), item.FromTier, item.ToTier, item.FromGroupID, item.ToGroupID, item.Status, item.Actor, item.Producer, item.Authority, item.Reason, item.Evidence, item.SnapshotVersion, item.Trigger, item.PacketID, item.PacketHash, item.RunID, item.GoalID, item.StepID, "", item.AttemptCount, item.BeforeState, "", 0, boolInt(item.Manual), boolInt(item.DryRun), formatTime(item.CreatedAt))
 	if err != nil {
 		if stringsContains(err.Error(), "UNIQUE") {
 			existing, getErr := s.GetGroupTierTransitionByKey(ctx, item.IdempotencyKey)
@@ -438,7 +438,7 @@ func scanGroupTierTransition(row rowScanner) (model.GroupTierTransition, error) 
 	var manual, dryRun, uncertain int
 	var createdAt string
 	var completedAt sql.NullString
-	err := row.Scan(&item.ID, &item.IdempotencyKey, &item.SourceID, &item.KeyID, &item.FromTier, &item.ToTier, &item.FromGroupID, &item.ToGroupID, &item.Status, &item.Actor, &item.Producer, &item.Authority, &item.Reason, &item.Evidence, &item.SnapshotVersion, &item.Trigger, &item.PacketID, &item.RunID, &item.Error, &item.AttemptCount, &item.BeforeState, &item.VerifiedAfter, &uncertain, &manual, &dryRun, &createdAt, &completedAt)
+	err := row.Scan(&item.ID, &item.IdempotencyKey, &item.SourceID, &item.KeyID, &item.FromTier, &item.ToTier, &item.FromGroupID, &item.ToGroupID, &item.Status, &item.Actor, &item.Producer, &item.Authority, &item.Reason, &item.Evidence, &item.SnapshotVersion, &item.Trigger, &item.PacketID, &item.PacketHash, &item.RunID, &item.GoalID, &item.StepID, &item.Error, &item.AttemptCount, &item.BeforeState, &item.VerifiedAfter, &uncertain, &manual, &dryRun, &createdAt, &completedAt)
 	if err != nil {
 		return model.GroupTierTransition{}, err
 	}
@@ -455,7 +455,8 @@ func sameGroupTransitionSemantics(left, right model.GroupTierTransition) bool {
 		left.FromTier == right.FromTier && left.ToTier == right.ToTier && left.FromGroupID == right.FromGroupID && left.ToGroupID == right.ToGroupID &&
 		left.Actor == right.Actor && left.Producer == right.Producer && left.Authority == right.Authority && left.Reason == right.Reason &&
 		left.Evidence == right.Evidence && left.SnapshotVersion == right.SnapshotVersion && left.Trigger == right.Trigger &&
-		left.PacketID == right.PacketID && left.RunID == right.RunID && left.Manual == right.Manual && left.DryRun == right.DryRun
+		left.PacketID == right.PacketID && left.PacketHash == right.PacketHash && left.RunID == right.RunID && left.GoalID == right.GoalID && left.StepID == right.StepID &&
+		left.Manual == right.Manual && left.DryRun == right.DryRun
 }
 
 func (s *Store) listGroupFailoverAccounts(ctx context.Context, sourceID int64, keyID string) ([]int64, error) {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/accountcontrol"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/automation"
+	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/controlplane"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/health"
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
@@ -192,7 +193,7 @@ func (e *Engine) AccountIDsForMonitors(monitorIDs ...int64) []int64 {
 	seen := make(map[int64]struct{})
 	e.snapshotMu.RLock()
 	for _, binding := range e.snapshot.Bindings {
-		if binding.Monitor != nil {
+		if binding.State == "bound" && binding.Monitor != nil {
 			if _, ok := requested[binding.Monitor.ID]; ok {
 				seen[binding.Account.ID] = struct{}{}
 			}
@@ -205,6 +206,37 @@ func (e *Engine) AccountIDsForMonitors(monitorIDs ...int64) []int64 {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
+}
+
+// FilterReconcileAccountIDs uses only the current in-memory binding snapshot.
+// It keeps Telemetry from waking targeted passes for OAuth or incomplete
+// accounts that matcher has already classified as unbound.
+func (e *Engine) FilterReconcileAccountIDs(accountIDs ...int64) (accepted []int64, ignored []int64) {
+	requested := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID > 0 {
+			requested[accountID] = struct{}{}
+		}
+	}
+	bound := make(map[int64]struct{}, len(requested))
+	e.snapshotMu.RLock()
+	for _, binding := range e.snapshot.Bindings {
+		if binding.Account.ID > 0 && binding.State == "bound" && binding.Monitor != nil &&
+			!strings.Contains(strings.ToLower(strings.TrimSpace(binding.Account.Type)), "oauth") {
+			bound[binding.Account.ID] = struct{}{}
+		}
+	}
+	e.snapshotMu.RUnlock()
+	for accountID := range requested {
+		if _, ok := bound[accountID]; ok {
+			accepted = append(accepted, accountID)
+		} else {
+			ignored = append(ignored, accountID)
+		}
+	}
+	sort.Slice(accepted, func(i, j int) bool { return accepted[i] < accepted[j] })
+	sort.Slice(ignored, func(i, j int) bool { return ignored[i] < ignored[j] })
+	return accepted, ignored
 }
 
 func (e *Engine) Events(ctx context.Context, limit int) ([]model.Event, error) {
@@ -1345,6 +1377,18 @@ func (e *Engine) reconcileAdaptiveLoad(ctx context.Context, binding *model.Resol
 			BeforeState: formatLoadFactor(binding.Account.LoadFactor), AfterState: formatLoadFactor(desired),
 			Details: actionDetails(binding, control, message), Actor: "system", CreatedAt: now})
 	}
+	disposition, err := e.automaticLoadNoopDisposition(ctx, binding, *control, desired, now, restore)
+	if err != nil {
+		return err
+	}
+	if disposition == automaticLoadNoopRepairProjection {
+		if err := e.reconcileAutomaticLoadProjection(ctx, binding, control, desired, restore); err != nil {
+			return err
+		}
+	}
+	if disposition != automaticLoadNoopNone {
+		return e.recordDesiredAlreadyApplied(ctx, binding, *control, desired, now)
+	}
 	intent, safety, err := e.policyLoadIntent(ctx, binding, desired, reasonForAdaptiveLoad(restore))
 	if err != nil {
 		return err
@@ -1361,6 +1405,114 @@ func (e *Engine) reconcileAdaptiveLoad(ctx context.Context, binding *model.Resol
 		binding.Account.LoadFactor = cloneIntPointer(result.VerifiedAfter.LoadFactor)
 	}
 	return nil
+}
+
+type pendingOverrideTransitionChecker interface {
+	HasPendingAccountOverrideTransition(context.Context, int64, controlplane.Operation) (bool, error)
+}
+
+const (
+	automaticLoadNoopNone             = ""
+	automaticLoadNoopSuppress         = "suppress"
+	automaticLoadNoopRepairProjection = "repair_projection"
+)
+
+func (e *Engine) automaticLoadNoopDisposition(ctx context.Context, binding *model.ResolvedBinding,
+	control model.AccountControl, desired *int, now time.Time, restore bool) (string, error) {
+	if !sameLoadFactor(binding.Account.LoadFactor, desired) {
+		return automaticLoadNoopNone, nil
+	}
+	pending, err := e.store.ListPendingAccountMutations(ctx, 1000)
+	if err != nil {
+		return automaticLoadNoopNone, err
+	}
+	for _, mutation := range pending {
+		if mutation.AccountID == binding.Account.ID && mutation.Operation == controlplane.OperationSetAccountLoadFactor {
+			return automaticLoadNoopNone, nil
+		}
+	}
+	overrides, err := e.store.ListActiveAccountOverrides(ctx, binding.Account.ID,
+		controlplane.OperationSetAccountLoadFactor, now)
+	if err != nil {
+		return automaticLoadNoopNone, err
+	}
+	if len(overrides) > 0 {
+		return automaticLoadNoopNone, nil
+	}
+	checker, ok := e.store.(pendingOverrideTransitionChecker)
+	if !ok {
+		return automaticLoadNoopNone, nil
+	}
+	hasPending, err := checker.HasPendingAccountOverrideTransition(ctx, binding.Account.ID,
+		controlplane.OperationSetAccountLoadFactor)
+	if err != nil || hasPending {
+		return automaticLoadNoopNone, err
+	}
+	projectionMatches := sameLoadFactor(control.ExpectedLoadFactor, desired) && control.OwnsLoadFactor
+	if restore {
+		projectionMatches = sameLoadFactor(control.ExpectedLoadFactor, desired) && !control.OwnsLoadFactor &&
+			control.OriginalLoadFactor == nil && control.LoadPinValue == nil && control.LoadPinUntil == nil &&
+			control.LoadOverrideUntil == nil
+	}
+	if projectionMatches {
+		return automaticLoadNoopSuppress, nil
+	}
+	// A policy-owned projection already has the durable baseline needed to
+	// repair ExpectedLoadFactor. Restore can always clear ownership. Other
+	// ownership gaps cannot be inferred safely and must use the normal path.
+	if restore || control.OwnsLoadFactor {
+		return automaticLoadNoopRepairProjection, nil
+	}
+	return automaticLoadNoopNone, nil
+}
+
+func (e *Engine) reconcileAutomaticLoadProjection(ctx context.Context, binding *model.ResolvedBinding,
+	control *model.AccountControl, desired *int, restore bool) error {
+	control.ExpectedLoadFactor = cloneIntPointer(desired)
+	control.LastDecision = "projection_reconciled"
+	if restore {
+		control.OwnsLoadFactor = false
+		control.OriginalLoadFactor = nil
+		control.LoadStage = model.HealthStageHealthy
+		control.RecoveryStep = 0
+		control.RecoveryStartedAt = nil
+		control.LoadOverrideUntil = nil
+		control.LoadPinValue = nil
+		control.LoadPinUntil = nil
+		control.LoadPinOwner = ""
+		control.LoadPinReason = ""
+	}
+	if err := e.store.UpsertControl(ctx, *control); err != nil {
+		return err
+	}
+	binding.Control = *control
+	return nil
+}
+
+func (e *Engine) recordDesiredAlreadyApplied(ctx context.Context, binding *model.ResolvedBinding,
+	control model.AccountControl, desired *int, now time.Time) error {
+	monitorID := bindingMonitorID(binding)
+	accountID := binding.Account.ID
+	seed := fmt.Sprintf("desired_already_applied:%d:%s:%s", accountID, control.LoadStage, formatLoadFactor(desired))
+	digest := sha256.Sum256([]byte(seed))
+	snapshot := model.DecisionSnapshot{DecisionID: fmt.Sprintf("%x", digest[:]), MonitorID: monitorID, AccountID: &accountID,
+		CheckedAt: now, AvailabilityState: "no_change", LoadStage: control.LoadStage, Action: "no_change",
+		ActionResult: "desired_already_applied", ReasonCode: "desired_already_applied", CreatedAt: now}
+	event := model.Event{Type: "desired_already_applied", Severity: "info", MonitorID: monitorID, AccountID: &accountID,
+		Message: "自动策略目标已由上游和本地投影满足，未创建账号 Mutation", BeforeState: formatLoadFactor(desired),
+		AfterState: formatLoadFactor(desired), Actor: "system", CreatedAt: now}
+	inserted, err := e.store.CommitDecisionSnapshot(ctx, snapshot, &event)
+	if err == nil && inserted {
+		e.logEvent(event)
+	}
+	return err
+}
+
+func sameLoadFactor(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (e *Engine) reconcileExpiredLoadControl(ctx context.Context, binding *model.ResolvedBinding, control *model.AccountControl,

@@ -36,6 +36,15 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			created_by TEXT NOT NULL DEFAULT 'system',
 			deadline_at TEXT,
 			last_error TEXT NOT NULL DEFAULT '',
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT 5,
+			model_attempt_count INTEGER NOT NULL DEFAULT 0,
+			contract_failure_count INTEGER NOT NULL DEFAULT 0,
+			no_progress_count INTEGER NOT NULL DEFAULT 0,
+			last_error_class TEXT NOT NULL DEFAULT '',
+			last_error_at TEXT,
+			completed_with_warnings INTEGER NOT NULL DEFAULT 0,
+			dead_lettered_at TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			completed_at TEXT,
@@ -212,6 +221,15 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 		{table: "agent_goals", name: "lease_owner"},
 		{table: "agent_goals", name: "lease_until"},
 		{table: "agent_goals", name: "next_runnable_at"},
+		{table: "agent_goals", name: "attempt_count"},
+		{table: "agent_goals", name: "max_attempts"},
+		{table: "agent_goals", name: "model_attempt_count"},
+		{table: "agent_goals", name: "contract_failure_count"},
+		{table: "agent_goals", name: "no_progress_count"},
+		{table: "agent_goals", name: "last_error_class"},
+		{table: "agent_goals", name: "last_error_at"},
+		{table: "agent_goals", name: "completed_with_warnings"},
+		{table: "agent_goals", name: "dead_lettered_at"},
 		{table: "agent_scheduled_commands", name: "intent_type"},
 		{table: "agent_scheduled_commands", name: "resource_type"},
 		{table: "agent_scheduled_commands", name: "resource_ids_json"},
@@ -229,6 +247,12 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 			definition = "TEXT NOT NULL DEFAULT ''"
 		}
 		switch column.name {
+		case "attempt_count", "model_attempt_count", "contract_failure_count", "no_progress_count", "completed_with_warnings":
+			definition = "INTEGER NOT NULL DEFAULT 0"
+		case "max_attempts":
+			definition = "INTEGER NOT NULL DEFAULT 5"
+		case "last_error_class":
+			definition = "TEXT NOT NULL DEFAULT ''"
 		case "intent_type":
 			definition = "TEXT NOT NULL DEFAULT 'scheduled_action'"
 		case "resource_type", "operation", "occurrence_id", "authority":
@@ -247,6 +271,9 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 	if err := s.backfillAgentGoalLanes(ctx); err != nil {
 		return err
 	}
+	if err := s.quarantineLegacyContractFailureGoals(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_agent_goals_claim ON agent_goals(lane,status,priority DESC,created_at,id,next_runnable_at)`); err != nil {
 		return fmt.Errorf("create agent goal claim index: %w", err)
 	}
@@ -262,6 +289,17 @@ func (s *Store) migrateAgentV2(ctx context.Context) error {
 	now := formatTime(time.Now().UTC())
 	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO agent_freeze_states(scope_type,scope_id,mode,reason,actor,created_at,updated_at)
 		VALUES('global','',?,'','system',?,?)`, model.AgentFreezeModeActive, now, now)
+	return err
+}
+
+func (s *Store) quarantineLegacyContractFailureGoals(ctx context.Context) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET status=?,last_error_class=?,last_error_at=COALESCE(last_error_at,updated_at),
+		dead_lettered_at=COALESCE(dead_lettered_at,?),lease_owner='',lease_until=NULL,next_runnable_at=NULL,completed_at=COALESCE(completed_at,?),updated_at=?
+		WHERE status IN (?,?,?) AND last_error_class='' AND
+			(last_error LIKE '%最终结构化结论无效%' OR last_error LIKE '%cannot unmarshal%EvidenceRequest%')`,
+		model.AgentGoalStatusFailed, "model_contract_invalid", now, now, now,
+		model.AgentGoalStatusPlanned, model.AgentGoalStatusRunning, model.AgentGoalStatusWaiting)
 	return err
 }
 
@@ -499,6 +537,12 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 	if item.CreatedBy == "" {
 		item.CreatedBy = "system"
 	}
+	if item.MaxAttempts == 0 {
+		item.MaxAttempts = 5
+	}
+	if item.MaxAttempts < 1 || item.MaxAttempts > 20 {
+		return errors.New("agent goal max attempts must be between 1 and 20")
+	}
 	item.Context, err = normalizedJSON(item.Context)
 	if err != nil {
 		return err
@@ -512,11 +556,14 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 		item.CompletedAt = &now
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_goals(parent_goal_id,conversation_id,title,objective,status,lane,priority,
-		risk_level,source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,
-		lease_owner,lease_until,next_runnable_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective,
+		risk_level,source,context_json,plan_hash,created_by,deadline_at,last_error,attempt_count,max_attempts,model_attempt_count,
+		contract_failure_count,no_progress_count,last_error_class,last_error_at,completed_with_warnings,dead_lettered_at,
+		created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective,
 		item.Status, item.Lane, item.Priority, item.RiskLevel, item.Source, string(item.Context), item.PlanHash, item.CreatedBy,
-		formatOptionalTime(item.DeadlineAt), item.LastError, formatTime(item.CreatedAt), formatTime(item.UpdatedAt),
+		formatOptionalTime(item.DeadlineAt), item.LastError, item.AttemptCount, item.MaxAttempts, item.ModelAttemptCount,
+		item.ContractFailureCount, item.NoProgressCount, item.LastErrorClass, formatOptionalTime(item.LastErrorAt), boolInt(item.CompletedWithWarnings),
+		formatOptionalTime(item.DeadLetteredAt), formatTime(item.CreatedAt), formatTime(item.UpdatedAt),
 		formatOptionalTime(item.CompletedAt), item.LeaseOwner, formatOptionalTime(item.LeaseUntil), formatOptionalTime(item.NextRunnableAt))
 	if err != nil {
 		return err
@@ -527,7 +574,9 @@ func (s *Store) CreateAgentGoal(ctx context.Context, item *model.AgentGoal) erro
 
 func (s *Store) GetAgentGoal(ctx context.Context, id int64) (model.AgentGoal, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,
-		source,context_json,plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
+		source,context_json,plan_hash,created_by,deadline_at,last_error,attempt_count,max_attempts,model_attempt_count,
+		contract_failure_count,no_progress_count,last_error_class,last_error_at,completed_with_warnings,dead_lettered_at,
+		created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
 		FROM agent_goals WHERE id=?`, id)
 	return scanAgentGoal(row)
 }
@@ -538,6 +587,12 @@ func (s *Store) UpdateAgentGoal(ctx context.Context, item model.AgentGoal) error
 	}
 	if item.Priority < 1 || item.Priority > 100 {
 		return errors.New("agent goal priority must be between 1 and 100")
+	}
+	if item.MaxAttempts == 0 {
+		item.MaxAttempts = 5
+	}
+	if item.MaxAttempts < 1 || item.MaxAttempts > 20 {
+		return errors.New("agent goal max attempts must be between 1 and 20")
 	}
 	if item.Lane == "" {
 		item.Lane = agentGoalLane(item.Source, item.ConversationID)
@@ -567,10 +622,14 @@ func (s *Store) UpdateAgentGoal(ctx context.Context, item model.AgentGoal) error
 		item.LeaseOwner, item.LeaseUntil, item.NextRunnableAt = "", nil, nil
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE agent_goals SET parent_goal_id=?,conversation_id=?,title=?,objective=?,status=?,lane=?,
-		priority=?,risk_level=?,source=?,context_json=?,plan_hash=?,created_by=?,deadline_at=?,last_error=?,updated_at=?,completed_at=?,lease_owner=?,lease_until=?,next_runnable_at=?
+		priority=?,risk_level=?,source=?,context_json=?,plan_hash=?,created_by=?,deadline_at=?,last_error=?,attempt_count=?,max_attempts=?,
+		model_attempt_count=?,contract_failure_count=?,no_progress_count=?,last_error_class=?,last_error_at=?,completed_with_warnings=?,dead_lettered_at=?,
+		updated_at=?,completed_at=?,lease_owner=?,lease_until=?,next_runnable_at=?
 		WHERE id=?`, item.ParentGoalID, item.ConversationID, item.Title, item.Objective, item.Status, item.Lane, item.Priority,
 		item.RiskLevel, item.Source, string(item.Context), item.PlanHash, item.CreatedBy, formatOptionalTime(item.DeadlineAt),
-		item.LastError, formatTime(item.UpdatedAt), formatOptionalTime(item.CompletedAt), item.LeaseOwner, formatOptionalTime(item.LeaseUntil), formatOptionalTime(item.NextRunnableAt), item.ID)
+		item.LastError, item.AttemptCount, item.MaxAttempts, item.ModelAttemptCount, item.ContractFailureCount, item.NoProgressCount,
+		item.LastErrorClass, formatOptionalTime(item.LastErrorAt), boolInt(item.CompletedWithWarnings), formatOptionalTime(item.DeadLetteredAt),
+		formatTime(item.UpdatedAt), formatOptionalTime(item.CompletedAt), item.LeaseOwner, formatOptionalTime(item.LeaseUntil), formatOptionalTime(item.NextRunnableAt), item.ID)
 	if err != nil {
 		return err
 	}
@@ -586,7 +645,8 @@ func (s *Store) ListAgentGoals(ctx context.Context, status string, limit int) ([
 		limit = 100
 	}
 	query := `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,source,context_json,
-		plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at FROM agent_goals`
+		plan_hash,created_by,deadline_at,last_error,attempt_count,max_attempts,model_attempt_count,contract_failure_count,no_progress_count,
+		last_error_class,last_error_at,completed_with_warnings,dead_lettered_at,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at FROM agent_goals`
 	args := make([]any, 0, 2)
 	if status = strings.TrimSpace(status); status != "" {
 		if !validAgentGoalStatus(status) {
@@ -633,7 +693,8 @@ func (s *Store) ClaimAgentGoal(ctx context.Context, lane, worker string, now tim
 		return nil, err
 	}
 	query := `SELECT id,parent_goal_id,conversation_id,title,objective,status,lane,priority,risk_level,source,context_json,
-		plan_hash,created_by,deadline_at,last_error,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
+		plan_hash,created_by,deadline_at,last_error,attempt_count,max_attempts,model_attempt_count,contract_failure_count,no_progress_count,
+		last_error_class,last_error_at,completed_with_warnings,dead_lettered_at,created_at,updated_at,completed_at,lease_owner,lease_until,next_runnable_at
 		FROM agent_goals WHERE lane=? AND status=? AND (next_runnable_at IS NULL OR next_runnable_at<=?)
 		ORDER BY priority DESC,created_at,id LIMIT 1`
 	goal, err := scanAgentGoal(tx.QueryRowContext(ctx, query, lane, model.AgentGoalStatusPlanned, nowText))
@@ -685,10 +746,13 @@ func scanAgentGoal(scanner agentGoalScanner) (model.AgentGoal, error) {
 	var item model.AgentGoal
 	var parentID, conversationID sql.NullInt64
 	var contextJSON, createdAt, updatedAt string
-	var deadlineAt, completedAt, leaseUntil, nextRunnableAt sql.NullString
+	var deadlineAt, completedAt, leaseUntil, nextRunnableAt, lastErrorAt, deadLetteredAt sql.NullString
+	var completedWithWarnings int
 	err := scanner.Scan(&item.ID, &parentID, &conversationID, &item.Title, &item.Objective, &item.Status,
 		&item.Lane, &item.Priority, &item.RiskLevel, &item.Source, &contextJSON, &item.PlanHash, &item.CreatedBy,
-		&deadlineAt, &item.LastError, &createdAt, &updatedAt, &completedAt, &item.LeaseOwner, &leaseUntil, &nextRunnableAt)
+		&deadlineAt, &item.LastError, &item.AttemptCount, &item.MaxAttempts, &item.ModelAttemptCount, &item.ContractFailureCount,
+		&item.NoProgressCount, &item.LastErrorClass, &lastErrorAt, &completedWithWarnings, &deadLetteredAt,
+		&createdAt, &updatedAt, &completedAt, &item.LeaseOwner, &leaseUntil, &nextRunnableAt)
 	if err != nil {
 		return item, err
 	}
@@ -700,6 +764,11 @@ func scanAgentGoal(scanner agentGoalScanner) (model.AgentGoal, error) {
 	item.CompletedAt = parseNullableTime(completedAt)
 	item.LeaseUntil = parseNullableTime(leaseUntil)
 	item.NextRunnableAt = parseNullableTime(nextRunnableAt)
+	item.LastErrorAt = parseNullableTime(lastErrorAt)
+	item.DeadLetteredAt = parseNullableTime(deadLetteredAt)
+	item.CompletedWithWarnings = completedWithWarnings == 1
+	item.DeadLettered = item.DeadLetteredAt != nil
+	item.TerminalFailed = item.Status == model.AgentGoalStatusFailed
 	return item, nil
 }
 

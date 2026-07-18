@@ -13,21 +13,21 @@ import (
 	"github.com/hua226529-ctrl/sub2api-account-scheduler/internal/model"
 )
 
-var allowedActions = map[string]bool{
-	"pause_account": true, "resume_account": true, "set_load_factor": true,
-	"clear_flap_protection": true, "clear_manual_override": true, "trigger_reconcile": true,
-	"transition_token_group_tier": true, "update_score_policy": true, "activate_policy_version": true,
-}
-
-func (m *Manager) validateDecision(packet model.AnalysisPacket, decision ModelDecision) error {
+// ValidateRuntimeDecision is the single semantic gate for a model's final
+// decision. It is pure: validation cannot create a step, mutate state, or read
+// a newer snapshot than the immutable packet supplied by the caller.
+func ValidateRuntimeDecision(packet model.AnalysisPacket, goalContext runtimeGoalContext, decision ModelDecision) error {
 	if len(decision.EvidenceRequests) > 0 {
 		return errors.New("模型在最终结论中仍保留证据追查请求")
 	}
 	if decision.NoChange && len(decision.Actions) > 0 {
 		return errors.New("模型声明维持现状却同时返回了执行动作")
 	}
-	if len(decision.Actions) > 12 {
-		return errors.New("单次分析动作超过安全上限 12 个")
+	if len(decision.Actions) > 1 {
+		return errors.New("Runtime V2 单轮最终决策最多允许一个 fallback 动作")
+	}
+	if (goalContext.ChatIntent.ReadOnly || goalContext.ChatIntent.IntentType == ChatIntentAmbiguous) && len(decision.Actions) > 0 {
+		return errors.New("只读或含糊聊天意图不得包含执行动作")
 	}
 	accountIDs := make(map[int64]bool, len(packet.AccountCompactStates))
 	for _, account := range packet.AccountCompactStates {
@@ -36,7 +36,8 @@ func (m *Manager) validateDecision(packet model.AnalysisPacket, decision ModelDe
 	accountAction := make(map[int64]string)
 	groupTransitions := 0
 	for _, action := range decision.Actions {
-		if !allowedActions[action.Type] {
+		spec, ok := capabilitySpec(action.Type)
+		if !ok || !spec.Mutating {
 			return fmt.Errorf("模型返回未授权动作 %s", action.Type)
 		}
 		if len([]rune(strings.TrimSpace(action.Reason))) < 4 {
@@ -79,12 +80,69 @@ func (m *Manager) validateDecision(packet model.AnalysisPacket, decision ModelDe
 				return errors.New("令牌分组层级动作的置信度必须不低于 0.90")
 			}
 		}
-		if (action.Type == "update_score_policy" || action.Type == "activate_policy_version") && decision.Confidence < .80 {
+		if (action.Type == "propose_dispatch_policy" || action.Type == "update_dispatch_policy" || action.Type == "activate_policy_version") && decision.Confidence < .80 {
 			return fmt.Errorf("配置动作 %s 的置信度必须不低于 0.80", action.Type)
 		}
 		if len(action.Config) > 16*1024 {
 			return errors.New("评分策略配置超过 16KB 安全限制")
 		}
+		call, err := decisionActionToolCall(action, decision.Confidence)
+		if err != nil {
+			return fmt.Errorf("动作参数无法映射到能力: %w", err)
+		}
+		if spec.ExecutionPolicy.MaxScope > 0 && actionScopeCount(action) > spec.ExecutionPolicy.MaxScope {
+			return fmt.Errorf("动作 %s 超过能力最大作用域 %d", action.Type, spec.ExecutionPolicy.MaxScope)
+		}
+		if goalContext.ChatIntent.IntentType != "" {
+			if err := enforceChatIntentCapability(goalContext.ChatIntent, action.Type,
+				json.RawMessage(call.Function.Arguments), spec.Mutating); err != nil {
+				return fmt.Errorf("动作与聊天意图不匹配: %w", err)
+			}
+		}
+		if err := validateActionTTL(action, call, spec.ExecutionPolicy, packet.CutoffAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateDecision remains only as a source-compatible wrapper for older
+// callers and tests; all semantics live in ValidateRuntimeDecision.
+func (*Manager) validateDecision(packet model.AnalysisPacket, decision ModelDecision) error {
+	return ValidateRuntimeDecision(packet, runtimeGoalContext{}, decision)
+}
+
+func actionScopeCount(action AgentAction) int {
+	if action.AccountID > 0 || action.SourceID > 0 || action.ScopeID != "" || action.PolicyID > 0 {
+		return 1
+	}
+	return 0
+}
+
+func validateActionTTL(action AgentAction, call RuntimeToolCall, policy ExecutionPolicy, createdAt time.Time) error {
+	if policy.MaxTTLSeconds <= 0 {
+		return nil
+	}
+	var envelope struct {
+		ExpiresAt *time.Time `json:"expires_at"`
+		Until     *time.Time `json:"until"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &envelope); err != nil {
+		return fmt.Errorf("动作 %s TTL 参数无效", action.Type)
+	}
+	expiresAt := envelope.ExpiresAt
+	if expiresAt == nil {
+		expiresAt = envelope.Until
+	}
+	if expiresAt == nil {
+		return nil // The execution boundary applies DefaultTTL for autonomous actions.
+	}
+	if createdAt.IsZero() {
+		return fmt.Errorf("动作 %s 缺少可验证 TTL 的快照时间", action.Type)
+	}
+	ttl := expiresAt.Sub(createdAt.UTC())
+	if ttl <= 0 || ttl > time.Duration(policy.MaxTTLSeconds)*time.Second {
+		return fmt.Errorf("动作 %s TTL 超出能力上限", action.Type)
 	}
 	return nil
 }
@@ -92,7 +150,7 @@ func (m *Manager) validateDecision(packet model.AnalysisPacket, decision ModelDe
 func packetContainsGroupTarget(packet model.AnalysisPacket, sourceID int64, keyID, targetTier string) bool {
 	now := packet.CutoffAt
 	if now.IsZero() {
-		now = time.Now().UTC()
+		return false
 	}
 	for _, token := range packet.GroupFailoverTokens {
 		if token.SourceID != sourceID || token.KeyID != keyID {
@@ -346,6 +404,19 @@ func (m *Manager) createOutcomes(ctx context.Context, runID, toolCallID int64, a
 		item := model.DecisionOutcome{RunID: runID, ToolCallID: &toolCallID, AccountID: &action.AccountID,
 			PredictedSuccessRateDelta: action.Prediction.SuccessRateDelta, PredictedLatencyDeltaMS: action.Prediction.LatencyDeltaMS,
 			PredictedCostDelta: action.Prediction.CostDelta, EvaluateAt: time.Now().UTC().Add(delay), CreatedAt: time.Now().UTC()}
+		_ = m.store.AddDecisionOutcome(ctx, &item)
+	}
+}
+
+func (m *Manager) createRuntimeOutcomes(ctx context.Context, goalID, stepID, packetID int64, packetHash string, action AgentAction) {
+	if goalID <= 0 || stepID <= 0 || packetID <= 0 || strings.TrimSpace(packetHash) == "" || action.AccountID <= 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for _, delay := range []time.Duration{10 * time.Minute, 30 * time.Minute, 2 * time.Hour} {
+		item := model.DecisionOutcome{GoalID: goalID, StepID: stepID, PacketID: packetID, PacketHash: packetHash, AccountID: &action.AccountID,
+			PredictedSuccessRateDelta: action.Prediction.SuccessRateDelta, PredictedLatencyDeltaMS: action.Prediction.LatencyDeltaMS,
+			PredictedCostDelta: action.Prediction.CostDelta, EvaluateAt: now.Add(delay), CreatedAt: now}
 		_ = m.store.AddDecisionOutcome(ctx, &item)
 	}
 }

@@ -39,6 +39,10 @@ type MonitorAccountResolver interface {
 	AccountIDsForMonitors(...int64) []int64
 }
 
+type ReconcileTargetFilter interface {
+	FilterReconcileAccountIDs(...int64) (accepted []int64, ignored []int64)
+}
+
 type FailoverEvidenceProcessor interface {
 	ProcessFailoverEvidence(context.Context) error
 }
@@ -328,10 +332,19 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 			ids = append(ids, accountID)
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		if sourced, ok := m.requester.(sourcedReconcileRequester); ok {
-			sourced.RequestAccountsFrom("telemetry", ids...)
-		} else {
-			m.requester.RequestAccounts(ids...)
+		if filter, ok := m.resolver.(ReconcileTargetFilter); ok {
+			var ignored []int64
+			ids, ignored = filter.FilterReconcileAccountIDs(ids...)
+			if len(ignored) > 0 {
+				m.logger.Info("telemetry_unbound_targets_ignored", "count", len(ignored))
+			}
+		}
+		if len(ids) > 0 {
+			if sourced, ok := m.requester.(sourcedReconcileRequester); ok {
+				sourced.RequestAccountsFrom("telemetry", ids...)
+			} else {
+				m.requester.RequestAccounts(ids...)
+			}
 		}
 	}
 	if len(issues) > 0 {

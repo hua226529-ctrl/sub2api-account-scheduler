@@ -17,8 +17,14 @@ import (
 )
 
 const (
-	runtimeLease = 8 * time.Minute
-	commandLease = 2 * time.Minute
+	runtimeLease               = 8 * time.Minute
+	commandLease               = 2 * time.Minute
+	maxContractRepairAttempts  = 1
+	defaultGoalMaxAttempts     = 5
+	maxModelAttemptsPerGoal    = 16
+	maxProviderRetryDelay      = 30 * time.Second
+	emergencyAggregationWindow = time.Minute
+	maxActiveEmergencyGoals    = 20
 )
 
 type runtimeGoalContext struct {
@@ -32,6 +38,10 @@ type runtimeGoalContext struct {
 	LegacyAdministratorDirect bool       `json:"administrator_direct,omitempty"`
 	Cutoff                    *time.Time `json:"cutoff,omitempty"`
 	ReportDate                string     `json:"report_date,omitempty"`
+	EventType                 string     `json:"event_type,omitempty"`
+	ResourceScope             string     `json:"resource_scope,omitempty"`
+	AggregationWindow         string     `json:"aggregation_window,omitempty"`
+	AuditEventRefs            []int64    `json:"audit_event_refs,omitempty"`
 }
 
 type ChatReceipt struct {
@@ -149,7 +159,18 @@ func hashOpaqueToken(value string) string {
 }
 
 func (m *Manager) EnqueueAnalysisGoal(ctx context.Context, kind, trigger string, priority int) (model.AgentGoal, error) {
+	goalContext := runtimeGoalContext{Kind: kind, Trigger: trigger}
+	if kind == model.AgentRunEmergency {
+		goalContext.EventType = "computed_emergency"
+		goalContext.ResourceScope = "global"
+		goalContext.AggregationWindow = time.Now().UTC().Truncate(emergencyAggregationWindow).Format(time.RFC3339)
+	}
+	return m.enqueueAnalysisGoal(ctx, goalContext, trigger, priority)
+}
+
+func (m *Manager) enqueueAnalysisGoal(ctx context.Context, goalContext runtimeGoalContext, objective string, priority int) (model.AgentGoal, error) {
 	active := []string{model.AgentGoalStatusPlanned, model.AgentGoalStatusRunning, model.AgentGoalStatusWaiting}
+	activeEmergency := 0
 	for _, status := range active {
 		items, err := m.store.ListAgentGoals(ctx, status, 100)
 		if err != nil {
@@ -157,24 +178,76 @@ func (m *Manager) EnqueueAnalysisGoal(ctx context.Context, kind, trigger string,
 		}
 		for _, item := range items {
 			var existing runtimeGoalContext
-			if json.Unmarshal(item.Context, &existing) == nil && existing.Kind == kind &&
-				(existing.Trigger == trigger || kind == model.AgentRunEmergency) {
+			if json.Unmarshal(item.Context, &existing) != nil {
+				continue
+			}
+			if existing.Kind == model.AgentRunEmergency {
+				activeEmergency++
+			}
+			if existing.Kind == goalContext.Kind && sameRuntimeGoalDedupeKey(existing, goalContext) {
+				if goalContext.Kind == model.AgentRunEmergency && len(goalContext.AuditEventRefs) > 0 {
+					existing.AuditEventRefs = uniqueInt64s(append(existing.AuditEventRefs, goalContext.AuditEventRefs...))
+					item.Context = marshalRaw(existing)
+					item.Objective = emergencyObjective(existing.EventType, existing.ResourceScope, existing.AuditEventRefs)
+					_ = m.store.UpdateAgentGoal(ctx, item)
+				}
 				return item, nil
 			}
 		}
 	}
+	if goalContext.Kind == model.AgentRunEmergency && activeEmergency >= maxActiveEmergencyGoals {
+		m.appendRuntimeEvent(ctx, nil, nil, "emergency_goal_deferred", "warning", "system", map[string]any{
+			"event_type": goalContext.EventType, "resource_scope": goalContext.ResourceScope,
+			"active_emergency_goals": activeEmergency,
+		})
+		return model.AgentGoal{}, errors.New("active emergency goal limit reached; event deferred")
+	}
 	if priority < 1 {
 		priority = 50
 	}
-	contextPayload, _ := json.Marshal(runtimeGoalContext{Kind: kind, Trigger: trigger})
-	goal := model.AgentGoal{Title: trigger, Objective: trigger, Status: model.AgentGoalStatusPlanned, Priority: priority,
+	contextPayload, _ := json.Marshal(goalContext)
+	goal := model.AgentGoal{Title: goalContext.Trigger, Objective: objective, Status: model.AgentGoalStatusPlanned, Priority: priority,
 		Lane: model.AgentLaneBackground, RiskLevel: model.AgentRiskMedium, Source: "scheduler", Context: contextPayload, CreatedBy: "scheduler"}
 	if err := m.store.CreateAgentGoal(ctx, &goal); err != nil {
 		return goal, err
 	}
-	m.appendRuntimeEvent(ctx, &goal.ID, nil, "analysis_goal_created", "info", "scheduler", map[string]any{"kind": kind, "trigger": trigger})
+	m.appendRuntimeEvent(ctx, &goal.ID, nil, "analysis_goal_created", "info", "scheduler", map[string]any{
+		"kind": goalContext.Kind, "trigger": goalContext.Trigger, "event_type": goalContext.EventType,
+		"resource_scope": goalContext.ResourceScope, "audit_event_refs": goalContext.AuditEventRefs,
+	})
 	m.wakeLane(model.AgentLaneBackground)
 	return goal, nil
+}
+
+func sameRuntimeGoalDedupeKey(left, right runtimeGoalContext) bool {
+	if left.Kind != right.Kind {
+		return false
+	}
+	if left.Kind != model.AgentRunEmergency {
+		return left.Trigger == right.Trigger
+	}
+	return left.EventType == right.EventType && left.ResourceScope == right.ResourceScope &&
+		left.AggregationWindow == right.AggregationWindow
+}
+
+func uniqueInt64s(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func emergencyObjective(eventType, scope string, refs []int64) string {
+	return fmt.Sprintf("分析严重运行事件 type=%s scope=%s audit_event_ids=%v", eventType, scope, refs)
 }
 
 func (m *Manager) enqueueDailyGoal(ctx context.Context, reportDate string, cutoff time.Time) (model.AgentGoal, error) {
@@ -256,16 +329,41 @@ func (m *Manager) bridgeOperationalEvents(ctx context.Context) {
 		inserted, appendErr := m.store.AppendAgentEvent(ctx, &event)
 		if appendErr == nil && inserted && (item.Severity == "critical" || item.Severity == "error") {
 			settings, settingsErr := m.store.GetAgentSettings(ctx)
-			now := time.Now().UTC()
-			if settingsErr == nil && settings.Enabled &&
-				(settings.LastEmergencyAt == nil || now.Sub(settings.LastEmergencyAt.UTC()) >= time.Duration(settings.EmergencyCooldownMinutes)*time.Minute) {
-				trigger := fmt.Sprintf("严重运行事件：%s，账号 %d", item.Type, derefInt64(item.AccountID))
-				_, _ = m.EnqueueAnalysisGoal(ctx, model.AgentRunEmergency, trigger, 95)
+			if settingsErr == nil && settings.Enabled {
+				scope := m.operationalEventScope(item)
+				window := item.CreatedAt.UTC().Truncate(emergencyAggregationWindow).Format(time.RFC3339)
+				goalContext := runtimeGoalContext{Kind: model.AgentRunEmergency, Trigger: "严重运行事件", EventType: item.Type,
+					ResourceScope: scope, AggregationWindow: window, AuditEventRefs: []int64{item.ID}}
+				_, _ = m.enqueueAnalysisGoal(ctx, goalContext, emergencyObjective(item.Type, scope, []int64{item.ID}), 95)
 			} else {
 				m.wakeLane(model.AgentLaneBackground)
 			}
 		}
 	}
+}
+
+func (m *Manager) operationalEventScope(item model.Event) string {
+	if item.AccountID != nil && *item.AccountID > 0 {
+		return fmt.Sprintf("account:%d", *item.AccountID)
+	}
+	if item.MonitorID == nil || *item.MonitorID <= 0 {
+		return "global"
+	}
+	monitorID := *item.MonitorID
+	accounts := make(map[int64]struct{})
+	if m.engine != nil {
+		for _, binding := range m.engine.Snapshot().Bindings {
+			if binding.Monitor != nil && binding.Monitor.ID == monitorID && binding.Account.ID > 0 {
+				accounts[binding.Account.ID] = struct{}{}
+			}
+		}
+	}
+	if len(accounts) == 1 {
+		for accountID := range accounts {
+			return fmt.Sprintf("account:%d", accountID)
+		}
+	}
+	return fmt.Sprintf("monitor:%d", monitorID)
 }
 
 func (m *Manager) runtimeWorker(ctx context.Context, lane string) {
@@ -420,7 +518,14 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			return m.checkpointRuntimeYield(parent, &goal, &run, messages, sequence, lastFailure, failureCount,
 				"waiting", model.AgentGoalStatusWaiting, "goal_paused_by_freeze", freezeErr, false)
 		}
-		turn, provider, err := m.completeRuntimeTurn(leaseCtx, messages, lane)
+		remainingModelAttempts := maxModelAttemptsPerGoal - goal.ModelAttemptCount
+		if remainingModelAttempts <= 0 {
+			cause := newRuntimeError(runtimeErrorModelNoProgress, errors.New("目标已达到模型调用硬上限"))
+			m.finishRuntimeRun(parent, &run, "failed", cause)
+			return m.failGoalClass(parent, &goal, runtimeErrorModelNoProgress, cause, true)
+		}
+		turn, provider, modelAttempts, err := m.completeRuntimeTurn(leaseCtx, messages, lane, remainingModelAttempts)
+		goal.ModelAttemptCount += modelAttempts
 		if leaseCtx.Err() != nil {
 			return m.checkpointRuntimeYield(parent, &goal, &run, messages, sequence, lastFailure, failureCount,
 				"checkpointed", model.AgentGoalStatusPlanned, "goal_checkpointed",
@@ -435,12 +540,44 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 		}
 		if err != nil {
 			m.recordObservationModelError(parent, settings, err)
+			class := runtimeErrorClassOf(err)
+			if class == runtimeErrorModelContractInvalid {
+				if m.repairRuntimeContract(parent, &goal, err, &messages) {
+					_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
+					continue
+				}
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
+				m.finishRuntimeRun(parent, &run, "failed", err)
+				return m.failGoalClass(parent, &goal, class, err, true)
+			}
+			if runtimeErrorRetryable(class) {
+				m.finishRuntimeRun(parent, &run, "waiting", err)
+				return m.retryProviderGoal(parent, &goal, class, err)
+			}
 			_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
-			m.finishRuntimeRun(parent, &run, "waiting", err)
-			return m.waitGoal(parent, &goal, err)
+			m.finishRuntimeRun(parent, &run, "failed", err)
+			return m.failGoalClass(parent, &goal, class, err, true)
 		}
 		run.ProviderSlot, run.Model = provider.Slot, provider.Model
+		if err := m.store.UpdateAgentGoal(parent, goal); err != nil {
+			return err
+		}
+		if turn.Decision != nil {
+			if validationErr := ValidateRuntimeDecision(packet, goalContext, *turn.Decision); validationErr != nil {
+				contractErr := newRuntimeError(runtimeErrorModelContractInvalid, validationErr)
+				if m.repairRuntimeContract(parent, &goal, contractErr, &messages) {
+					_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
+					continue
+				}
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
+				m.finishRuntimeRun(parent, &run, "failed", contractErr)
+				return m.failGoalClass(parent, &goal, runtimeErrorModelContractInvalid, contractErr, true)
+			}
+		}
+		var fallbackAction *AgentAction
 		if len(turn.ToolCalls) == 0 && turn.Decision != nil && len(turn.Decision.Actions) > 0 {
+			action := turn.Decision.Actions[0]
+			fallbackAction = &action
 			call, mapErr := decisionActionToolCall(turn.Decision.Actions[0], turn.Decision.Confidence)
 			if mapErr != nil {
 				if settings.OptimizerMode == model.AgentOptimizerObserve {
@@ -490,12 +627,31 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 					"waiting", model.AgentGoalStatusWaiting, "goal_paused_by_freeze", freezeErr, false)
 			}
 			arguments := json.RawMessage(call.Function.Arguments)
-			fingerprint := call.Function.Name + ":" + string(arguments)
+			normalized, normalizeErr := normalizedArguments(arguments)
+			if normalizeErr != nil {
+				normalized = arguments
+			}
+			fingerprint := call.Function.Name + ":" + string(normalized)
 			if fingerprint == lastFailure && failureCount >= 2 {
+				goal.NoProgressCount++
 				blocked := CapabilityExecution{Capability: call.Function.Name, Status: "blocked", Message: "相同工具在相同状态下连续失败，禁止无意义重试；必须重新规划"}
 				payload, _ := json.Marshal(blocked)
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
-				m.appendRuntimeEvent(parent, &goal.ID, nil, "agent_no_progress", "warning", "agent", blocked)
+				m.appendRuntimeEvent(parent, &goal.ID, nil, "agent_no_progress", "error", "agent", blocked)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
+				cause := newRuntimeError(runtimeErrorModelNoProgress, errors.New(blocked.Message))
+				m.finishRuntimeRun(parent, &run, "failed", cause)
+				return m.failGoalClass(parent, &goal, runtimeErrorModelNoProgress, cause, true)
+			}
+			if fingerprint == lastFailure && failureCount == 1 {
+				failureCount = 2
+				goal.NoProgressCount++
+				blocked := CapabilityExecution{Capability: call.Function.Name, Status: "blocked", Message: "相同工具参数已失败；这是唯一一次 no-progress 修复提示，请改变计划或给出安全结论"}
+				payload, _ := json.Marshal(blocked)
+				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
+				m.appendRuntimeEvent(parent, &goal.ID, nil, "agent_no_progress_repair", "warning", "agent", blocked)
+				_ = m.store.UpdateAgentGoal(parent, goal)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, nil, messages, sequence, lastFailure, failureCount)
 				continue
 			}
 			sequence++
@@ -515,6 +671,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				payload, _ := json.Marshal(execution)
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "unauthorized_capability_blocked", "error", "agent", execution)
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
 				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
@@ -537,6 +694,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				payload, _ := json.Marshal(execution)
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "chat_intent_capability_blocked", "error", "system", execution)
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
 				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
@@ -564,6 +722,8 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 					payload, _ := json.Marshal(execution)
 					messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 					m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "reconciling_write_blocked", "error", "agent", execution)
+					recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
+					_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 					continue
 				}
 			}
@@ -575,6 +735,8 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "daily_write_blocked", "error", "agent", execution)
 				m.recordRuntimeObservation(parent, settings, 1, 0, 1, 1)
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
 			adminGrant, grantErr := m.administratorGrantForInvocation(goalContext.AdminIntent, call.Function.Name, arguments)
@@ -585,6 +747,8 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				payload, _ := json.Marshal(execution)
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "administrator_grant_blocked", "error", "system", execution)
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
 			dryRun, modeErr := capabilityExecutionMode(settings, goalContext, call.Function.Name, spec, adminGrant)
@@ -595,6 +759,8 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 				payload, _ := json.Marshal(execution)
 				messages = append(messages, RuntimeMessage{Role: "tool", ToolCallID: call.ID, Content: string(payload)})
 				m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "capability_mode_blocked", "error", "system", execution)
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
+				_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 				continue
 			}
 			actor := "agent:v2"
@@ -608,6 +774,7 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			}
 			invocation := CapabilityInvocation{Name: call.Function.Name, Arguments: arguments,
 				RunID: run.ID, GoalID: goal.ID, StepID: step.ID, Actor: actor, IdempotencyKey: step.IdempotencyKey,
+				PacketID: packet.ID, PacketHash: packet.Hash,
 				AdministratorGrant: adminGrant, DryRun: dryRun, CreatedAt: step.CreatedAt, ExpiresAt: expiresAt,
 				SnapshotVersion: fmt.Sprintf("analysis_packet:%d:%s", packet.ID, packet.Hash),
 				EvidenceRefs:    []string{fmt.Sprintf("analysis_packet:%d:%s", packet.ID, packet.Hash)}}
@@ -650,16 +817,20 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 					execution.Message = "外部写入结果不明确；仅允许回读核对，禁止自动重放"
 					step.Result = marshalRaw(execution)
 				}
-				if fingerprint == lastFailure {
-					failureCount++
-				} else {
-					lastFailure, failureCount = fingerprint, 1
-				}
+				recordRuntimeFailureFingerprint(fingerprint, &lastFailure, &failureCount)
 				if step.Status == model.AgentStepStatusReconciling {
 					failureCount = 2
 				}
+				if strings.Contains(execErr.Error(), "能力参数") {
+					goal.LastErrorClass = string(runtimeErrorModelToolArgumentsInvalid)
+					now := time.Now().UTC()
+					goal.LastErrorAt = &now
+				}
 			} else {
 				step.Status, lastFailure, failureCount = model.AgentStepStatusCompleted, "", 0
+				if fallbackAction != nil {
+					m.createRuntimeOutcomes(parent, goal.ID, step.ID, packet.ID, packet.Hash, *fallbackAction)
+				}
 			}
 			_ = m.store.UpdateAgentStep(parent, step)
 			m.appendRuntimeEvent(parent, &goal.ID, &step.ID, "capability_"+execution.Status, severityForExecution(execution), "agent", execution)
@@ -668,6 +839,8 @@ func (m *Manager) runRuntimeGoalLease(parent context.Context, goal model.AgentGo
 			_ = m.saveRuntimeCheckpoint(parent, goal.ID, &step.ID, messages, sequence, lastFailure, failureCount)
 			if step.Status == model.AgentStepStatusReconciling {
 				cause := errors.New("外部写入结果不明确，目标已暂停并等待只读核对")
+				now := time.Now().UTC()
+				goal.LastErrorClass, goal.LastErrorAt = string(runtimeErrorExternalMutationUncertain), &now
 				m.finishRuntimeRun(parent, &run, "waiting", cause)
 				return m.waitGoal(parent, &goal, cause)
 			}
@@ -737,7 +910,7 @@ func (m *Manager) runtimeMessages(ctx context.Context, goal model.AgentGoal, goa
 			}
 			for _, step := range steps {
 				if (step.Status == model.AgentStepStatusCompleted || step.Status == model.AgentStepStatusFailed) &&
-					step.UpdatedAt.After(checkpoint.CreatedAt) {
+					!step.UpdatedAt.Before(checkpoint.CreatedAt) {
 					state.Messages = append(state.Messages, RuntimeMessage{Role: "user", Content: fmt.Sprintf(
 						"只读核对已解析步骤 #%d：状态=%s，说明=%s，当前回读=%s。请基于该结果重新规划，禁止假定原写入仍待执行。",
 						step.ID, step.Status, step.LastError, truncateRunes(string(step.AfterState), 2000))})
@@ -798,16 +971,20 @@ func (m *Manager) recentRuntimeContext(ctx context.Context) json.RawMessage {
 		"memories": memories, "decision_outcomes": outcomes})
 }
 
-func (m *Manager) completeRuntimeTurn(ctx context.Context, messages []RuntimeMessage, lane string) (RuntimeTurn, model.AgentProvider, error) {
+func (m *Manager) completeRuntimeTurn(ctx context.Context, messages []RuntimeMessage, lane string, attemptBudget int) (RuntimeTurn, model.AgentProvider, int, error) {
+	if attemptBudget <= 0 {
+		return RuntimeTurn{}, model.AgentProvider{}, 0,
+			newRuntimeError(runtimeErrorModelNoProgress, errors.New("目标已达到模型调用硬上限"))
+	}
 	release, err := m.acquireModelSlot(ctx, lane)
 	if err != nil {
-		return RuntimeTurn{}, model.AgentProvider{}, err
+		return RuntimeTurn{}, model.AgentProvider{}, 0, err
 	}
 	if release == nil {
-		return m.completeRuntimeTurnWithoutSlot(ctx, messages)
+		return m.completeRuntimeTurnWithoutSlot(ctx, messages, attemptBudget)
 	}
 	defer release()
-	return m.completeRuntimeTurnWithoutSlot(ctx, messages)
+	return m.completeRuntimeTurnWithoutSlot(ctx, messages, attemptBudget)
 }
 
 func (m *Manager) acquireModelSlot(ctx context.Context, lane string) (func(), error) {
@@ -829,41 +1006,64 @@ func (m *Manager) acquireModelSlot(ctx context.Context, lane string) (func(), er
 	}
 }
 
-func (m *Manager) completeRuntimeTurnWithoutSlot(ctx context.Context, messages []RuntimeMessage) (RuntimeTurn, model.AgentProvider, error) {
+func (m *Manager) completeRuntimeTurnWithoutSlot(ctx context.Context, messages []RuntimeMessage, attemptBudget int) (RuntimeTurn, model.AgentProvider, int, error) {
 	providers, err := m.store.ListAgentProviders(ctx)
 	if err != nil {
-		return RuntimeTurn{}, model.AgentProvider{}, err
+		return RuntimeTurn{}, model.AgentProvider{}, 0, err
 	}
 	failures := make([]string, 0)
+	var classifiedFailure error
+	modelAttempts := 0
 	for _, provider := range providers {
 		if !provider.Enabled || provider.BaseURL == "" || provider.Model == "" || len(provider.CredentialCiphertext) == 0 {
 			continue
 		}
 		if m.box == nil {
-			failures = append(failures, provider.Slot+": 缺少模型凭据加密密钥")
+			failure := newRuntimeError(runtimeErrorProviderAuthFailed, errors.New("缺少模型凭据加密密钥"))
+			classifiedFailure = preferredRuntimeFailure(classifiedFailure, failure)
+			failures = append(failures, provider.Slot+": "+failure.Error())
 			continue
 		}
 		plaintext, decryptErr := m.box.Decrypt(provider.CredentialNonce, provider.CredentialCiphertext)
 		if decryptErr != nil {
-			failures = append(failures, provider.Slot+": 凭据解密失败")
+			failure := newRuntimeError(runtimeErrorProviderAuthFailed, errors.New("凭据解密失败"))
+			classifiedFailure = preferredRuntimeFailure(classifiedFailure, failure)
+			failures = append(failures, provider.Slot+": "+failure.Error())
 			continue
 		}
+		if modelAttempts >= attemptBudget {
+			break
+		}
+		modelAttempts++
 		turn, completeErr := m.client.CompleteRuntimeNative(ctx, provider, string(plaintext), messages, CapabilitySpecs())
 		if errors.Is(completeErr, errNativeToolsUnsupported) {
+			if modelAttempts >= attemptBudget {
+				return RuntimeTurn{}, model.AgentProvider{}, modelAttempts,
+					newRuntimeError(runtimeErrorModelNoProgress, errors.New("目标已达到模型调用硬上限，无法进入兼容模式"))
+			}
+			modelAttempts++
 			turn, completeErr = m.completeRuntimeFallback(ctx, provider, string(plaintext), messages)
 		}
 		if completeErr == nil {
 			now := time.Now().UTC()
-			_ = m.store.UpdateAgentProviderStatus(ctx, provider.Slot, "", &now)
-			return turn, provider, nil
+			_ = m.store.RecordAgentProviderSuccess(ctx, provider.Slot, now)
+			return turn, provider, modelAttempts, nil
 		}
-		_ = m.store.UpdateAgentProviderStatus(ctx, provider.Slot, completeErr.Error(), nil)
+		classifiedFailure = preferredRuntimeFailure(classifiedFailure, completeErr)
+		_ = m.store.RecordAgentProviderFailure(ctx, provider.Slot, string(runtimeErrorClassOf(completeErr)),
+			completeErr.Error(), time.Now().UTC())
 		failures = append(failures, provider.Slot+": "+completeErr.Error())
 	}
-	if len(failures) == 0 {
-		return RuntimeTurn{}, model.AgentProvider{}, errors.New("没有可用的主模型或备用模型")
+	if modelAttempts >= attemptBudget {
+		return RuntimeTurn{}, model.AgentProvider{}, modelAttempts,
+			newRuntimeError(runtimeErrorModelNoProgress, errors.New("目标已达到模型调用硬上限"))
 	}
-	return RuntimeTurn{}, model.AgentProvider{}, errors.New(strings.Join(failures, "; "))
+	if len(failures) == 0 {
+		return RuntimeTurn{}, model.AgentProvider{}, modelAttempts, newRuntimeError(runtimeErrorProviderAuthFailed,
+			errors.New("没有可用的主模型或备用模型"))
+	}
+	class := runtimeErrorClassOf(classifiedFailure)
+	return RuntimeTurn{}, model.AgentProvider{}, modelAttempts, newRuntimeError(class, errors.New(strings.Join(failures, "; ")))
 }
 
 func (m *Manager) completeRuntimeFallback(ctx context.Context, provider model.AgentProvider, apiKey string, messages []RuntimeMessage) (RuntimeTurn, error) {
@@ -932,6 +1132,7 @@ func (m *Manager) completeRuntimeGoal(ctx context.Context, goal *model.AgentGoal
 	run.ActionsJSON, _ = json.Marshal(decision.Actions)
 	run.Status, run.CompletedAt = "completed", &now
 	goal.Status, goal.CompletedAt, goal.LastError = model.AgentGoalStatusCompleted, &now, ""
+	goal.CompletedWithWarnings = goal.AttemptCount > 0 || goal.ContractFailureCount > 0 || goal.NoProgressCount > 0
 	if err := m.store.UpdateAgentGoal(ctx, *goal); err != nil {
 		return err
 	}
@@ -1020,9 +1221,85 @@ func (m *Manager) recordRuntimeObservation(ctx context.Context, settings model.A
 }
 
 func (m *Manager) failGoal(ctx context.Context, goal *model.AgentGoal, cause error) error {
-	goal.Status, goal.LastError = model.AgentGoalStatusFailed, truncateRunes(cause.Error(), 1000)
+	return m.failGoalClass(ctx, goal, runtimeErrorRuntimeInternal, cause, false)
+}
+
+func (m *Manager) repairRuntimeContract(ctx context.Context, goal *model.AgentGoal, cause error, messages *[]RuntimeMessage) bool {
+	now := time.Now().UTC()
+	goal.ContractFailureCount++
+	goal.LastErrorClass = string(runtimeErrorModelContractInvalid)
+	goal.LastErrorAt = &now
+	goal.LastError = truncateRunes(cause.Error(), 1000)
 	_ = m.store.UpdateAgentGoal(ctx, *goal)
-	m.appendRuntimeEvent(ctx, &goal.ID, nil, "goal_failed", "error", "agent", map[string]any{"reason": goal.LastError})
+	if goal.ContractFailureCount > maxContractRepairAttempts {
+		return false
+	}
+	*messages = append(*messages, RuntimeMessage{Role: "user", Content: "最终决策违反机器契约：" +
+		truncateRunes(cause.Error(), 600) + "。请严格按系统消息中的完整 JSON Schema 重新生成一次；不得输出 Markdown，不得在最终结论保留 evidence_requests。"})
+	m.appendRuntimeEvent(ctx, &goal.ID, nil, "model_contract_repair_requested", "warning", "agent",
+		map[string]any{"error_class": runtimeErrorModelContractInvalid, "attempt": goal.ContractFailureCount})
+	return true
+}
+
+func (m *Manager) retryProviderGoal(ctx context.Context, goal *model.AgentGoal, class runtimeErrorClass, cause error) error {
+	if goal.MaxAttempts <= 0 {
+		goal.MaxAttempts = defaultGoalMaxAttempts
+	}
+	goal.AttemptCount++
+	now := time.Now().UTC()
+	goal.LastErrorClass, goal.LastErrorAt, goal.LastError = string(class), &now, truncateRunes(cause.Error(), 1000)
+	if goal.AttemptCount >= goal.MaxAttempts {
+		return m.failGoalClass(ctx, goal, class, cause, true)
+	}
+	delay := providerRetryDelay(goal.ID, goal.AttemptCount)
+	next := now.Add(delay)
+	goal.Status, goal.NextRunnableAt = model.AgentGoalStatusPlanned, &next
+	_ = m.store.UpdateAgentGoal(ctx, *goal)
+	m.appendRuntimeEvent(ctx, &goal.ID, nil, "provider_retry_scheduled", "warning", "agent",
+		map[string]any{"error_class": class, "attempt": goal.AttemptCount, "max_attempts": goal.MaxAttempts, "delay_ms": delay.Milliseconds()})
+	return cause
+}
+
+func providerRetryDelay(goalID int64, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Second << min(attempt-1, 5)
+	if delay > maxProviderRetryDelay {
+		delay = maxProviderRetryDelay
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", goalID, attempt)))
+	jitter := time.Duration(int(hash[0])<<8|int(hash[1])) % (500 * time.Millisecond)
+	if delay+jitter > maxProviderRetryDelay {
+		return maxProviderRetryDelay
+	}
+	return delay + jitter
+}
+
+func recordRuntimeFailureFingerprint(fingerprint string, lastFailure *string, failureCount *int) {
+	if lastFailure == nil || failureCount == nil {
+		return
+	}
+	if fingerprint == *lastFailure {
+		*failureCount++
+		return
+	}
+	*lastFailure, *failureCount = fingerprint, 1
+}
+
+func (m *Manager) failGoalClass(ctx context.Context, goal *model.AgentGoal, class runtimeErrorClass, cause error, deadLetter bool) error {
+	if cause == nil {
+		cause = errors.New(string(class))
+	}
+	now := time.Now().UTC()
+	goal.Status, goal.LastError = model.AgentGoalStatusFailed, truncateRunes(cause.Error(), 1000)
+	goal.LastErrorClass, goal.LastErrorAt, goal.NextRunnableAt = string(class), &now, nil
+	if deadLetter {
+		goal.DeadLetteredAt = &now
+	}
+	_ = m.store.UpdateAgentGoal(ctx, *goal)
+	m.appendRuntimeEvent(ctx, &goal.ID, nil, "goal_failed", "error", "agent",
+		map[string]any{"reason": goal.LastError, "error_class": class, "dead_lettered": deadLetter})
 	return cause
 }
 

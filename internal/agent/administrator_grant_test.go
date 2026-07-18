@@ -158,7 +158,8 @@ func TestCharacterizationAdministratorGrantCannotBeConsumedByAnotherStep(t *test
 		administratorCommandHash("立即暂停account-example"), "immediate", "pause_account", arguments,
 		[]string{"account:298"}, "", nil, nil)
 	invocation := CapabilityInvocation{Name: "pause_account", Arguments: arguments, GoalID: 301, StepID: 401,
-		Actor: "administrator:agent", AdministratorGrant: grant}
+		Actor: "administrator:agent", AdministratorGrant: grant, CreatedAt: time.Now().UTC(),
+		SnapshotVersion: "packet:301", EvidenceRefs: []string{"packet:301"}}
 	if _, err := manager.ExecuteCapability(context.Background(), invocation); err != nil {
 		t.Fatalf("first exact administrator action failed: %v", err)
 	}

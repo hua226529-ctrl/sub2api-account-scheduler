@@ -96,13 +96,31 @@ func TestCharacterizationGroupFailoverPolicyVersionConfirmationAndIdempotentTran
 		t.Fatal(err)
 	}
 
-	request := model.GroupTierTransitionRequest{SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierBackup, IdempotencyKey: "transition-1", Actor: "web", Reason: "manual test", Manual: true}
+	request := model.GroupTierTransitionRequest{SourceID: source.ID, KeyID: "1", TargetTier: model.GroupTierBackup,
+		IdempotencyKey: "transition-1", Actor: "administrator:agent", Reason: "manual test", Manual: true,
+		PacketID: 303, PacketHash: "packet-hash", GoalID: 101, StepID: 202}
 	transition, err := manager.TransitionGroupTier(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if transition.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "backup" || writes.Load() != 1 {
+	if transition.Status != model.GroupTransitionApplied || currentGroup.Load().(string) != "backup" || writes.Load() != 1 ||
+		transition.RunID != 0 || transition.GoalID != 101 || transition.StepID != 202 ||
+		transition.PacketID != 303 || transition.PacketHash != "packet-hash" {
 		t.Fatalf("unexpected transition: %+v group=%s writes=%d", transition, currentGroup.Load(), writes.Load())
+	}
+	events, err := database.ListEvents(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var transitionAudit *model.Event
+	for index := range events {
+		if events[index].Type == "group_failover_transition_applied" {
+			transitionAudit = &events[index]
+			break
+		}
+	}
+	if transitionAudit == nil || transitionAudit.GoalID != 101 || transitionAudit.StepID != 202 {
+		t.Fatalf("V2 group audit provenance missing: %+v", transitionAudit)
 	}
 	repeated, err := manager.TransitionGroupTier(ctx, request)
 	if err != nil || repeated.ID != transition.ID || writes.Load() != 1 {

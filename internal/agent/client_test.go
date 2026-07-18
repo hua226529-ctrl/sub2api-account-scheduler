@@ -29,13 +29,11 @@ func TestCompletionClientParsesStructuredDecision(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		responseFormat, ok := payload["response_format"].(map[string]any)
-		if !ok || responseFormat["type"] != "json_object" {
+		if !ok || responseFormat["type"] != "json_schema" {
 			t.Errorf("response_format = %#v", payload["response_format"])
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"分析结果如下：\n` +
-			"```json\\n{\\\"summary\\\":\\\"系统稳定\\\",\\\"conclusion\\\":\\\"保持当前策略\\\",\\\"confidence\\\":1.2,\\\"no_change\\\":true,\\\"actions\\\":[],\\\"advice\\\":[\\\"继续观察\\\"],\\\"data_limitations\\\":[]}\\n```" +
-			`"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"系统稳定\",\"conclusion\":\"保持当前策略\",\"confidence\":1,\"no_change\":true,\"actions\":[],\"advice\":[\"继续观察\"],\"data_limitations\":[],\"evidence_requests\":[]}"}}]}`))
 	}))
 	defer server.Close()
 
@@ -49,7 +47,7 @@ func TestCompletionClientParsesStructuredDecision(t *testing.T) {
 		t.Fatalf("unexpected decision: %+v", decision)
 	}
 	if decision.Confidence != 1 {
-		t.Fatalf("confidence = %v, want clamped to 1", decision.Confidence)
+		t.Fatalf("confidence = %v, want 1", decision.Confidence)
 	}
 	if len(decision.Advice) != 1 || decision.Advice[0] != "继续观察" {
 		t.Fatalf("advice = %#v", decision.Advice)
@@ -75,10 +73,10 @@ func TestCompletionClientRetriesWithoutResponseFormatOnBadRequest(t *testing.T) 
 			_, _ = w.Write([]byte(`{"error":{"message":"response_format is unsupported"}}`))
 			return
 		}
-		if _, ok := payload["response_format"]; ok {
-			t.Errorf("fallback request still contains response_format: %#v", payload["response_format"])
+		if format, ok := payload["response_format"].(map[string]any); !ok || format["type"] != "json_object" {
+			t.Errorf("fallback request did not use json_object: %#v", payload["response_format"])
 		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"{\"summary\":\"兼容模式成功\",\"conclusion\":\"不调整\",\"confidence\":0.8,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[]}"}]}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"{\"summary\":\"兼容模式成功\",\"conclusion\":\"不调整\",\"confidence\":0.8,\"no_change\":true,\"actions\":[],\"advice\":[],\"data_limitations\":[],\"evidence_requests\":[]}"}]}}]}`))
 	}))
 	defer server.Close()
 
@@ -193,6 +191,19 @@ func TestDecisionValidationRejectsContradictionsAndUnknownTargets(t *testing.T) 
 		Type: "pause_account", AccountID: 999, Reason: "账号不在数据包中",
 	}}}); err == nil {
 		t.Fatal("action target outside the immutable packet should be rejected")
+	}
+}
+
+func TestDecisionValidationUsesCapabilityRegistryAsActionAuthority(t *testing.T) {
+	packet := model.AnalysisPacket{CutoffAt: testPacketTime()}
+	proposal := AgentAction{Type: "propose_dispatch_policy", ScopeType: "global", Config: json.RawMessage(`{"minimum_samples":10}`),
+		Reason: "使用当前证据创建低风险策略提案"}
+	if err := ValidateRuntimeDecision(packet, runtimeGoalContext{}, ModelDecision{Confidence: .8, Actions: []AgentAction{proposal}}); err != nil {
+		t.Fatalf("registered mutating capability was rejected: %v", err)
+	}
+	readOnly := AgentAction{Type: "get_system_snapshot", Reason: "尝试把只读工具伪装为最终动作"}
+	if err := ValidateRuntimeDecision(packet, runtimeGoalContext{}, ModelDecision{Confidence: 1, Actions: []AgentAction{readOnly}}); err == nil {
+		t.Fatal("read-only capability was accepted as a final action")
 	}
 }
 

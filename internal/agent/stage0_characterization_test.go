@@ -72,8 +72,8 @@ func TestInteractiveGoalDoesNotWaitForBackgroundLane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if goal.Status != model.AgentGoalStatusPlanned {
-		t.Fatalf("goal status after missing model provider = %q, want planned retry", goal.Status)
+	if goal.Status != model.AgentGoalStatusFailed || goal.LastErrorClass != string(runtimeErrorProviderAuthFailed) || !goal.DeadLettered {
+		t.Fatalf("goal after missing model provider did not fail closed: %+v", goal)
 	}
 }
 

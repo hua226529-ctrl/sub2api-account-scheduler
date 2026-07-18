@@ -19,7 +19,10 @@ func (s *Store) migrateAgent(ctx context.Context) error {
 			slot TEXT PRIMARY KEY, base_url TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
 			credential_nonce BLOB, credential_ciphertext BLOB, enabled INTEGER NOT NULL DEFAULT 0,
 			timeout_seconds INTEGER NOT NULL DEFAULT 90, max_output_tokens INTEGER NOT NULL DEFAULT 4096,
-			temperature REAL NOT NULL DEFAULT 0.1, last_validated_at TEXT, last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+			temperature REAL NOT NULL DEFAULT 0.1, last_validated_at TEXT, last_error TEXT NOT NULL DEFAULT '',
+			recent_error TEXT NOT NULL DEFAULT '',last_error_class TEXT NOT NULL DEFAULT '',last_error_at TEXT,
+			error_count_24h INTEGER NOT NULL DEFAULT 0,error_window_started_at TEXT,
+			consecutive_failure_count INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS agent_settings (
 			id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'observe',
@@ -76,7 +79,9 @@ func (s *Store) migrateAgent(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_score_policy_active ON score_policy_versions(scope_type,scope_id,status)`,
 		`CREATE TABLE IF NOT EXISTS decision_outcomes (
-			id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, tool_call_id INTEGER, account_id INTEGER,
+			id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL DEFAULT 0, goal_id INTEGER NOT NULL DEFAULT 0,
+			step_id INTEGER NOT NULL DEFAULT 0, packet_id INTEGER NOT NULL DEFAULT 0, packet_hash TEXT NOT NULL DEFAULT '',
+			tool_call_id INTEGER, account_id INTEGER,
 			predicted_success_rate_delta REAL NOT NULL DEFAULT 0, predicted_latency_delta_ms INTEGER NOT NULL DEFAULT 0,
 			predicted_cost_delta REAL NOT NULL DEFAULT 0, evaluate_at TEXT NOT NULL, actual_success_rate_delta REAL,
 			actual_latency_delta_ms INTEGER, actual_cost_delta REAL, verdict TEXT NOT NULL DEFAULT '', evaluated_at TEXT, created_at TEXT NOT NULL
@@ -101,7 +106,8 @@ func (s *Store) migrateAgent(ctx context.Context) error {
 		name       string
 		definition string
 	}{
-		{"base_version_id", "INTEGER"}, {"source_goal_id", "INTEGER"},
+		{"base_version_id", "INTEGER"}, {"source_goal_id", "INTEGER"}, {"source_step_id", "INTEGER"},
+		{"source_packet_id", "INTEGER"}, {"source_packet_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"patch_json", "TEXT NOT NULL DEFAULT '{}'"}, {"diff_json", "TEXT NOT NULL DEFAULT '{}'"},
 		{"simulation_json", "TEXT NOT NULL DEFAULT '{}'"}, {"risk_level", "TEXT NOT NULL DEFAULT 'high'"},
 		{"affected_accounts_json", "TEXT NOT NULL DEFAULT '[]'"}, {"approved_by", "TEXT NOT NULL DEFAULT ''"},
@@ -141,6 +147,26 @@ func (s *Store) migrateAgent(ctx context.Context) error {
 	}
 	for _, column := range []string{"observation_proposed_actions", "observation_executable_actions", "observation_violations", "observation_structure_errors"} {
 		if err := s.ensureColumn(ctx, "agent_settings", column, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name, definition string
+	}{{"goal_id", "INTEGER NOT NULL DEFAULT 0"}, {"step_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"packet_id", "INTEGER NOT NULL DEFAULT 0"}, {"packet_hash", "TEXT NOT NULL DEFAULT ''"}} {
+		if err := s.ensureColumn(ctx, "decision_outcomes", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name, definition string
+	}{
+		{"recent_error", "TEXT NOT NULL DEFAULT ''"}, {"last_error_class", "TEXT NOT NULL DEFAULT ''"},
+		{"last_error_at", "TEXT"}, {"error_count_24h", "INTEGER NOT NULL DEFAULT 0"},
+		{"error_window_started_at", "TEXT"},
+		{"consecutive_failure_count", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "agent_providers", column.name, column.definition); err != nil {
 			return err
 		}
 	}
@@ -221,18 +247,22 @@ func validOperatorMode(value string) bool {
 func (s *Store) GetAgentProvider(ctx context.Context, slot string) (model.AgentProvider, error) {
 	var item model.AgentProvider
 	var enabled int
-	var validated sql.NullString
+	var validated, lastErrorAt, errorWindowStartedAt sql.NullString
 	var updated string
 	err := s.db.QueryRowContext(ctx, `SELECT slot,base_url,model,credential_nonce,credential_ciphertext,enabled,timeout_seconds,
-		max_output_tokens,temperature,last_validated_at,last_error,updated_at FROM agent_providers WHERE slot=?`, slot).
+		max_output_tokens,temperature,last_validated_at,last_error,recent_error,last_error_class,last_error_at,error_count_24h,error_window_started_at,
+		consecutive_failure_count,updated_at FROM agent_providers WHERE slot=?`, slot).
 		Scan(&item.Slot, &item.BaseURL, &item.Model, &item.CredentialNonce, &item.CredentialCiphertext, &enabled,
-			&item.TimeoutSeconds, &item.MaxOutputTokens, &item.Temperature, &validated, &item.LastError, &updated)
+			&item.TimeoutSeconds, &item.MaxOutputTokens, &item.Temperature, &validated, &item.LastError, &item.RecentError,
+			&item.LastErrorClass, &lastErrorAt, &item.ErrorCount24h, &errorWindowStartedAt, &item.ConsecutiveFailures, &updated)
 	if err != nil {
 		return item, err
 	}
 	item.Enabled = enabled == 1
 	item.APIKeyConfigured = len(item.CredentialCiphertext) > 0
 	item.LastValidatedAt = parseNullableTime(validated)
+	item.LastErrorAt = parseNullableTime(lastErrorAt)
+	item.ErrorWindowStartedAt = parseNullableTime(errorWindowStartedAt)
 	item.UpdatedAt = parseTime(updated)
 	return item, nil
 }
@@ -265,13 +295,17 @@ func (s *Store) UpsertAgentProvider(ctx context.Context, item model.AgentProvide
 	}
 	item.UpdatedAt = time.Now().UTC()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_providers(slot,base_url,model,credential_nonce,credential_ciphertext,enabled,
-		timeout_seconds,max_output_tokens,temperature,last_validated_at,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		timeout_seconds,max_output_tokens,temperature,last_validated_at,last_error,recent_error,last_error_class,last_error_at,
+		error_count_24h,error_window_started_at,consecutive_failure_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(slot) DO UPDATE SET base_url=excluded.base_url,model=excluded.model,credential_nonce=excluded.credential_nonce,
 		credential_ciphertext=excluded.credential_ciphertext,enabled=excluded.enabled,timeout_seconds=excluded.timeout_seconds,
 		max_output_tokens=excluded.max_output_tokens,temperature=excluded.temperature,last_validated_at=excluded.last_validated_at,
-		last_error=excluded.last_error,updated_at=excluded.updated_at`, item.Slot, item.BaseURL, item.Model, item.CredentialNonce,
+		last_error=excluded.last_error,recent_error=excluded.recent_error,last_error_class=excluded.last_error_class,
+		last_error_at=excluded.last_error_at,error_count_24h=excluded.error_count_24h,error_window_started_at=excluded.error_window_started_at,
+		consecutive_failure_count=excluded.consecutive_failure_count,updated_at=excluded.updated_at`, item.Slot, item.BaseURL, item.Model, item.CredentialNonce,
 		item.CredentialCiphertext, boolInt(item.Enabled), item.TimeoutSeconds, item.MaxOutputTokens, item.Temperature,
-		formatOptionalTime(item.LastValidatedAt), item.LastError, formatTime(item.UpdatedAt))
+		formatOptionalTime(item.LastValidatedAt), item.LastError, item.RecentError, item.LastErrorClass, formatOptionalTime(item.LastErrorAt),
+		item.ErrorCount24h, formatOptionalTime(item.ErrorWindowStartedAt), item.ConsecutiveFailures, formatTime(item.UpdatedAt))
 	return err
 }
 
@@ -281,6 +315,31 @@ func (s *Store) UpdateAgentProviderStatus(ctx context.Context, slot, lastError s
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE agent_providers SET last_error=?,last_validated_at=COALESCE(?,last_validated_at),
 		updated_at=? WHERE slot=?`, lastError, formatOptionalTime(validatedAt), formatTime(time.Now().UTC()), slot)
+	return err
+}
+
+func (s *Store) RecordAgentProviderSuccess(ctx context.Context, slot string, at time.Time) error {
+	if slot != "primary" && slot != "fallback" {
+		return errors.New("invalid provider slot")
+	}
+	at = at.UTC()
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_providers SET last_error='',last_validated_at=?,
+		consecutive_failure_count=0,updated_at=? WHERE slot=?`, formatTime(at), formatTime(at), slot)
+	return err
+}
+
+func (s *Store) RecordAgentProviderFailure(ctx context.Context, slot, class, message string, at time.Time) error {
+	if slot != "primary" && slot != "fallback" {
+		return errors.New("invalid provider slot")
+	}
+	at = at.UTC()
+	cutoff := formatTime(at.Add(-24 * time.Hour))
+	_, err := s.db.ExecContext(ctx, `UPDATE agent_providers SET last_error=?,recent_error=?,last_error_class=?,last_error_at=?,
+		error_count_24h=CASE WHEN error_window_started_at IS NOT NULL AND error_window_started_at>=? THEN error_count_24h+1 ELSE 1 END,
+		error_window_started_at=CASE WHEN error_window_started_at IS NOT NULL AND error_window_started_at>=? THEN error_window_started_at ELSE ? END,
+		consecutive_failure_count=consecutive_failure_count+1,updated_at=? WHERE slot=?`,
+		strings.TrimSpace(message), strings.TrimSpace(message), strings.TrimSpace(class), formatTime(at), cutoff,
+		cutoff, formatTime(at), formatTime(at), slot)
 	return err
 }
 
@@ -631,15 +690,15 @@ func (s *Store) ListPolicyVersions(ctx context.Context, limit int) ([]model.Scor
 }
 
 func (s *Store) AddDecisionOutcome(ctx context.Context, item *model.DecisionOutcome) error {
-	if item == nil || item.RunID <= 0 || item.EvaluateAt.IsZero() {
+	if item == nil || (item.RunID <= 0 && (item.GoalID <= 0 || item.StepID <= 0)) || item.EvaluateAt.IsZero() {
 		return errors.New("invalid decision outcome")
 	}
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = time.Now().UTC()
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO decision_outcomes(run_id,tool_call_id,account_id,
+	result, err := s.db.ExecContext(ctx, `INSERT INTO decision_outcomes(run_id,goal_id,step_id,packet_id,packet_hash,tool_call_id,account_id,
 		predicted_success_rate_delta,predicted_latency_delta_ms,predicted_cost_delta,evaluate_at,created_at)
-		VALUES(?,?,?,?,?,?,?,?)`, item.RunID, item.ToolCallID, item.AccountID, item.PredictedSuccessRateDelta,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, item.RunID, item.GoalID, item.StepID, item.PacketID, item.PacketHash, item.ToolCallID, item.AccountID, item.PredictedSuccessRateDelta,
 		item.PredictedLatencyDeltaMS, item.PredictedCostDelta, formatTime(item.EvaluateAt), formatTime(item.CreatedAt))
 	if err != nil {
 		return err
@@ -652,7 +711,7 @@ func (s *Store) ListPendingDecisionOutcomes(ctx context.Context, until time.Time
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,run_id,tool_call_id,account_id,predicted_success_rate_delta,
+	rows, err := s.db.QueryContext(ctx, `SELECT id,run_id,goal_id,step_id,packet_id,packet_hash,tool_call_id,account_id,predicted_success_rate_delta,
 		predicted_latency_delta_ms,predicted_cost_delta,evaluate_at,created_at FROM decision_outcomes
 		WHERE evaluated_at IS NULL AND evaluate_at<=? ORDER BY evaluate_at LIMIT ?`, formatTime(until), limit)
 	if err != nil {
@@ -664,7 +723,7 @@ func (s *Store) ListPendingDecisionOutcomes(ctx context.Context, until time.Time
 		var item model.DecisionOutcome
 		var callID, accountID sql.NullInt64
 		var evaluateAt, createdAt string
-		if err := rows.Scan(&item.ID, &item.RunID, &callID, &accountID, &item.PredictedSuccessRateDelta,
+		if err := rows.Scan(&item.ID, &item.RunID, &item.GoalID, &item.StepID, &item.PacketID, &item.PacketHash, &callID, &accountID, &item.PredictedSuccessRateDelta,
 			&item.PredictedLatencyDeltaMS, &item.PredictedCostDelta, &evaluateAt, &createdAt); err != nil {
 			return nil, err
 		}
@@ -686,7 +745,7 @@ func (s *Store) ListRecentDecisionOutcomes(ctx context.Context, limit int) ([]mo
 	if limit < 1 || limit > 500 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,run_id,tool_call_id,account_id,predicted_success_rate_delta,
+	rows, err := s.db.QueryContext(ctx, `SELECT id,run_id,goal_id,step_id,packet_id,packet_hash,tool_call_id,account_id,predicted_success_rate_delta,
 		predicted_latency_delta_ms,predicted_cost_delta,evaluate_at,actual_success_rate_delta,
 		actual_latency_delta_ms,actual_cost_delta,verdict,evaluated_at,created_at FROM decision_outcomes
 		ORDER BY id DESC LIMIT ?`, limit)
@@ -702,7 +761,7 @@ func (s *Store) ListRecentDecisionOutcomes(ctx context.Context, limit int) ([]mo
 		var latency sql.NullInt64
 		var evaluateAt, createdAt string
 		var evaluatedAt sql.NullString
-		if err := rows.Scan(&item.ID, &item.RunID, &callID, &accountID, &item.PredictedSuccessRateDelta,
+		if err := rows.Scan(&item.ID, &item.RunID, &item.GoalID, &item.StepID, &item.PacketID, &item.PacketHash, &callID, &accountID, &item.PredictedSuccessRateDelta,
 			&item.PredictedLatencyDeltaMS, &item.PredictedCostDelta, &evaluateAt, &success, &latency, &cost,
 			&item.Verdict, &evaluatedAt, &createdAt); err != nil {
 			return nil, err

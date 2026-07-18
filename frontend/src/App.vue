@@ -495,6 +495,14 @@ function agentGoalStatusLabel(status?: string) {
   return ({ pending: "待规划", planned: "待规划", planning: "规划中", queued: "排队中", running: "执行中", waiting: "等待条件", checkpointed: "已保存检查点", blocked: "已阻塞", completed: "已完成", failed: "失败", cancelled: "已取消", canceled: "已取消", interrupted: "已中断", expired: "已过期" } as Record<string, string>)[status ?? ""] ?? status ?? "未知";
 }
 
+function agentGoalCompletionLabel(goal?: AgentGoal) {
+  if (!goal) return agentGoalStatusLabel();
+  if (goal.dead_lettered) return "失败（已隔离）";
+  if (goal.terminal_failed) return "终态失败";
+  if (goal.status === "completed") return goal.completed_with_warnings || goal.model_attempt_count > 1 ? "已完成（有重试）" : "已完成（干净）";
+  return agentGoalStatusLabel(goal.status);
+}
+
 function agentStepStatusLabel(status?: string) {
   return ({ pending: "待执行", scheduled: "等待到期", queued: "排队中", leased: "已领取", running: "执行中", verifying: "回读确认中", reconciling: "结果核对中", compensating: "正在补偿", waiting: "等待条件", completed: "已完成", compensated: "已补偿", failed: "失败", skipped: "已跳过", blocked: "已阻塞", cancelled: "已取消", expired: "已过期" } as Record<string, string>)[status ?? ""] ?? status ?? "未知";
 }
@@ -1315,9 +1323,9 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
 
       <div class="agent-runtime-grid">
         <section class="agent-goal-panel">
-          <div class="section-heading"><div><h2>当前目标与步骤</h2><p>目标 #{{ activeAgentGoal?.id ?? '--' }} · {{ activeAgentGoal?.source || '等待任务' }}</p></div><span :class="['agent-run-state', activeAgentGoal?.status]">{{ agentGoalStatusLabel(activeAgentGoal?.status) }}</span></div>
+          <div class="section-heading"><div><h2>当前目标与步骤</h2><p>目标 #{{ activeAgentGoal?.id ?? '--' }} · {{ activeAgentGoal?.source || '等待任务' }}</p></div><span :class="['agent-run-state', activeAgentGoal?.status]">{{ agentGoalCompletionLabel(activeAgentGoal) }}</span></div>
           <div v-if="activeAgentGoal" class="goal-summary">
-            <div class="goal-mark"><Target :size="19" /></div><div><strong>{{ activeAgentGoal.title }}</strong><p>{{ activeAgentGoal.objective }}</p><small>优先级 {{ activeAgentGoal.priority }} · 风险 {{ activeAgentGoal.risk_level || '未标记' }}<template v-if="activeAgentGoal.deadline_at"> · 截止 {{ formatTime(activeAgentGoal.deadline_at) }}</template></small></div>
+            <div class="goal-mark"><Target :size="19" /></div><div><strong>{{ activeAgentGoal.title }}</strong><p>{{ activeAgentGoal.objective }}</p><small>优先级 {{ activeAgentGoal.priority }} · 风险 {{ activeAgentGoal.risk_level || '未标记' }} · 模型尝试 {{ activeAgentGoal.model_attempt_count ?? 0 }} · 契约失败 {{ activeAgentGoal.contract_failure_count ?? 0 }} · 无进展 {{ activeAgentGoal.no_progress_count ?? 0 }}<template v-if="activeAgentGoal.last_error_class"> · {{ activeAgentGoal.last_error_class }}</template><template v-if="activeAgentGoal.deadline_at"> · 截止 {{ formatTime(activeAgentGoal.deadline_at) }}</template></small></div>
           </div>
           <div v-else class="agent-empty compact"><Target :size="20" /><span>暂无活动目标</span></div>
           <ol v-if="activeAgentSteps.length" class="goal-step-list">
@@ -1602,6 +1610,7 @@ function showToast(message: string) { toast.value = message; window.setTimeout((
           <label class="toggle-row"><input v-model="agentProviderForm.enabled" type="checkbox" />启用这个模型</label>
         </div>
         <div :class="['connection-state', agentProviderValidated ? 'success' : 'neutral']"><Check v-if="agentProviderValidated" :size="17" /><AlertTriangle v-else :size="17" />{{ agentProviderValidated ? '连接、鉴权和结构化输出均已验证' : '保存前会调用一次模型验证结构化输出能力' }}</div>
+        <div v-if="selectedAgentProvider?.last_error_at" class="connection-state neutral"><AlertTriangle :size="17" />最近错误 {{ selectedAgentProvider.last_error_class || 'provider_error' }} · {{ formatTime(selectedAgentProvider.last_error_at) }} · 24 小时 {{ selectedAgentProvider.error_count_24h ?? 0 }} 次</div>
         <footer><button class="secondary-button" @click="testAgentProvider"><RefreshCw :size="16" />测试模型</button><span class="footer-spacer"></span><button class="secondary-button" @click="modal = null">取消</button><button class="primary-button inline" @click="persistAgentProvider"><Save :size="16" />加密保存</button></footer>
       </section>
 

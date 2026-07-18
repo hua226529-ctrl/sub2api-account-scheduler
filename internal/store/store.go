@@ -179,6 +179,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			goal_id INTEGER NOT NULL DEFAULT 0,
+			step_id INTEGER NOT NULL DEFAULT 0,
 			type TEXT NOT NULL,
 			severity TEXT NOT NULL,
 			monitor_id INTEGER,
@@ -344,7 +346,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			snapshot_version TEXT NOT NULL DEFAULT '',
 			trigger TEXT NOT NULL DEFAULT '',
 			packet_id INTEGER NOT NULL DEFAULT 0,
+			packet_hash TEXT NOT NULL DEFAULT '',
 			run_id INTEGER NOT NULL DEFAULT 0,
+			goal_id INTEGER NOT NULL DEFAULT 0,
+			step_id INTEGER NOT NULL DEFAULT 0,
 			dry_run INTEGER NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT '',
 			attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -438,6 +443,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			reason TEXT NOT NULL,
 			policy_version TEXT NOT NULL DEFAULT '',
 			snapshot_version TEXT NOT NULL DEFAULT '',
+			run_id INTEGER NOT NULL DEFAULT 0,
+			goal_id INTEGER NOT NULL DEFAULT 0,
+			step_id INTEGER NOT NULL DEFAULT 0,
 			expires_at TEXT,
 			status TEXT NOT NULL,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -471,6 +479,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"account_policies", "flap_enabled", "INTEGER"},
 		{"account_overrides", "override_kind", "TEXT NOT NULL DEFAULT 'temporary'"},
 		{"account_mutations", "winning_override_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"account_mutations", "run_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"account_mutations", "goal_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"account_mutations", "step_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"account_policies", "flap_window_minutes", "INTEGER"},
 		{"account_policies", "flap_pause_threshold", "INTEGER"},
 		{"account_policies", "flap_recovery_threshold", "INTEGER"},
@@ -555,6 +566,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"account_policies", "persistent_slow_rate", "INTEGER"},
 		{"account_policies", "score_policy_source", "TEXT NOT NULL DEFAULT ''"},
 		{"account_policies", "score_policy_version_id", "INTEGER"},
+		{"upstream_group_transitions", "goal_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_transitions", "step_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_group_transitions", "packet_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"events", "goal_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"events", "step_id", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, column := range columns {
 		if err := s.ensureColumn(ctx, column.table, column.name, column.definition); err != nil {
@@ -1212,8 +1228,8 @@ type sqlExecer interface {
 }
 
 func insertEvent(ctx context.Context, exec sqlExecer, event model.Event) (sql.Result, error) {
-	return exec.ExecContext(ctx, `INSERT INTO events(type,severity,monitor_id,account_id,message,before_state,after_state,details,actor,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		event.Type, event.Severity, event.MonitorID, event.AccountID, event.Message, event.BeforeState, event.AfterState, event.Details, event.Actor, formatTime(event.CreatedAt))
+	return exec.ExecContext(ctx, `INSERT INTO events(goal_id,step_id,type,severity,monitor_id,account_id,message,before_state,after_state,details,actor,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		event.GoalID, event.StepID, event.Type, event.Severity, event.MonitorID, event.AccountID, event.Message, event.BeforeState, event.AfterState, event.Details, event.Actor, formatTime(event.CreatedAt))
 }
 
 func upsertControl(ctx context.Context, exec sqlExecer, control model.AccountControl) error {
@@ -1303,7 +1319,7 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]model.Event, error
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,type,severity,monitor_id,account_id,message,before_state,after_state,details,actor,created_at FROM events ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,goal_id,step_id,type,severity,monitor_id,account_id,message,before_state,after_state,details,actor,created_at FROM events ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1313,7 +1329,7 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]model.Event, error
 		var item model.Event
 		var monitorID, accountID sql.NullInt64
 		var created string
-		if err := rows.Scan(&item.ID, &item.Type, &item.Severity, &monitorID, &accountID, &item.Message, &item.BeforeState, &item.AfterState, &item.Details, &item.Actor, &created); err != nil {
+		if err := rows.Scan(&item.ID, &item.GoalID, &item.StepID, &item.Type, &item.Severity, &monitorID, &accountID, &item.Message, &item.BeforeState, &item.AfterState, &item.Details, &item.Actor, &created); err != nil {
 			return nil, err
 		}
 		item.MonitorID = nullInt64Pointer(monitorID)

@@ -53,6 +53,23 @@ type telemetryResolverFake struct{ accountID int64 }
 
 func (f telemetryResolverFake) AccountIDsForMonitors(...int64) []int64 { return []int64{f.accountID} }
 
+type filteringTelemetryResolverFake struct {
+	accepted map[int64]bool
+}
+
+func (f filteringTelemetryResolverFake) AccountIDsForMonitors(...int64) []int64 { return nil }
+func (f filteringTelemetryResolverFake) FilterReconcileAccountIDs(ids ...int64) ([]int64, []int64) {
+	accepted, ignored := make([]int64, 0), make([]int64, 0)
+	for _, id := range ids {
+		if f.accepted[id] {
+			accepted = append(accepted, id)
+		} else {
+			ignored = append(ignored, id)
+		}
+	}
+	return accepted, ignored
+}
+
 type telemetryPassFake struct{ started chan time.Time }
 
 func (f *telemetryPassFake) ReconcileFull(context.Context) error {
@@ -184,6 +201,39 @@ func TestTelemetryRequestsOnlyAccountsWithNewCommittedTraffic(t *testing.T) {
 	case ids := <-requester.accounts:
 		t.Fatalf("duplicate telemetry unexpectedly requested accounts: %#v", ids)
 	default:
+	}
+}
+
+func TestTelemetryFiltersUnboundTargetedAccountsAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"), model.Settings{
+		FailureThreshold: 3, RecoveryThreshold: 3, ManualHoldMinutes: 10,
+		FlapWindowMinutes: 60, FlapPauseThreshold: 3, FlapRecoveryThreshold: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now().UTC().Add(-time.Minute)
+	api := &fakeTelemetryAPI{monitor: model.Monitor{ID: 2, PrimaryModel: "gpt"},
+		success: []model.TrafficSuccess{
+			{EventKey: "bound-request", AccountID: 225, Model: "gpt", CreatedAt: now},
+			{EventKey: "unbound-oauth-request", AccountID: 295, Model: "gpt", CreatedAt: now},
+		}}
+	requester := &reconcileRequestFake{accounts: make(chan []int64, 1)}
+	resolver := filteringTelemetryResolverFake{accepted: map[int64]bool{225: true}}
+	manager := NewManager(api, database, 2*time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithReconcileRequester(requester), WithMonitorAccountResolver(resolver))
+	if err := manager.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ids := <-requester.accounts:
+		if len(ids) != 1 || ids[0] != 225 {
+			t.Fatalf("unbound account reached targeted reconcile: %#v", ids)
+		}
+	default:
+		t.Fatal("valid bound account was not requested")
 	}
 }
 

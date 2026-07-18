@@ -48,11 +48,13 @@ func (s *Store) CreatePolicyProposal(ctx context.Context, item *model.ScorePolic
 	}
 	diff, simulation, affected := normalizedPolicyLifecycleJSON(item)
 	result, err := tx.ExecContext(ctx, `INSERT INTO score_policy_versions(scope_type,scope_id,version,status,config_json,reason,
-		agent_run_id,created_by,activated_at,created_at,base_version_id,source_goal_id,patch_json,diff_json,simulation_json,
+		agent_run_id,created_by,activated_at,created_at,base_version_id,source_goal_id,source_step_id,source_packet_id,
+		source_packet_hash,patch_json,diff_json,simulation_json,
 		risk_level,affected_accounts_json,approved_by,previous_active_version_id,rollback_reason,outcome_summary,
-		idempotency_key,semantic_hash,auto_rollback_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		idempotency_key,semantic_hash,auto_rollback_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		item.ScopeType, item.ScopeID, item.Version, item.Status, string(item.Config), item.Reason, item.AgentRunID,
 		item.CreatedBy, formatOptionalTime(item.ActivatedAt), formatTime(item.CreatedAt), item.BaseVersionID, item.SourceGoalID,
+		item.SourceStepID, item.SourcePacketID, item.SourcePacketHash,
 		string(item.Patch), diff, simulation, item.RiskLevel, affected, item.ApprovedBy, item.PreviousActiveVersionID,
 		item.RollbackReason, item.OutcomeSummary, item.IdempotencyKey, item.SemanticHash, item.AutoRollbackCount)
 	if err != nil {
@@ -131,7 +133,8 @@ func (s *Store) findPolicyByIdempotency(ctx context.Context, key string) (model.
 }
 
 const policyLifecycleSelect = `SELECT id,scope_type,scope_id,version,status,config_json,patch_json,diff_json,
-	simulation_json,risk_level,affected_accounts_json,reason,agent_run_id,source_goal_id,base_version_id,
+	simulation_json,risk_level,affected_accounts_json,reason,agent_run_id,source_goal_id,source_step_id,source_packet_id,
+	source_packet_hash,base_version_id,
 	previous_active_version_id,created_by,approved_by,idempotency_key,semantic_hash,rollback_reason,outcome_summary,
 	auto_rollback_count,activated_at,created_at FROM score_policy_versions`
 
@@ -142,10 +145,11 @@ type policyScanner interface {
 func scanPolicyLifecycle(scanner policyScanner) (model.ScorePolicyVersion, error) {
 	var item model.ScorePolicyVersion
 	var config, patch, diff, simulation, affected, created string
-	var runID, goalID, baseID, previousID sql.NullInt64
+	var runID, goalID, stepID, packetID, baseID, previousID sql.NullInt64
 	var activated sql.NullString
 	err := scanner.Scan(&item.ID, &item.ScopeType, &item.ScopeID, &item.Version, &item.Status, &config, &patch, &diff,
-		&simulation, &item.RiskLevel, &affected, &item.Reason, &runID, &goalID, &baseID, &previousID,
+		&simulation, &item.RiskLevel, &affected, &item.Reason, &runID, &goalID, &stepID, &packetID,
+		&item.SourcePacketHash, &baseID, &previousID,
 		&item.CreatedBy, &item.ApprovedBy, &item.IdempotencyKey, &item.SemanticHash, &item.RollbackReason,
 		&item.OutcomeSummary, &item.AutoRollbackCount, &activated, &created)
 	if err != nil {
@@ -154,7 +158,8 @@ func scanPolicyLifecycle(scanner policyScanner) (model.ScorePolicyVersion, error
 	item.Config, item.Patch, item.Diff = json.RawMessage(config), json.RawMessage(patch), json.RawMessage(diff)
 	_ = json.Unmarshal([]byte(simulation), &item.Simulation)
 	_ = json.Unmarshal([]byte(affected), &item.AffectedAccountIDs)
-	item.AgentRunID, item.SourceGoalID, item.BaseVersionID = nullableInt64(runID), nullableInt64(goalID), nullableInt64(baseID)
+	item.AgentRunID, item.SourceGoalID, item.SourceStepID = nullableInt64(runID), nullableInt64(goalID), nullableInt64(stepID)
+	item.SourcePacketID, item.BaseVersionID = nullableInt64(packetID), nullableInt64(baseID)
 	item.PreviousActiveVersionID = nullableInt64(previousID)
 	item.ActivatedAt, item.CreatedAt = parseNullableTime(activated), parseTime(created)
 	return item, nil

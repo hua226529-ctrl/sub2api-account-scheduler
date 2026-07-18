@@ -183,6 +183,8 @@ func (s *Service) submitLocked(ctx context.Context, submission Submission, queue
 	if err != nil {
 		return Result{}, err
 	}
+	commandContext := CommandContextFrom(ctx)
+	mutation.RunID, mutation.GoalID, mutation.StepID = commandContext.RunID, commandContext.GoalID, commandContext.StepID
 	var pendingOverride *Override
 	if submission.PersistOverride {
 		overrideID, idErr := s.idGenerator()
@@ -382,6 +384,7 @@ func (s *Service) finishWithoutWrite(ctx context.Context, submission Submission,
 	if event.Type == "" {
 		event = defaultEvent(mutation, status, reason, now)
 	}
+	event.GoalID, event.StepID = mutation.GoalID, mutation.StepID
 	finalErr := s.repository.FinalizeAccountMutation(ctx, Finalization{
 		Mutation: mutation, Event: event, OverrideStatus: overrideStatus,
 	})
@@ -430,6 +433,7 @@ func (s *Service) finalize(ctx context.Context, submission Submission, mutation 
 		event.Message = "账号实际状态已满足仲裁结果，未调用写接口"
 	}
 	event.AccountID = &mutation.AccountID
+	event.GoalID, event.StepID = mutation.GoalID, mutation.StepID
 	event.Actor = mutation.Actor
 	event.CreatedAt = now
 	event.BeforeState = formatState(mutation.Before)

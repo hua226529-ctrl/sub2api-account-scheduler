@@ -60,6 +60,10 @@ func TestAccountControlMigrationBackfillsManualAndDisablesLegacyAgent(t *testing
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	var eventProvenanceColumns int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('events') WHERE name IN ('goal_id','step_id')`).Scan(&eventProvenanceColumns); err != nil || eventProvenanceColumns != 2 {
+		t.Fatalf("event provenance migration missing: count=%d err=%v", eventProvenanceColumns, err)
+	}
 	manual, err := database.FindActiveAccountOverride(ctx, 101, controlplane.OperationSetAccountSchedulable,
 		controlplane.AuthorityManualHold, now)
 	if err != nil || manual == nil || manual.Schedulable == nil || *manual.Schedulable || manual.ExpiresAt != nil {

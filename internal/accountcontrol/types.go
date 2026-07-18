@@ -227,6 +227,9 @@ type Mutation struct {
 	Reason                 string
 	PolicyVersion          string
 	SnapshotVersion        string
+	RunID                  int64
+	GoalID                 int64
+	StepID                 int64
 	ExpiresAt              *time.Time
 	Status                 MutationStatus
 	AttemptCount           int

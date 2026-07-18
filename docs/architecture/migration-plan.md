@@ -12,6 +12,7 @@ The core control-plane migration is complete through Core C. Every checkpoint re
 | Core C2 | Complete | One policy lifecycle with typed patch, simulation, deterministic risk, constrained auto-publish and rollback. |
 | Core C3 | Complete | One Group Transition Executor, fixed three-level failover, persisted post-switch evidence validation, independent failover mode, per-pool isolation, mutation budget and typed scheduled occurrence identity. |
 | Core C4 | Complete | Independent admin secret, trusted proxies, bounded limiters, frontend lifecycle controls, migration/operations documentation and legacy code removal. |
+| v2.0.0-rc.2 hardening | Complete | Strict Runtime V2 decision contract, bounded retries/no-progress, execution-policy enforcement, scoped emergency goals, telemetry target filtering, no-op suppression and V2 provenance. Linux CI and prerelease publication remain independent release gates. |
 
 ## Non-negotiable final constraints
 

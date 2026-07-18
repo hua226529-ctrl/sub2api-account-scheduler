@@ -312,7 +312,8 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 		IdempotencyKey: request.IdempotencyKey, SourceID: source.ID, KeyID: policy.KeyID,
 		FromTier: currentTier, ToTier: request.TargetTier, FromGroupID: key.GroupID, ToGroupID: targetGroupID,
 		Actor: request.Actor, Producer: request.Producer, Authority: request.Authority, Reason: strings.TrimSpace(request.Reason), Evidence: strings.TrimSpace(request.Evidence), SnapshotVersion: strings.TrimSpace(request.SnapshotVersion),
-		Trigger: request.Trigger, PacketID: request.PacketID, RunID: request.RunID, Manual: request.Manual, DryRun: request.DryRun, CreatedAt: now,
+		Trigger: request.Trigger, PacketID: request.PacketID, PacketHash: request.PacketHash, RunID: request.RunID, GoalID: request.GoalID, StepID: request.StepID,
+		Manual: request.Manual, DryRun: request.DryRun, CreatedAt: now,
 		BeforeState: key.GroupID,
 	}
 	if err := m.store.AssertNoPendingGroupTransition(ctx, source.ID, policy.KeyID); err != nil {
@@ -384,14 +385,14 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 			_ = m.store.SaveGroupFailoverState(ctx, state)
 			transition.Error = switchErr.Error()
 			transition.Uncertain = true
-			m.record(ctx, model.Event{Type: "group_failover_transition_reconciling", Severity: "critical", Message: source.Name + " 三级分组切换结果不明确，已保留幂等流水并只允许回读: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)})
+			m.record(ctx, transitionEvent(transition, model.Event{Type: "group_failover_transition_reconciling", Severity: "critical", Message: source.Name + " 三级分组切换结果不明确，已保留幂等流水并只允许回读: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)}))
 			return transition, switchErr
 		}
 		_ = m.store.FailGroupTierTransition(ctx, transition.ID, switchErr.Error(), now)
 		state.ValidationStatus = previousValidationStatus
 		state.LastError = switchErr.Error()
 		_ = m.store.SaveGroupFailoverState(ctx, state)
-		m.record(ctx, model.Event{Type: "group_failover_transition_failed", Severity: "error", Message: source.Name + " 三级分组切换失败: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)})
+		m.record(ctx, transitionEvent(transition, model.Event{Type: "group_failover_transition_failed", Severity: "error", Message: source.Name + " 三级分组切换失败: " + switchErr.Error(), Actor: request.Actor, Details: transitionDetails(transition)}))
 		return transition, switchErr
 	}
 	confirmedKey, confirmed := findKeyRate(result.KeyRates, policy.KeyID)
@@ -441,7 +442,7 @@ func (m *Manager) TransitionGroupTier(ctx context.Context, request model.GroupTi
 	transition.Status = model.GroupTransitionApplied
 	transition.VerifiedAfter = targetGroupID
 	transition.CompletedAt = &completedAt
-	m.record(ctx, model.Event{Type: "group_failover_transition_applied", Severity: "warning", Message: fmt.Sprintf("%s 令牌已从 %s 切换到 %s 并完成写后确认，等待切换后证据", source.Name, currentTier, request.TargetTier), BeforeState: currentTier, AfterState: request.TargetTier, Actor: request.Actor, Details: transitionDetails(transition)})
+	m.record(ctx, transitionEvent(transition, model.Event{Type: "group_failover_transition_applied", Severity: "warning", Message: fmt.Sprintf("%s 令牌已从 %s 切换到 %s 并完成写后确认，等待切换后证据", source.Name, currentTier, request.TargetTier), BeforeState: currentTier, AfterState: request.TargetTier, Actor: request.Actor, Details: transitionDetails(transition)}))
 	m.trigger.Trigger()
 	return transition, nil
 }
@@ -556,7 +557,7 @@ func (m *Manager) recoverGroupTransition(ctx context.Context, item model.GroupTi
 	if err := m.applySuccess(ctx, &source, result); err != nil {
 		m.logger.Warn("group_transition_recovery_refresh_failed", "transition_id", current.ID, "error", err)
 	}
-	m.record(ctx, model.Event{Type: "group_transition_recovered", Severity: "warning", Message: "分组切换流水已通过只读回读恢复", Actor: "system:recovery", Details: transitionDetails(current)})
+	m.record(ctx, transitionEvent(current, model.Event{Type: "group_transition_recovered", Severity: "warning", Message: "分组切换流水已通过只读回读恢复", Actor: "system:recovery", Details: transitionDetails(current)}))
 	m.trigger.Trigger()
 	return nil
 }
@@ -593,6 +594,7 @@ func groupRequestMatchesExisting(request model.GroupTierTransitionRequest, exist
 		producer == existing.Producer && authority == existing.Authority && strings.TrimSpace(request.Reason) == existing.Reason &&
 		strings.TrimSpace(request.Evidence) == existing.Evidence && strings.TrimSpace(request.SnapshotVersion) == existing.SnapshotVersion &&
 		request.Trigger == existing.Trigger && request.PacketID == existing.PacketID && request.RunID == existing.RunID &&
+		request.GoalID == existing.GoalID && request.StepID == existing.StepID &&
 		request.Manual == existing.Manual && request.DryRun == existing.DryRun
 }
 
@@ -671,7 +673,7 @@ func (m *Manager) reconcileGroupFailoverStatesForSourcesLocked(ctx context.Conte
 				if err := m.store.CompleteGroupTierTransition(ctx, transition.ID, state, now); err != nil {
 					return err
 				}
-				m.record(ctx, model.Event{Type: "group_failover_transition_recovered", Severity: "warning", Message: "服务重启后已通过上游实际分组确认未完成的切换流水", Actor: "system", Details: transitionDetails(transition)})
+				m.record(ctx, transitionEvent(transition, model.Event{Type: "group_failover_transition_recovered", Severity: "warning", Message: "服务重启后已通过上游实际分组确认未完成的切换流水", Actor: "system", Details: transitionDetails(transition)}))
 			} else {
 				if err := m.store.FailGroupTierTransition(ctx, transition.ID, "服务重启后实际分组未达到目标，未重放写操作", now); err != nil {
 					return err
@@ -892,7 +894,12 @@ func fallbackActor(actor string) string {
 }
 
 func transitionDetails(item model.GroupTierTransition) string {
-	return fmt.Sprintf(`{"transition_id":%d,"source_id":%d,"from_tier":%q,"to_tier":%q,"producer":%q,"authority":%q,"status":%q,"verified":%t,"uncertain":%t,"packet_id":%d,"run_id":%d}`,
+	return fmt.Sprintf(`{"transition_id":%d,"source_id":%d,"from_tier":%q,"to_tier":%q,"producer":%q,"authority":%q,"status":%q,"verified":%t,"uncertain":%t,"packet_id":%d,"run_id":%d,"goal_id":%d,"step_id":%d}`,
 		item.ID, item.SourceID, item.FromTier, item.ToTier, item.Producer, item.Authority, item.Status,
-		item.VerifiedAfter != "", item.Uncertain, item.PacketID, item.RunID)
+		item.VerifiedAfter != "", item.Uncertain, item.PacketID, item.RunID, item.GoalID, item.StepID)
+}
+
+func transitionEvent(item model.GroupTierTransition, event model.Event) model.Event {
+	event.GoalID, event.StepID = item.GoalID, item.StepID
+	return event
 }
