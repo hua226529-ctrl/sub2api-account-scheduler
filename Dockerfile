@@ -23,7 +23,7 @@ RUN test -z "$(gofmt -l cmd internal)" \
     && go vet ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/scheduler ./cmd/scheduler
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata wget && addgroup -g 10001 scheduler && adduser -D -u 10001 -G scheduler scheduler
 WORKDIR /app
 COPY --from=backend-builder /out/scheduler /app/scheduler
